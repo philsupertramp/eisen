@@ -25,8 +25,6 @@ impl Clone for Storage {
     fn clone(&self) -> Self {
         match self {
             Storage::Cpu(v) => Storage::Cpu(v.clone()),
-            // We don't want to accidentally trigger massive VRAM-to-VRAM copies 
-            // without being explicit about it.
             Storage::Gpu(_) => panic!("Cloning GPU storage is not yet supported. Use explicit device-to-device transfers."),
         }
     }
@@ -73,6 +71,8 @@ pub struct Tensor {
     pub grad: Storage,
     pub device: Device,
     pub name: Option<String>,
+    /// Tracks allocation provenance to prevent VRAM pool leakage
+    pub is_pooled: bool, 
 }
 
 impl Tensor {
@@ -80,16 +80,13 @@ impl Tensor {
         let size: usize = shape.iter().product();
         let strides = Self::compute_strides(&shape);
 
-        // Real VRAM allocation logic
         let (data_storage, grad_storage) = match &device {
             Device::Cpu => (
                 Storage::Cpu(data),
                 Storage::Cpu(vec![0.0; size])
             ),
             Device::Gpu(ctx, stream) => {
-                // Host-to-Device Copy using the stream
                 let d_data = stream.clone_htod(data.as_slice()).expect("Failed to copy data to VRAM");
-                // Zero-allocation on Device
                 let d_grad = stream.alloc_zeros(size).expect("Failed to allocate gradients in VRAM");
                 (Storage::Gpu(d_data), Storage::Gpu(d_grad))
             }
@@ -103,11 +100,10 @@ impl Tensor {
             grad: grad_storage,
             device,
             name: None,
+            is_pooled: false, // Explicit user allocations do NOT belong to the internal recycle pool
         }
     }
 
-    /// Pulls data from VRAM back to a CPU Vec<f32>. 
-    /// If already on CPU, it returns a clone.
     pub fn sync_to_cpu(&self) -> Vec<f32> {
         match &self.data {
             Storage::Cpu(v) => v.clone(),

@@ -499,6 +499,52 @@ fn test_gpu_transformer_block_forward_backward() {
     assert!(x_grad.iter().any(|&v| v != 0.0), "Transformer block input received no gradient");
 }
 
+#[test]
+fn test_gpu_gradient_checkpointing() {
+    let device = match setup_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut g = Graph::new(device);
+
+    let hidden_dim = 16;
+    let block = eisen::nn::transformer::TransformerBlock::new(&mut g, hidden_dim, 4, 64);
+    g.mark_params();
+    
+    // 1. Allocate block input
+    let x_data = vec![0.5; 2 * 4 * 16];
+    let x_id = g.alloc(vec![2, 4, 16], x_data);
+    
+    // ** SAVE POINT: Captures the graph exactly at `x_id`. **
+    let save_point = g.mark_save_point();
+    
+    // 2. FORWARD PASS WITH CHECKPOINTING (Saves VRAM)
+    g.no_grad = true;
+    let checkpointed_out_id = block.forward(&mut g, x_id);
+    let checkpointed_out_data = g.tensors[checkpointed_out_id].sync_to_cpu();
+    g.no_grad = false; // Re-enable tracking
+    
+    // Checkpointing Engine Action: We immediately drop the output and all 
+    // internal `TapeNode` activations, returning them to the VRAM pool!
+    g.restore_save_point(save_point);
+    
+    // 3. RECOMPUTATION & BACKWARD PASS
+    // We re-run the exact same block with `no_grad = false`. 
+    // The engine automatically re-allocates from the VRAM pool we just filled!
+    let recomputed_out_id = block.forward(&mut g, x_id);
+    
+    // Verify mathematical integrity: the checkpointed pass and recomputed pass must be identical!
+    let recomputed_out_data = g.tensors[recomputed_out_id].sync_to_cpu();
+    assert_eq!(checkpointed_out_data, recomputed_out_data, "Gradient Checkpointing corrupted forward pass data");
+    
+    // Backpropagate to prove the Wengert List was correctly re-assembled during recomputation.
+    g.backward(recomputed_out_id);
+    let x_grad = g.sync_grad_to_cpu(x_id);
+    assert!(x_grad.iter().any(|&v| v != 0.0), "Gradient Checkpointing failed to backpropagate");
+    
+    println!("Milestone 4 Passed: Gradient Checkpointing is mechanically sound.");
+}
+
 // Helper trait extension to easily extract stream for test resets
 trait IntoGpu { fn into_gpu(self) -> (std::sync::Arc<CudaContext>, std::sync::Arc<cudarc::driver::CudaStream>); }
 impl IntoGpu for Device { fn into_gpu(self) -> (std::sync::Arc<CudaContext>, std::sync::Arc<cudarc::driver::CudaStream>) { match self { Device::Gpu(c, s) => (c, s), _ => unreachable!() } } }
