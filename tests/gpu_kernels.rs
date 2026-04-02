@@ -1,7 +1,7 @@
 use eisen::graph::Graph;
 use eisen::tensor::Device;
 use cudarc::driver::CudaContext;
-use std::sync::Arc;
+use eisen::nn::Module;
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
@@ -324,6 +324,181 @@ fn test_gpu_sum_max_forward_backward() {
     // Gradients should ONLY route to the winning indices: index 2 (val: 3.0) and index 4 (val: 9.0)
     assert_eq!(a_grad_max, vec![0.0, 0.0, 1.0, 0.0, 1.0, 0.0]);
 }
+
+#[test]
+fn test_gpu_bmm_and_softmax_attention_primitives() {
+    let device = match setup_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut g = Graph::new(device);
+
+    // Mock an Attention scenario: Batch=2, SeqLen=2, HeadDim=3
+    // Q: [2, 2, 3]
+    let q_data = vec![
+        1.0, 0.0, 1.0,  0.0, 1.0, 0.0, // Batch 1
+        1.0, 1.0, 1.0,  0.0, 0.0, 1.0  // Batch 2
+    ];
+    // K: [2, 2, 3] 
+    let k_data = vec![
+        1.0, 0.0, 1.0,  0.0, 1.0, 0.0, // Batch 1 (Same as Q to test self-attention similarity)
+        1.0, 0.0, 0.0,  0.0, 0.0, 1.0  // Batch 2
+    ];
+    
+    let q_id = g.alloc(vec![2, 2, 3], q_data);
+    let k_id = g.alloc(vec![2, 2, 3], k_data);
+
+    // 1. Compute Scores = Q @ K^T 
+    // BMM with trans_b = true avoids the memory allocation of a Transpose node!
+    let scores_id = g.bmm(q_id, k_id, true);
+    
+    let scores = g.tensors[scores_id].sync_to_cpu();
+    
+    // Batch 1: 
+    // Q0 @ K0 = (1*1 + 0*0 + 1*1) = 2.0
+    // Q0 @ K1 = (1*0 + 0*1 + 1*0) = 0.0
+    // Q1 @ K0 = 0.0
+    // Q1 @ K1 = 1.0
+    assert_eq!(scores[0..4], vec![2.0, 0.0, 0.0, 1.0]);
+
+    // 2. Compute Probabilities = Softmax(Scores)
+    let probs_id = g.softmax(scores_id);
+    let probs = g.tensors[probs_id].sync_to_cpu();
+    
+    // Batch 1, Row 0 softmax([2.0, 0.0]) => ~[0.88, 0.12]
+    assert!((probs[0] - 0.88079).abs() < 1e-4);
+    assert!((probs[1] - 0.11920).abs() < 1e-4);
+
+    // Run a backward pass through Softmax and BMM to ensure autograd hooks are wired
+    g.backward(probs_id);
+    
+    let dq = g.sync_grad_to_cpu(q_id);
+    let dk = g.sync_grad_to_cpu(k_id);
+    
+    assert!(dq.iter().any(|&v| v != 0.0), "Q gradients failed to accumulate");
+    assert!(dk.iter().any(|&v| v != 0.0), "K gradients failed to accumulate");
+}
+
+#[test]
+fn test_gpu_mha_layer_forward_backward() {
+    let device = match setup_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut g = Graph::new(device);
+    
+    let hidden_dim = 4;
+    let num_heads = 2; // Test MHA!
+    
+    // Instantiate our new Multi-Head Attention layer
+    let mha = eisen::nn::attention::MultiHeadAttention::new(&mut g, hidden_dim, num_heads);
+    
+    // Mock Input: Batch=1, SeqLen=3, HiddenDim=4
+    let x_data = vec![
+        1.0, 0.0, 1.0, 0.0, // token 1
+        0.0, 1.0, 0.0, 1.0, // token 2
+        1.0, 1.0, 1.0, 1.0, // token 3
+    ];
+    let x_id = g.alloc(vec![1, 3, 4], x_data);
+    
+    // Forward Pass (Causal Mask = True)
+    let out_id = mha.forward(&mut g, x_id);
+    let out_data = g.tensors[out_id].sync_to_cpu();
+    
+    // Verify structural integrity
+    assert_eq!(out_data.len(), 12);
+    assert_eq!(g.tensors[out_id].shape, vec![1, 3, 4]);
+    assert!(out_data.iter().all(|v| !v.is_nan()), "MHA produced NaNs");
+    
+    // Backward Pass
+    g.backward(out_id);
+    let x_grad = g.sync_grad_to_cpu(x_id);
+    
+    // Verify gradients successfully flowed through all the projections, MHA transposes, and BMMs!
+    assert!(x_grad.iter().any(|&v| v != 0.0), "MHA input received no gradient");
+}
+
+#[test]
+fn test_gpu_rope_forward_backward() {
+    let device = match setup_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut g = Graph::new(device);
+    
+    // Batch=1, Seq=2, HiddenDim=4 (HeadDim=4)
+    // Sequence pos 0: [1.0, 1.0, 1.0, 1.0]
+    // Sequence pos 1: [1.0, 1.0, 1.0, 1.0]
+    let q_data = vec![
+        1.0, 1.0, 1.0, 1.0,
+        1.0, 1.0, 1.0, 1.0,
+    ];
+    let q_id = g.alloc(vec![1, 2, 4], q_data);
+    
+    let rope_id = g.rope(q_id, 4);
+    let rope_data = g.tensors[rope_id].sync_to_cpu();
+    
+    // Position 0 should have no rotation applied (angle = 0)
+    assert_eq!(rope_data[0..4], vec![1.0, 1.0, 1.0, 1.0]);
+    
+    // Position 1 should be rotated. 
+    // Frequency for pair 0: 10000^(-0/4) = 1.0. Angle = 1.0 * 1 = 1.0 rad.
+    // cos(1) ~ 0.5403, sin(1) ~ 0.8414
+    // [1*cos - 1*sin, 1*cos + 1*sin] -> [0.5403 - 0.8414, 0.5403 + 0.8414]
+    assert!((rope_data[4] - (0.5403 - 0.8414)).abs() < 1e-3);
+    assert!((rope_data[5] - (0.5403 + 0.8414)).abs() < 1e-3);
+
+    // Test backward pass inverse transformation
+    g.backward(rope_id);
+    let q_grad = g.sync_grad_to_cpu(q_id);
+    
+    // Seed grad is 1.0 everywhere.
+    // Pos 0 grads should be [1.0, 1.0] because cos(0)=1, sin(0)=0.
+    assert_eq!(q_grad[0..4], vec![1.0, 1.0, 1.0, 1.0]);
+    
+    // Pos 1 grads should be inverse rotated:
+    // grad_x1 = 1*cos(1) + 1*sin(1)
+    // grad_x2 = 1*cos(1) - 1*sin(1)
+    assert!((q_grad[4] - (0.5403 + 0.8414)).abs() < 1e-3);
+    assert!((q_grad[5] - (0.5403 - 0.8414)).abs() < 1e-3);
+}
+
+#[test]
+fn test_gpu_transformer_block_forward_backward() {
+    let device = match setup_gpu() {
+        Some(d) => d,
+        None => return,
+    };
+    let mut g = Graph::new(device);
+    
+    let hidden_dim = 16;
+    let num_heads = 4;
+    let ffn_dim = 64;
+    
+    // Instantiate the complete Transformer Block
+    let block = eisen::nn::transformer::TransformerBlock::new(&mut g, hidden_dim, num_heads, ffn_dim);
+    
+    // Mock Input: Batch=2, SeqLen=4, HiddenDim=16
+    let x_data = vec![0.5; 2 * 4 * 16];
+    let x_id = g.alloc(vec![2, 4, 16], x_data);
+    
+    // Forward Pass
+    let out_id = block.forward(&mut g, x_id);
+    let out_data = g.tensors[out_id].sync_to_cpu();
+    
+    // Verify structural integrity
+    assert_eq!(out_data.len(), 128);
+    assert_eq!(g.tensors[out_id].shape, vec![2, 4, 16]);
+    assert!(out_data.iter().all(|v| !v.is_nan()), "Transformer block produced NaNs");
+    
+    // Backward Pass
+    g.backward(out_id);
+    let x_grad = g.sync_grad_to_cpu(x_id);
+    
+    // Verify gradients successfully flowed through the entire block!
+    assert!(x_grad.iter().any(|&v| v != 0.0), "Transformer block input received no gradient");
+}
+
 // Helper trait extension to easily extract stream for test resets
 trait IntoGpu { fn into_gpu(self) -> (std::sync::Arc<CudaContext>, std::sync::Arc<cudarc::driver::CudaStream>); }
 impl IntoGpu for Device { fn into_gpu(self) -> (std::sync::Arc<CudaContext>, std::sync::Arc<cudarc::driver::CudaStream>) { match self { Device::Gpu(c, s) => (c, s), _ => unreachable!() } } }

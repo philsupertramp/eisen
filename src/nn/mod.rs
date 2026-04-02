@@ -2,6 +2,8 @@ pub mod linear;
 pub mod optim;
 pub mod embedding;
 pub mod rmsnorm;
+pub mod attention;
+pub mod transformer;
 
 use crate::graph::Graph;
 

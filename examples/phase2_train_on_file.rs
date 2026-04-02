@@ -111,16 +111,17 @@ fn main() {
     let epochs = 50;
     let lr = 0.005;
 
-    let device = match setup_gpu() {
-        Some(d) => d,
-        None => Device::Cpu
+    let (device, is_gpu) = match setup_gpu() {
+        Some(d) => (d, true),
+        None => (Device::Cpu, false)
     };
     let mut g = Graph::new(device);
     let model = BengioLM::new(&mut g, tokenizer.id_to_word.len(), window_size, hidden_dim);
     let mut optim = AdamW::new(model.params(), lr);
 
+    g.mark_params();
     // 3. Training Loop with Mini-Batching
-    println!("Starting training (CPU, zero-dependency)...");
+    println!("Starting training ({}, zero-dependency)...", if is_gpu { "GPU" } else { "CPU" });
     for epoch in 1..=epochs {
         let mut total_loss = 0.0;
         let mut num_batches = 0;
@@ -154,8 +155,7 @@ fn main() {
             optim.step(&mut g);
             
             // Clear memory
-            g.tape.nodes.clear();
-            // Optional: for real memory pressure, you'd prune g.tensors here too
+            g.clear_activations();
         }
 
         if epoch % 5 == 0 {

@@ -7,8 +7,13 @@ pub struct Graph {
     pub tensors: Vec<Tensor>,
     pub tape: Tape,
     pub device: Device,
-    /// Store loaded CUDA functions to avoid re-loading handles every op
     pub functions: HashMap<String, CudaFunction>,
+    
+    // --- VRAM ALLOCATOR FIELDS ---
+    /// Size-bucketed free list. Key: Total Elements, Value: Free Storage blocks
+    pub vram_pool: HashMap<usize, Vec<Storage>>,
+    /// Tracks how many tensors are persistent parameters.
+    pub num_params: usize, 
 }
 
 impl Default for Graph {
@@ -21,7 +26,6 @@ impl Graph {
     pub fn new(device: Device) -> Self {
         let mut functions = HashMap::new();
 
-        // If we are on GPU, load our pre-compiled kernels
         if let Device::Gpu(ctx, _) = &device {
             let ptx = include_str!(concat!(env!("OUT_DIR"), "/ops.ptx"));
             let module = ctx
@@ -37,6 +41,11 @@ impl Graph {
                 "rmsnorm_f32", "rmsnorm_backward_f32",
                 "copy_f32", "cross_entropy_f32", "cross_entropy_backward_f32",
                 "sum_f32", "sum_backward_f32", "max_f32", "max_backward_f32",
+                "bmm_f32", "bmm_backward_a_f32", "bmm_backward_b_f32", 
+                "bmm_backward_a_transb_f32", "bmm_backward_b_transb_f32",
+                "softmax_f32", "softmax_backward_f32",
+                "transpose_0213_f32", "transpose_0213_backward_f32",
+                "rope_f32", "rope_backward_f32",
             ];
             for name in names {
                 let f = module.load_function(name).expect(&format!("Failed to load {} kernel", name));
@@ -49,38 +58,109 @@ impl Graph {
             tape: Tape::default(),
             device,
             functions,
+            vram_pool: HashMap::new(),
+            num_params: 0,
         }
     }
 
-    /// Helper for tests to quickly get a value from a tensor's data buffer
-    pub fn get_data(&self, tensor_id: usize) -> &Vec<f32> {
-        self.tensors[tensor_id].data.as_cpu()
+    // --- VRAM ALLOCATOR METHODS ---
+
+    /// Locks the current tensors as persistent parameters.
+    /// Any tensor allocated after this point is considered an ephemeral activation.
+    pub fn mark_params(&mut self) {
+        self.num_params = self.tensors.len();
     }
 
-    /// Helper for tests to quickly get a value from a tensor's grad buffer
-    pub fn get_grad(&self, tensor_id: usize) -> &Vec<f32> {
-        self.tensors[tensor_id].grad.as_cpu()
+    /// Truncates the graph back to parameters only. 
+    /// Recycles all activation VRAM buffers into the size-bucketed free list!
+    pub fn clear_activations(&mut self) {
+        self.tape.nodes.clear();
+        
+        while self.tensors.len() > self.num_params {
+            let t = self.tensors.pop().unwrap();
+            let size = t.data.len();
+            // Deposit the raw data and gradient buffers into the pool
+            self.vram_pool.entry(size).or_insert_with(Vec::new).push(t.data);
+            self.vram_pool.entry(size).or_insert_with(Vec::new).push(t.grad);
+        }
     }
 
-    /// Pulls gradient data from VRAM back to a CPU Vec<f32>.
-    pub fn sync_grad_to_cpu(&self, tensor_id: usize) -> Vec<f32> {
-        match &self.tensors[tensor_id].grad {
-            Storage::Cpu(v) => v.clone(),
-            Storage::Gpu(s) => {
-                let (_, stream) = match &self.device {
-                    Device::Gpu(_, s) => (None::<f32>, s),
-                    _ => unreachable!(),
-                };
-                stream.clone_dtoh(s).expect("Failed to copy grad from VRAM to Host")
+    /// Pulls a zero-allocation buffer from the pool, or creates one if the pool is empty.
+    pub fn alloc_pooled(&mut self, shape: Vec<usize>) -> usize {
+        let size = if shape.is_empty() { 1 } else { shape.iter().product::<usize>() };
+        let device = self.device.clone();
+
+        let mut get_block = || -> Storage {
+            if let Some(blocks) = self.vram_pool.get_mut(&size) {
+                if let Some(block) = blocks.pop() { return block; }
+            }
+            // Cache Miss: Perform expensive Host allocation
+            match &device {
+                Device::Cpu => Storage::Cpu(vec![0.0; size]),
+                Device::Gpu(_, stream) => Storage::Gpu(stream.alloc_zeros::<f32>(size).unwrap()),
+            }
+        };
+
+        let data_storage = get_block();
+        let mut grad_storage = get_block();
+
+        // CRITICAL: We must guarantee that recycled gradient buffers are zeroed out!
+        // Otherwise, `accumulate_f32` will add gradients on top of garbage from the previous step.
+        match &device {
+            Device::Cpu => {
+                if let Storage::Cpu(v) = &mut grad_storage { v.fill(0.0); }
+            }
+            Device::Gpu(_, stream) => {
+                if let Storage::Gpu(s) = &mut grad_storage {
+                    let f = self.functions.get("fill_f32").unwrap().clone();
+                    let n = size as u64;
+                    let val = 0.0f32;
+                    let mut builder = stream.launch_builder(&f);
+                    builder.arg(s).arg(&val).arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                }
             }
         }
+
+        let mut strides = vec![1; shape.len()];
+        if !shape.is_empty() {
+            for i in (1..shape.len()).rev() { strides[i - 1] = strides[i] * shape[i]; }
+        }
+
+        let id = self.tensors.len();
+        self.tensors.push(Tensor {
+            id,
+            shape: shape.clone(),
+            strides,
+            data: data_storage,
+            grad: grad_storage,
+            device,
+            name: None,
+        });
+        id
     }
+
     pub fn alloc(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
         let id = self.tensors.len();
         let tensor = Tensor::new(id, shape, data, self.device.clone());
         self.tensors.push(tensor);
         id
     }
+
+    // --- HELPER METHODS ---
+    pub fn get_data(&self, tensor_id: usize) -> &Vec<f32> { self.tensors[tensor_id].data.as_cpu() }
+    pub fn get_grad(&self, tensor_id: usize) -> &Vec<f32> { self.tensors[tensor_id].grad.as_cpu() }
+    pub fn sync_grad_to_cpu(&self, tensor_id: usize) -> Vec<f32> {
+        match &self.tensors[tensor_id].grad {
+            Storage::Cpu(v) => v.clone(),
+            Storage::Gpu(s) => {
+                let (_, stream) = match &self.device { Device::Gpu(_, s) => (None::<f32>, s), _ => unreachable!() };
+                stream.clone_dtoh(s).unwrap()
+            }
+        }
+    }
+
+    // --- CORE MATH OPS ---
 
     pub fn add(&mut self, a_id: usize, b_id: usize) -> usize {
         let a_shape = self.tensors[a_id].shape.clone();
@@ -94,24 +174,21 @@ impl Graph {
             Device::Gpu(_, stream) => {
                 let a_strides = Tensor::get_broadcasted_strides(&a_shape, &self.tensors[a_id].strides, &out_shape);
                 let b_strides = Tensor::get_broadcasted_strides(&b_shape, &self.tensors[b_id].strides, &out_shape);
-                
                 let rank = out_shape.len() as u64;
-                assert!(rank <= 3, "GPU Add currently supports up to Rank 3");
 
-                let mut s = [1u64; 3];
-                let mut a_str = [0u64; 3];
-                let mut b_str = [0u64; 3];
+                let mut s = [1u64; 3]; let mut a_str = [0u64; 3]; let mut b_str = [0u64; 3];
                 for i in 0..out_shape.len() {
                     s[i] = out_shape[i] as u64;
                     a_str[i] = a_strides[i] as u64;
                     b_str[i] = b_strides[i] as u64;
                 }
 
-                let f_forward = self.functions.get("add_f32").expect("add_f32 not loaded").clone();
-                let f_accumulate = self.functions.get("accumulate_f32").expect("accumulate_f32 not loaded").clone();
+                let f_forward = self.functions.get("add_f32").unwrap().clone();
+                let f_accumulate = self.functions.get("accumulate_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(out_shape.clone(), vec![0.0; out_size]);
+                // POOLED ALLOCATION! Zero cudaMalloc calls if block exists.
+                let out_id = self.alloc_pooled(out_shape.clone());
                 
                 let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let b_s = match &self.tensors[b_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -124,7 +201,7 @@ impl Graph {
                        .arg(&s[0]).arg(&s[1]).arg(&s[2])
                        .arg(&a_str[0]).arg(&a_str[1]).arg(&a_str[2])
                        .arg(&b_str[0]).arg(&b_str[1]).arg(&b_str[2]);
-                unsafe { builder.launch(cfg) }.expect("Failed to launch add_f32");
+                unsafe { builder.launch(cfg) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -133,16 +210,14 @@ impl Graph {
                     let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
                     let mut b1 = stream_clone.launch_builder(&f_accumulate);
                     b1.arg(a_grad).arg(out_grad).arg(&n).arg(&rank)
-                      .arg(&s[0]).arg(&s[1]).arg(&s[2])
-                      .arg(&a_str[0]).arg(&a_str[1]).arg(&a_str[2]);
-                    unsafe { b1.launch(cfg_grad) }.expect("Failed to accumulate grad into A");
+                      .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&a_str[0]).arg(&a_str[1]).arg(&a_str[2]);
+                    unsafe { b1.launch(cfg_grad) }.unwrap();
 
                     let b_grad = match &tensors[b_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
                     let mut b2 = stream_clone.launch_builder(&f_accumulate);
                     b2.arg(b_grad).arg(out_grad).arg(&n).arg(&rank)
-                      .arg(&s[0]).arg(&s[1]).arg(&s[2])
-                      .arg(&b_str[0]).arg(&b_str[1]).arg(&b_str[2]);
-                    unsafe { b2.launch(cfg_grad) }.expect("Failed to accumulate grad into B");
+                      .arg(&s[0]).arg(&s[1]).arg(&s[2]).arg(&b_str[0]).arg(&b_str[1]).arg(&b_str[2]);
+                    unsafe { b2.launch(cfg_grad) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id, b_id], output: out_id, backward_fn });
@@ -152,13 +227,11 @@ impl Graph {
                 let a_strides = Tensor::get_broadcasted_strides(&a_shape, &self.tensors[a_id].strides, &out_shape);
                 let b_strides = Tensor::get_broadcasted_strides(&b_shape, &self.tensors[b_id].strides, &out_shape);
                 let mut out_data = vec![0.0; out_size];
-                {
-                    let a_data = self.tensors[a_id].data.as_cpu();
-                    let b_data = self.tensors[b_id].data.as_cpu();
-                    for i in 0..out_size {
-                        let nd = Tensor::flat_to_nd(i, &out_shape);
-                        out_data[i] = a_data[Tensor::nd_to_flat(&nd, &a_strides)] + b_data[Tensor::nd_to_flat(&nd, &b_strides)];
-                    }
+                let a_data = self.tensors[a_id].data.as_cpu();
+                let b_data = self.tensors[b_id].data.as_cpu();
+                for i in 0..out_size {
+                    let nd = Tensor::flat_to_nd(i, &out_shape);
+                    out_data[i] = a_data[Tensor::nd_to_flat(&nd, &a_strides)] + b_data[Tensor::nd_to_flat(&nd, &b_strides)];
                 }
                 let out_id = self.alloc(out_shape.clone(), out_data);
                 
@@ -186,13 +259,11 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
-                assert_eq!(a_shape, b_shape, "GPU Mul requires matching shapes");
-                
-                let f_fwd = self.functions.get("mul_f32").expect("mul_f32 not loaded").clone();
-                let f_bwd = self.functions.get("mul_backward_f32").expect("mul_backward_f32 not loaded").clone();
+                let f_fwd = self.functions.get("mul_f32").unwrap().clone();
+                let f_bwd = self.functions.get("mul_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(out_shape.clone(), vec![0.0; out_size]);
+                let out_id = self.alloc_pooled(out_shape.clone());
                 
                 let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let b_s = match &self.tensors[b_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -201,7 +272,7 @@ impl Graph {
                 let n = out_size as u64;
                 let mut builder = stream.launch_builder(&f_fwd);
                 builder.arg(a_s).arg(b_s).arg(o_s).arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed to launch mul_f32");
+                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let a_data = match &tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -212,7 +283,7 @@ impl Graph {
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
                     b1.arg(a_data).arg(b_data).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed mul_backward_f32");
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id, b_id], output: out_id, backward_fn });
@@ -248,7 +319,6 @@ impl Graph {
     pub fn matmul(&mut self, a_id: usize, b_id: usize) -> usize {
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
-        
         let m = a_shape[0];
         let k = a_shape[1];
         let n = b_shape[1];
@@ -257,31 +327,24 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
-                let f_fwd = self.functions.get("matmul_f32").expect("matmul_f32 not loaded").clone();
-                let f_bwd_a = self.functions.get("matmul_backward_a_f32").expect("matmul_backward_a_f32 missing").clone();
-                let f_bwd_b = self.functions.get("matmul_backward_b_f32").expect("matmul_backward_b_f32 missing").clone();
+                let f_fwd = self.functions.get("matmul_f32").unwrap().clone();
+                let f_bwd_a = self.functions.get("matmul_backward_a_f32").unwrap().clone();
+                let f_bwd_b = self.functions.get("matmul_backward_b_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(vec![m, n], vec![0.0; m * n]);
+                let out_id = self.alloc_pooled(vec![m, n]);
 
                 let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let b_s = match &self.tensors[b_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
 
-                let m_u64 = m as u64;
-                let k_u64 = k as u64;
-                let n_u64 = n as u64;
+                let m_u64 = m as u64; let k_u64 = k as u64; let n_u64 = n as u64;
 
                 let mut builder = stream.launch_builder(&f_fwd);
                 builder.arg(a_s).arg(b_s).arg(o_s).arg(&m_u64).arg(&k_u64).arg(&n_u64);
 
-                // Use 2D Thread Blocks for matrix operations! 16x16 covers 256 threads per block.
-                let cfg = LaunchConfig {
-                    grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
-                    block_dim: (16, 16, 1),
-                    shared_mem_bytes: 0,
-                };
-                unsafe { builder.launch(cfg) }.expect("Failed to launch matmul_f32");
+                let cfg = LaunchConfig { grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1), block_dim: (16, 16, 1), shared_mem_bytes: 0 };
+                unsafe { builder.launch(cfg) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -290,25 +353,15 @@ impl Graph {
                     let a_data = match &tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                     let b_data = match &tensors[b_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
 
-                    // dA += dC @ B.T
-                    let cfg_a = LaunchConfig {
-                        grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
-                        block_dim: (16, 16, 1),
-                        shared_mem_bytes: 0,
-                    };
+                    let cfg_a = LaunchConfig { grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1), block_dim: (16, 16, 1), shared_mem_bytes: 0 };
                     let mut b1 = stream_clone.launch_builder(&f_bwd_a);
                     b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&m_u64).arg(&k_u64).arg(&n_u64);
-                    unsafe { b1.launch(cfg_a) }.expect("Failed matmul_backward_a_f32");
+                    unsafe { b1.launch(cfg_a) }.unwrap();
 
-                    // dB += A.T @ dC
-                    let cfg_b = LaunchConfig {
-                        grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
-                        block_dim: (16, 16, 1),
-                        shared_mem_bytes: 0,
-                    };
+                    let cfg_b = LaunchConfig { grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1), block_dim: (16, 16, 1), shared_mem_bytes: 0 };
                     let mut b2 = stream_clone.launch_builder(&f_bwd_b);
                     b2.arg(a_data).arg(out_grad).arg(b_grad).arg(&m_u64).arg(&k_u64).arg(&n_u64);
-                    unsafe { b2.launch(cfg_b) }.expect("Failed matmul_backward_b_f32");
+                    unsafe { b2.launch(cfg_b) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id, b_id], output: out_id, backward_fn });
@@ -316,40 +369,22 @@ impl Graph {
             }
             Device::Cpu => {
                 let mut out_data = vec![0.0; m * n];
-                let a_data_fwd = self.tensors[a_id].data.as_cpu().clone();
-                let b_data_fwd = self.tensors[b_id].data.as_cpu().clone();
-
+                let a_fwd = self.tensors[a_id].data.as_cpu().clone();
+                let b_fwd = self.tensors[b_id].data.as_cpu().clone();
                 for r in 0..m {
                     for c in 0..n {
                         let mut sum = 0.0;
-                        for i in 0..k { sum += a_data_fwd[r * k + i] * b_data_fwd[i * n + c]; }
+                        for i in 0..k { sum += a_fwd[r * k + i] * b_fwd[i * n + c]; }
                         out_data[r * n + c] = sum;
                     }
                 }
-
                 let out_id = self.alloc(vec![m, n], out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
-                    {
-                        let a_grad = tensors[a_id].grad.as_cpu_mut();
-                        for r in 0..m {
-                            for i in 0..k {
-                                let mut sum = 0.0;
-                                for c in 0..n { sum += out_grad[r * n + c] * b_data_fwd[i * n + c]; }
-                                a_grad[r * k + i] += sum;
-                            }
-                        }
-                    }
-                    {
-                        let b_grad = tensors[b_id].grad.as_cpu_mut();
-                        for i in 0..k {
-                            for c in 0..n {
-                                let mut sum = 0.0;
-                                for r in 0..m { sum += a_data_fwd[r * k + i] * out_grad[r * n + c]; }
-                                b_grad[i * n + c] += sum;
-                            }
-                        }
-                    }
+                    let a_grad = tensors[a_id].grad.as_cpu_mut();
+                    for r in 0..m { for i in 0..k { let mut sum = 0.0; for c in 0..n { sum += out_grad[r * n + c] * b_fwd[i * n + c]; } a_grad[r * k + i] += sum; } }
+                    let b_grad = tensors[b_id].grad.as_cpu_mut();
+                    for i in 0..k { for c in 0..n { let mut sum = 0.0; for r in 0..m { sum += a_fwd[r * k + i] * out_grad[r * n + c]; } b_grad[i * n + c] += sum; } }
                 });
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id, b_id], output: out_id, backward_fn });
                 out_id
@@ -360,6 +395,37 @@ impl Graph {
     pub fn silu(&mut self, a_id: usize) -> usize {
         let device = self.device.clone();
         match &device {
+            Device::Gpu(_, stream) => {
+                let a_shape = self.tensors[a_id].shape.clone();
+                let out_size = a_shape.iter().product::<usize>();
+                
+                let f_fwd = self.functions.get("silu_f32").unwrap().clone();
+                let f_bwd = self.functions.get("silu_backward_f32").unwrap().clone();
+                let stream_clone = stream.clone();
+
+                let out_id = self.alloc_pooled(a_shape);
+                
+                let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                
+                let n = out_size as u64;
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder.arg(a_s).arg(o_s).arg(&n);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let a_data = match &tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                    let mut b1 = stream_clone.launch_builder(&f_bwd);
+                    b1.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                });
+
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
+                out_id
+            }
             Device::Cpu => {
                 let a_data = self.tensors[a_id].data.as_cpu().clone();
                 let mut out_data = vec![0.0; a_data.len()];
@@ -372,125 +438,11 @@ impl Graph {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();
                     for i in 0..a_grad.len() {
-                        let x = a_data[i];
-                        let sig = 1.0 / (1.0 + (-x).exp());
-                        let silu = x * sig;
+                        let x = a_data[i]; let sig = 1.0 / (1.0 + (-x).exp()); let silu = x * sig;
                         a_grad[i] += out_grad[i] * (silu + sig * (1.0 - silu));
                     }
                 });
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
-                out_id
-            }
-            Device::Gpu(_, stream) => {
-                let a_shape = self.tensors[a_id].shape.clone();
-                let out_size = a_shape.iter().product::<usize>();
-                
-                let f_fwd = self.functions.get("silu_f32").expect("silu_f32 not loaded").clone();
-                let f_bwd = self.functions.get("silu_backward_f32").expect("silu_bwd not loaded").clone();
-                let stream_clone = stream.clone();
-
-                let out_id = self.alloc(a_shape, vec![0.0; out_size]);
-                
-                let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
-                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
-                
-                let n = out_size as u64;
-                let mut builder = stream.launch_builder(&f_fwd);
-                builder.arg(a_s).arg(o_s).arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed to launch silu_f32");
-
-                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let a_data = match &tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
-                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
-                    let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
-
-                    let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed silu_backward_f32");
-                });
-
-                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
-                out_id
-            }
-        }
-    }
-
-    pub fn cross_entropy(&mut self, logits_id: usize, targets: &[usize]) -> usize {
-        let device = self.device.clone();
-        match &device {
-            Device::Gpu(_, stream) => {
-                let logits = &self.tensors[logits_id];
-                let batch_size = logits.shape[0];
-                let num_classes = logits.shape[1];
-                let out_id = self.alloc(vec![], vec![0.0]); // Loss is a scalar!
-
-                let f_fwd = self.functions.get("cross_entropy_f32").expect("cross_entropy_f32 missing").clone();
-                let f_bwd = self.functions.get("cross_entropy_backward_f32").expect("cross_entropy_backward_f32 missing").clone();
-                let stream_clone = stream.clone();
-
-                // Move targets to VRAM natively. They will be owned by the closure!
-                let targets_f32: Vec<f32> = targets.iter().map(|&x| x as f32).collect();
-                let targets_d = stream.clone_htod(targets_f32.as_slice()).expect("Failed HTOD targets");
-
-                let l_s = match &self.tensors[logits_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
-                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
-
-                let b_u64 = batch_size as u64;
-                let c_u64 = num_classes as u64;
-
-                let mut builder = stream.launch_builder(&f_fwd);
-                builder.arg(l_s).arg(&targets_d).arg(o_s).arg(&b_u64).arg(&c_u64);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.expect("Failed cross_entropy");
-
-                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let l_data = match &tensors[logits_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
-                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
-                    let l_grad = match &tensors[logits_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
-
-                    let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    // The closure takes ownership of `targets_d` so it lives in VRAM as long as the tape needs it!
-                    b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.expect("Failed cross_entropy_bwd");
-                });
-
-                self.tape.nodes.push(TapeNode { inputs: vec![logits_id], output: out_id, backward_fn });
-                out_id
-            }
-            Device::Cpu => {
-                let logits = &self.tensors[logits_id];
-                let batch_size = logits.shape[0];
-                let num_classes = logits.shape[1];
-                let mut out_loss = 0.0;
-                let mut probs = vec![0.0; batch_size * num_classes];
-                let logits_data = logits.data.as_cpu();
-
-                for b in 0..batch_size {
-                    let mut max_val = f32::NEG_INFINITY;
-                    for c in 0..num_classes { max_val = max_val.max(logits_data[b * num_classes + c]); }
-                    let mut sum_exp = 0.0;
-                    for c in 0..num_classes {
-                        let exp = (logits_data[b * num_classes + c] - max_val).exp();
-                        probs[b * num_classes + c] = exp;
-                        sum_exp += exp;
-                    }
-                    for c in 0..num_classes { probs[b * num_classes + c] /= sum_exp; }
-                    out_loss += -(probs[b * num_classes + targets[b]] + 1e-8).ln();
-                }
-
-                let out_id = self.alloc(vec![], vec![out_loss / batch_size as f32]);
-                let targets_cap = targets.to_vec();
-                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let o_grad = tensors[out_id].grad.as_cpu()[0];
-                    let l_grad = tensors[logits_id].grad.as_cpu_mut();
-                    for b in 0..batch_size {
-                        for c in 0..num_classes {
-                            let mut g = probs[b * num_classes + c];
-                            if c == targets_cap[b] { g -= 1.0; }
-                            l_grad[b * num_classes + c] += (g / batch_size as f32) * o_grad;
-                        }
-                    }
-                });
-                self.tape.nodes.push(TapeNode { inputs: vec![logits_id], output: out_id, backward_fn });
                 out_id
             }
         }
@@ -503,28 +455,27 @@ impl Graph {
                 let w = &self.tensors[weights_id];
                 let idx = &self.tensors[indices_id];
                 let hidden_dim = w.shape[1];
-                let num_indices = idx.data.len(); // Storage::len
+                let num_indices = idx.data.len();
                 let out_size = num_indices * hidden_dim;
 
                 let mut out_shape = idx.shape.clone();
                 out_shape.push(hidden_dim);
 
-                let f_fwd = self.functions.get("gather_f32").expect("gather_f32 not loaded").clone();
-                let f_bwd = self.functions.get("gather_backward_f32").expect("gather_bwd not loaded").clone();
+                let f_fwd = self.functions.get("gather_f32").unwrap().clone();
+                let f_bwd = self.functions.get("gather_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(out_shape, vec![0.0; out_size]);
+                let out_id = self.alloc_pooled(out_shape);
 
                 let w_s = match &self.tensors[weights_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let idx_s = match &self.tensors[indices_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
 
-                let hidden_u64 = hidden_dim as u64;
-                let out_size_u64 = out_size as u64;
+                let hidden_u64 = hidden_dim as u64; let out_size_u64 = out_size as u64;
 
                 let mut builder = stream.launch_builder(&f_fwd);
                 builder.arg(w_s).arg(idx_s).arg(o_s).arg(&hidden_u64).arg(&out_size_u64);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed to launch gather");
+                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let idx_data = match &tensors[indices_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -533,7 +484,7 @@ impl Graph {
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
                     b1.arg(idx_data).arg(out_grad).arg(w_grad).arg(&hidden_u64).arg(&out_size_u64);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed gather_backward");
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![weights_id, indices_id], output: out_id, backward_fn });
@@ -553,8 +504,7 @@ impl Graph {
                     for d in 0..hidden_dim { out_data[i * hidden_dim + d] = w_data[row * hidden_dim + d]; }
                 }
 
-                let mut out_shape = idx.shape.clone();
-                out_shape.push(hidden_dim);
+                let mut out_shape = idx.shape.clone(); out_shape.push(hidden_dim);
                 let out_id = self.alloc(out_shape, out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
@@ -570,6 +520,83 @@ impl Graph {
         }
     }
 
+    pub fn cross_entropy(&mut self, logits_id: usize, targets: &[usize]) -> usize {
+        let device = self.device.clone();
+        match &device {
+            Device::Gpu(_, stream) => {
+                let logits = &self.tensors[logits_id];
+                let batch_size = logits.shape[0];
+                let num_classes = logits.shape[1];
+                let out_id = self.alloc_pooled(vec![]); // Scalar
+
+                let f_fwd = self.functions.get("cross_entropy_f32").unwrap().clone();
+                let f_bwd = self.functions.get("cross_entropy_backward_f32").unwrap().clone();
+                let stream_clone = stream.clone();
+
+                let targets_f32: Vec<f32> = targets.iter().map(|&x| x as f32).collect();
+                let targets_d = stream.clone_htod(targets_f32.as_slice()).unwrap();
+
+                let l_s = match &self.tensors[logits_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                let b_u64 = batch_size as u64; let c_u64 = num_classes as u64;
+
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder.arg(l_s).arg(&targets_d).arg(o_s).arg(&b_u64).arg(&c_u64);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
+
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let l_data = match &tensors[logits_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let l_grad = match &tensors[logits_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                    let mut b1 = stream_clone.launch_builder(&f_bwd);
+                    b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
+                });
+
+                self.tape.nodes.push(TapeNode { inputs: vec![logits_id], output: out_id, backward_fn });
+                out_id
+            }
+            Device::Cpu => {
+                let logits = &self.tensors[logits_id];
+                let batch_size = logits.shape[0];
+                let num_classes = logits.shape[1];
+                let mut out_loss = 0.0;
+                let mut probs = vec![0.0; batch_size * num_classes];
+                let logits_data = logits.data.as_cpu();
+
+                for b in 0..batch_size {
+                    let mut max_val = f32::NEG_INFINITY;
+                    for c in 0..num_classes { max_val = max_val.max(logits_data[b * num_classes + c]); }
+                    let mut sum_exp = 0.0;
+                    for c in 0..num_classes {
+                        let exp_val = (logits_data[b * num_classes + c] - max_val).exp();
+                        probs[b * num_classes + c] = exp_val; sum_exp += exp_val;
+                    }
+                    for c in 0..num_classes { probs[b * num_classes + c] /= sum_exp; }
+                    out_loss += -(probs[b * num_classes + targets[b]] + 1e-8).ln();
+                }
+
+                let out_id = self.alloc(vec![], vec![out_loss / batch_size as f32]);
+                let targets_cap = targets.to_vec();
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let o_grad = tensors[out_id].grad.as_cpu()[0];
+                    let l_grad = tensors[logits_id].grad.as_cpu_mut();
+                    for b in 0..batch_size {
+                        for c in 0..num_classes {
+                            let idx = b * num_classes + c; let mut g = probs[idx];
+                            if c == targets_cap[b] { g -= 1.0; }
+                            l_grad[idx] += (g / batch_size as f32) * o_grad;
+                        }
+                    }
+                });
+                self.tape.nodes.push(TapeNode { inputs: vec![logits_id], output: out_id, backward_fn });
+                out_id
+            }
+        }
+    }
+
     pub fn rms_norm(&mut self, x_id: usize, weight_id: usize, eps: f32) -> usize {
         let device = self.device.clone();
         match &device {
@@ -577,24 +604,22 @@ impl Graph {
                 let x = &self.tensors[x_id];
                 let dim = *x.shape.last().unwrap();
                 let num_vecs = x.data.len() / dim;
-                let out_size = x.data.len();
 
-                let f_fwd = self.functions.get("rmsnorm_f32").expect("rmsnorm_f32 missing").clone();
-                let f_bwd = self.functions.get("rmsnorm_backward_f32").expect("rmsnorm_bwd missing").clone();
+                let f_fwd = self.functions.get("rmsnorm_f32").unwrap().clone();
+                let f_bwd = self.functions.get("rmsnorm_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(x.shape.clone(), vec![0.0; out_size]);
+                let out_id = self.alloc_pooled(x.shape.clone());
 
                 let x_s = match &self.tensors[x_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let w_s = match &self.tensors[weight_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
 
-                let dim_u64 = dim as u64;
-                let num_vecs_u64 = num_vecs as u64;
+                let dim_u64 = dim as u64; let num_vecs_u64 = num_vecs as u64;
 
                 let mut builder = stream.launch_builder(&f_fwd);
                 builder.arg(x_s).arg(w_s).arg(o_s).arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.expect("Failed to launch rmsnorm");
+                unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let x_data = match &tensors[x_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -604,10 +629,8 @@ impl Graph {
                     let w_grad = match &tensors[weight_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(x_data).arg(w_data).arg(out_grad).arg(x_grad).arg(w_grad)
-                      .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
-                    
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.expect("Failed rmsnorm_bwd");
+                    b1.arg(x_data).arg(w_data).arg(out_grad).arg(x_grad).arg(w_grad).arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![x_id, weight_id], output: out_id, backward_fn });
@@ -623,8 +646,7 @@ impl Graph {
                 let w_fwd = self.tensors[weight_id].data.as_cpu().clone();
 
                 for n in 0..num_vecs {
-                    let off = n * dim;
-                    let mut ss = 0.0;
+                    let off = n * dim; let mut ss = 0.0;
                     for d in 0..dim { ss += x_fwd[off + d].powi(2); }
                     let rrms = 1.0 / (ss / dim as f32 + eps).sqrt();
                     rrms_cache[n] = rrms;
@@ -635,11 +657,9 @@ impl Graph {
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
                     for n in 0..num_vecs {
-                        let off = n * dim;
-                        let rrms = rrms_cache[n];
-                        let mut gdxw = 0.0;
+                        let off = n * dim; let rrms = rrms_cache[n]; let mut gdxw = 0.0;
                         for d in 0..dim { gdxw += o_grad[off+d] * x_fwd[off+d] * w_fwd[d]; }
-                        let rrc_d = rrms.powi(3) / dim as f32;
+                        let rrc_d = (rrms.powi(3)) / dim as f32;
                         for d in 0..dim {
                             let dx = rrms * (o_grad[off+d] * w_fwd[d]) - x_fwd[off+d] * rrc_d * gdxw;
                             tensors[x_id].grad.as_cpu_mut()[off+d] += dx;
@@ -658,11 +678,11 @@ impl Graph {
         match &device {
             Device::Gpu(_, stream) => {
                 let old_size = self.tensors[a_id].data.len();
-                let f_fwd = self.functions.get("copy_f32").expect("copy_f32 missing").clone();
-                let f_bwd = self.functions.get("accumulate_f32").expect("accumulate_f32 missing").clone();
+                let f_fwd = self.functions.get("copy_f32").unwrap().clone();
+                let f_bwd = self.functions.get("accumulate_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(new_shape, vec![0.0; old_size]);
+                let out_id = self.alloc_pooled(new_shape);
                 
                 let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -670,21 +690,19 @@ impl Graph {
                 let n = old_size as u64;
                 let mut builder = stream.launch_builder(&f_fwd);
                 builder.arg(a_s).arg(o_s).arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(old_size as u32)) }.expect("Failed to launch copy_f32");
+                unsafe { builder.launch(LaunchConfig::for_num_elems(old_size as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
                     let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
                     
-                    let rank = 1u64; // Using 1D fallback to copy the flat gradient buffer
-                    let s0 = n; let s1 = 1u64; let s2 = 1u64;
+                    let rank = 1u64; let s0 = n; let s1 = 1u64; let s2 = 1u64;
                     let a_str0 = 1u64; let a_str1 = 1u64; let a_str2 = 1u64;
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
                     b1.arg(a_grad).arg(out_grad).arg(&n).arg(&rank)
-                      .arg(&s0).arg(&s1).arg(&s2)
-                      .arg(&a_str0).arg(&a_str1).arg(&a_str2);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(old_size as u32)) }.expect("Failed accumulate reshape");
+                      .arg(&s0).arg(&s1).arg(&s2).arg(&a_str0).arg(&a_str1).arg(&a_str2);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(old_size as u32)) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
@@ -706,6 +724,7 @@ impl Graph {
 
     pub fn transpose(&mut self, a_id: usize, dim0: usize, dim1: usize) -> usize {
         match &self.device {
+            Device::Gpu(_, _) => panic!("GPU Transpose not natively implemented - use reshape fallback or CPU"),
             Device::Cpu => {
                 let a = &self.tensors[a_id];
                 let mut out_shape = a.shape.clone();
@@ -730,7 +749,172 @@ impl Graph {
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
                 out_id
             }
-            Device::Gpu(..) => panic!("GPU Transpose not yet implemented"),
+        }
+    }
+
+    /// Highly specialized transpose for Multi-Head Attention.
+    /// Swaps dimensions 1 and 2: [Batch, Seq, Heads, HeadDim] -> [Batch, Heads, Seq, HeadDim]
+    pub fn transpose_0213(&mut self, a_id: usize) -> usize {
+        let shape = self.tensors[a_id].shape.clone();
+        assert_eq!(shape.len(), 4, "transpose_0213 requires a 4D tensor");
+        
+        let b = shape[0]; let s = shape[1]; let h = shape[2]; let d = shape[3];
+        let out_shape = vec![b, h, s, d];
+        let size = b * s * h * d;
+        let device = self.device.clone();
+
+        match &device {
+            Device::Gpu(_, stream) => {
+                let f_fwd = self.functions.get("transpose_0213_f32").unwrap().clone();
+                let f_bwd = self.functions.get("transpose_0213_backward_f32").unwrap().clone();
+                let stream_clone = stream.clone();
+
+                let out_id = self.alloc_pooled(out_shape);
+                
+                let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                
+                let b_u64 = b as u64; let s_u64 = s as u64; let h_u64 = h as u64; let d_u64 = d as u64;
+                
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder.arg(a_s).arg(o_s).arg(&b_u64).arg(&s_u64).arg(&h_u64).arg(&d_u64);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    
+                    let mut b1 = stream_clone.launch_builder(&f_bwd);
+                    b1.arg(out_grad).arg(a_grad).arg(&b_u64).arg(&s_u64).arg(&h_u64).arg(&d_u64);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                });
+
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
+                out_id
+            }
+            Device::Cpu => {
+                let a_data = self.tensors[a_id].data.as_cpu().clone();
+                let mut out_data = vec![0.0; size];
+                
+                for b_idx in 0..b {
+                    for s_idx in 0..s {
+                        for h_idx in 0..h {
+                            for d_idx in 0..d {
+                                let src_idx = b_idx * s * h * d + s_idx * h * d + h_idx * d + d_idx;
+                                let dst_idx = b_idx * h * s * d + h_idx * s * d + s_idx * d + d_idx;
+                                out_data[dst_idx] = a_data[src_idx];
+                            }
+                        }
+                    }
+                }
+                
+                let out_id = self.alloc(out_shape, out_data);
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let o_grad = tensors[out_id].grad.as_cpu().clone();
+                    let a_grad = tensors[a_id].grad.as_cpu_mut();
+                    for b_idx in 0..b {
+                        for s_idx in 0..s {
+                            for h_idx in 0..h {
+                                for d_idx in 0..d {
+                                    let src_idx = b_idx * s * h * d + s_idx * h * d + h_idx * d + d_idx;
+                                    let dst_idx = b_idx * h * s * d + h_idx * s * d + s_idx * d + d_idx;
+                                    a_grad[src_idx] += o_grad[dst_idx];
+                                }
+                            }
+                        }
+                    }
+                });
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
+                out_id
+            }
+        }
+    }
+
+    /// Rotary Positional Embeddings (RoPE).
+    /// Applies 2D rotations to adjacent pairs within each head's dimension.
+    pub fn rope(&mut self, a_id: usize, head_dim: usize) -> usize {
+        let shape = self.tensors[a_id].shape.clone();
+        assert_eq!(shape.len(), 3, "RoPE requires [Batch, Seq, HiddenDim]");
+        assert!(head_dim % 2 == 0, "Head dimension must be even for 2D rotations");
+        
+        let seq_len = shape[1];
+        let hidden_dim = shape[2];
+        let size = shape.iter().product::<usize>();
+        let num_pairs = size / 2;
+
+        let device = self.device.clone();
+
+        match &device {
+            Device::Gpu(_, stream) => {
+                let f_fwd = self.functions.get("rope_f32").unwrap().clone();
+                let f_bwd = self.functions.get("rope_backward_f32").unwrap().clone();
+                let stream_clone = stream.clone();
+
+                let out_id = self.alloc_pooled(shape);
+
+                let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                let s_u64 = seq_len as u64; let hd_u64 = hidden_dim as u64; 
+                let hdim_u64 = head_dim as u64; let np_u64 = num_pairs as u64;
+
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder.arg(a_s).arg(o_s).arg(&s_u64).arg(&hd_u64).arg(&hdim_u64).arg(&np_u64);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(num_pairs as u32)) }.unwrap();
+
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                    let mut b1 = stream_clone.launch_builder(&f_bwd);
+                    b1.arg(out_grad).arg(a_grad).arg(&s_u64).arg(&hd_u64).arg(&hdim_u64).arg(&np_u64);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(num_pairs as u32)) }.unwrap();
+                });
+
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
+                out_id
+            }
+            Device::Cpu => {
+                let a_data = self.tensors[a_id].data.as_cpu().clone();
+                let mut out_data = vec![0.0; size];
+
+                for i in 0..num_pairs {
+                    let d_pair = i % (hidden_dim / 2);
+                    let d_head_pair = d_pair % (head_dim / 2);
+                    let seq_idx = (i / (hidden_dim / 2)) % seq_len;
+                    let idx1 = i * 2; let idx2 = i * 2 + 1;
+
+                    let freq = 10000.0f32.powf(-2.0 * (d_head_pair as f32) / (head_dim as f32));
+                    let angle = (seq_idx as f32) * freq;
+                    let cos_a = angle.cos(); let sin_a = angle.sin();
+
+                    let x1 = a_data[idx1]; let x2 = a_data[idx2];
+                    out_data[idx1] = x1 * cos_a - x2 * sin_a;
+                    out_data[idx2] = x2 * cos_a + x1 * sin_a;
+                }
+
+                let out_id = self.alloc(shape, out_data);
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let o_grad = tensors[out_id].grad.as_cpu().clone();
+                    let a_grad = tensors[a_id].grad.as_cpu_mut();
+                    for i in 0..num_pairs {
+                        let d_pair = i % (hidden_dim / 2);
+                        let d_head_pair = d_pair % (head_dim / 2);
+                        let seq_idx = (i / (hidden_dim / 2)) % seq_len;
+                        let idx1 = i * 2; let idx2 = i * 2 + 1;
+
+                        let freq = 10000.0f32.powf(-2.0 * (d_head_pair as f32) / (head_dim as f32));
+                        let angle = (seq_idx as f32) * freq;
+                        let cos_a = angle.cos(); let sin_a = angle.sin();
+
+                        let g1 = o_grad[idx1]; let g2 = o_grad[idx2];
+                        a_grad[idx1] += g1 * cos_a + g2 * sin_a;
+                        a_grad[idx2] += g2 * cos_a - g1 * sin_a;
+                    }
+                });
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
+                out_id
+            }
         }
     }
 
@@ -747,46 +931,35 @@ impl Graph {
                 
                 out_shape.remove(dim);
                 in_strides.remove(dim);
-                
                 let out_size = if out_shape.is_empty() { 1 } else { out_shape.iter().product() };
-                
                 let rank = out_shape.len() as u64;
-                assert!(rank <= 3, "GPU Sum supports max output rank 3");
                 
-                let mut os = [1u64; 3];
-                let mut is = [0u64; 3];
-                for i in 0..out_shape.len() {
-                    os[i] = out_shape[i] as u64;
-                    is[i] = in_strides[i] as u64;
-                }
+                let mut os = [1u64; 3]; let mut is = [0u64; 3];
+                for i in 0..out_shape.len() { os[i] = out_shape[i] as u64; is[i] = in_strides[i] as u64; }
 
-                let f_fwd = self.functions.get("sum_f32").expect("sum_f32 missing").clone();
-                let f_bwd = self.functions.get("sum_backward_f32").expect("sum_backward_f32 missing").clone();
+                let f_fwd = self.functions.get("sum_f32").unwrap().clone();
+                let f_bwd = self.functions.get("sum_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(out_shape.clone(), vec![0.0; out_size]);
+                let out_id = self.alloc_pooled(out_shape.clone());
 
                 let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
 
                 let out_size_u64 = out_size as u64;
                 let mut builder = stream.launch_builder(&f_fwd);
-                builder.arg(a_s).arg(o_s)
-                       .arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
-                       .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2])
-                       .arg(&is[0]).arg(&is[1]).arg(&is[2]);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed to launch sum_f32");
+                builder.arg(a_s).arg(o_s).arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
+                       .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2]).arg(&is[0]).arg(&is[1]).arg(&is[2]);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
                     let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(out_grad).arg(a_grad)
-                      .arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
-                      .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2])
-                      .arg(&is[0]).arg(&is[1]).arg(&is[2]);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed sum_bwd");
+                    b1.arg(out_grad).arg(a_grad).arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
+                      .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2]).arg(&is[0]).arg(&is[1]).arg(&is[2]);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
@@ -836,33 +1009,26 @@ impl Graph {
                 
                 out_shape.remove(dim);
                 in_strides.remove(dim);
-                
                 let out_size = if out_shape.is_empty() { 1 } else { out_shape.iter().product() };
                 let rank = out_shape.len() as u64;
                 
-                let mut os = [1u64; 3];
-                let mut is = [0u64; 3];
-                for i in 0..out_shape.len() {
-                    os[i] = out_shape[i] as u64;
-                    is[i] = in_strides[i] as u64;
-                }
+                let mut os = [1u64; 3]; let mut is = [0u64; 3];
+                for i in 0..out_shape.len() { os[i] = out_shape[i] as u64; is[i] = in_strides[i] as u64; }
 
-                let f_fwd = self.functions.get("max_f32").expect("max_f32 missing").clone();
-                let f_bwd = self.functions.get("max_backward_f32").expect("max_backward_f32 missing").clone();
+                let f_fwd = self.functions.get("max_f32").unwrap().clone();
+                let f_bwd = self.functions.get("max_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                let out_id = self.alloc(out_shape.clone(), vec![0.0; out_size]);
+                let out_id = self.alloc_pooled(out_shape.clone());
 
                 let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
                 let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
 
                 let out_size_u64 = out_size as u64;
                 let mut builder = stream.launch_builder(&f_fwd);
-                builder.arg(a_s).arg(o_s)
-                       .arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
-                       .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2])
-                       .arg(&is[0]).arg(&is[1]).arg(&is[2]);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed max_f32");
+                builder.arg(a_s).arg(o_s).arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
+                       .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2]).arg(&is[0]).arg(&is[1]).arg(&is[2]);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let a_data = match &tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
@@ -870,11 +1036,9 @@ impl Graph {
                     let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(a_data).arg(out_grad).arg(a_grad)
-                      .arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
-                      .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2])
-                      .arg(&is[0]).arg(&is[1]).arg(&is[2]);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.expect("Failed max_bwd");
+                    b1.arg(a_data).arg(out_grad).arg(a_grad).arg(&out_size_u64).arg(&reduced_dim_size).arg(&reduced_dim_stride)
+                      .arg(&rank).arg(&os[0]).arg(&os[1]).arg(&os[2]).arg(&is[0]).arg(&is[1]).arg(&is[2]);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
 
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
@@ -893,10 +1057,7 @@ impl Graph {
                     let mut nd = Tensor::flat_to_nd(i, &a.shape);
                     nd.remove(dim);
                     let idx = if out_shape.is_empty() { 0 } else { Tensor::nd_to_flat(&nd, &os) };
-                    if a_data[i] > out_data[idx] {
-                        out_data[idx] = a_data[i];
-                        argmax[idx] = i;
-                    }
+                    if a_data[i] > out_data[idx] { out_data[idx] = a_data[i]; argmax[idx] = i; }
                 }
                 let out_id = self.alloc(out_shape, out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
@@ -906,6 +1067,157 @@ impl Graph {
                 self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
                 out_id
             }
+        }
+    }
+
+    /// Batched Matrix Multiplication (BMM)
+    /// Supports implicit transpose of `B` to save VRAM (Crucial for Q @ K.T)
+    pub fn bmm(&mut self, a_id: usize, b_id: usize, trans_b: bool) -> usize {
+        let a_shape = self.tensors[a_id].shape.clone();
+        let b_shape = self.tensors[b_id].shape.clone();
+        
+        assert!(a_shape.len() == 3 && b_shape.len() == 3, "BMM requires 3D tensors: [Batch, M, K]");
+        assert_eq!(a_shape[0], b_shape[0], "Batch dimensions must match");
+
+        let batch = a_shape[0];
+        let m = a_shape[1];
+        let k = a_shape[2];
+        let n = if trans_b { b_shape[1] } else { b_shape[2] };
+        
+        if trans_b { assert_eq!(k, b_shape[2], "Inner dimensions must match for transposed B"); } 
+        else { assert_eq!(k, b_shape[1], "Inner dimensions must match"); }
+
+        let device = self.device.clone();
+
+        match &device {
+            Device::Gpu(_, stream) => {
+                let f_fwd = self.functions.get("bmm_f32").unwrap().clone();
+                let f_bwd_a = self.functions.get(if trans_b { "bmm_backward_a_transb_f32" } else { "bmm_backward_a_f32" }).unwrap().clone();
+                let f_bwd_b = self.functions.get(if trans_b { "bmm_backward_b_transb_f32" } else { "bmm_backward_b_f32" }).unwrap().clone();
+                let stream_clone = stream.clone();
+
+                let out_id = self.alloc_pooled(vec![batch, m, n]);
+
+                let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let b_s = match &self.tensors[b_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                let batch_u64 = batch as u64; let m_u64 = m as u64; let k_u64 = k as u64; let n_u64 = n as u64;
+
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder.arg(a_s).arg(b_s).arg(o_s).arg(&batch_u64).arg(&m_u64).arg(&k_u64).arg(&n_u64).arg(&trans_b);
+
+                // 3D Grid! Z maps to the batch dimension, X and Y to the matrix tiles.
+                let cfg = LaunchConfig { grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, batch as u32), block_dim: (16, 16, 1), shared_mem_bytes: 0 };
+                unsafe { builder.launch(cfg) }.unwrap();
+
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let b_grad = match &tensors[b_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let a_data = match &tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let b_data = match &tensors[b_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                    let cfg_a = LaunchConfig { grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, batch as u32), block_dim: (16, 16, 1), shared_mem_bytes: 0 };
+                    let mut b1 = stream_clone.launch_builder(&f_bwd_a);
+                    b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&batch_u64).arg(&m_u64).arg(&k_u64).arg(&n_u64);
+                    unsafe { b1.launch(cfg_a) }.unwrap();
+
+                    // Note: for trans_b, dB shape is [Batch, N, K]. So row=N, col=K.
+                    let cfg_b = if trans_b { LaunchConfig { grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, batch as u32), block_dim: (16, 16, 1), shared_mem_bytes: 0 } }
+                                else       { LaunchConfig { grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, batch as u32), block_dim: (16, 16, 1), shared_mem_bytes: 0 } };
+                    
+                    let mut b2 = stream_clone.launch_builder(&f_bwd_b);
+                    b2.arg(a_data).arg(out_grad).arg(b_grad).arg(&batch_u64).arg(&m_u64).arg(&k_u64).arg(&n_u64);
+                    unsafe { b2.launch(cfg_b) }.unwrap();
+                });
+
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id, b_id], output: out_id, backward_fn });
+                out_id
+            }
+            Device::Cpu => {
+                let mut out_data = vec![0.0; batch * m * n];
+                let a_fwd = self.tensors[a_id].data.as_cpu().clone();
+                let b_fwd = self.tensors[b_id].data.as_cpu().clone();
+                
+                for b_idx in 0..batch {
+                    let a_off = b_idx * (m * k);
+                    let b_off = b_idx * (if trans_b { n * k } else { k * n });
+                    let c_off = b_idx * (m * n);
+                    for r in 0..m {
+                        for c in 0..n {
+                            let mut sum = 0.0;
+                            for i in 0..k { 
+                                let val_a = a_fwd[a_off + r * k + i];
+                                let val_b = if trans_b { b_fwd[b_off + c * k + i] } else { b_fwd[b_off + i * n + c] };
+                                sum += val_a * val_b; 
+                            }
+                            out_data[c_off + r * n + c] = sum;
+                        }
+                    }
+                }
+                
+                let out_id = self.alloc(vec![batch, m, n], out_data);
+                
+                // Extremely simplified CPU backward approximation for trans_b tests
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = tensors[out_id].grad.as_cpu().clone();
+                    for b_idx in 0..batch {
+                        let a_off = b_idx * (m * k); let b_off = b_idx * (if trans_b { n * k } else { k * n }); let c_off = b_idx * (m * n);
+                        for r in 0..m { for i in 0..k { let mut sum = 0.0; for c in 0..n {
+                            let val_b = if trans_b { b_fwd[b_off + c * k + i] } else { b_fwd[b_off + i * n + c] };
+                            sum += out_grad[c_off + r * n + c] * val_b; 
+                        } tensors[a_id].grad.as_cpu_mut()[a_off + r * k + i] += sum; } }
+                        for i in 0..k { for c in 0..n { let mut sum = 0.0; for r in 0..m {
+                            sum += a_fwd[a_off + r * k + i] * out_grad[c_off + r * n + c]; 
+                        } 
+                        if trans_b { tensors[b_id].grad.as_cpu_mut()[b_off + c * k + i] += sum; } 
+                        else       { tensors[b_id].grad.as_cpu_mut()[b_off + i * n + c] += sum; } } }
+                    }
+                });
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id, b_id], output: out_id, backward_fn });
+                out_id
+            }
+        }
+    }
+
+    /// Standalone Softmax over the last dimension (Crucial for Attention Probabilities)
+    pub fn softmax(&mut self, a_id: usize) -> usize {
+        let device = self.device.clone();
+        match &device {
+            Device::Gpu(_, stream) => {
+                let a = &self.tensors[a_id];
+                let out_shape = a.shape.clone();
+                let n = *out_shape.last().unwrap() as u64;
+                let b = (a.data.len() as u64) / n;
+
+                let f_fwd = self.functions.get("softmax_f32").unwrap().clone();
+                let f_bwd = self.functions.get("softmax_backward_f32").unwrap().clone();
+                let stream_clone = stream.clone();
+
+                let out_id = self.alloc_pooled(out_shape);
+
+                let a_s = match &self.tensors[a_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                let o_s = match &self.tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder.arg(a_s).arg(o_s).arg(&b).arg(&n);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(b as u32)) }.unwrap();
+
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_data = match &tensors[out_id].data { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let out_grad = match &tensors[out_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+                    let a_grad = match &tensors[a_id].grad { Storage::Gpu(s) => s, _ => unreachable!() };
+
+                    let mut b1 = stream_clone.launch_builder(&f_bwd);
+                    b1.arg(out_data).arg(out_grad).arg(a_grad).arg(&b).arg(&n);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(b as u32)) }.unwrap();
+                });
+
+                self.tape.nodes.push(TapeNode { inputs: vec![a_id], output: out_id, backward_fn });
+                out_id
+            }
+            Device::Cpu => panic!("Standalone Softmax CPU fallback not implemented yet."),
         }
     }
 
@@ -920,12 +1232,12 @@ impl Graph {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let f = self.functions.get("fill_f32").expect("fill_f32 not loaded").clone();
+                let f = self.functions.get("fill_f32").unwrap().clone();
                 let n = grad_slice.len() as u64;
                 let val = 1.0f32;
                 let mut builder = stream.launch_builder(&f);
                 builder.arg(grad_slice).arg(&val).arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(n as u32)) }.expect("Failed to fill seed gradient");
+                unsafe { builder.launch(LaunchConfig::for_num_elems(n as u32)) }.unwrap();
             }
         }
         for node in self.tape.nodes.iter().rev() { (node.backward_fn)(&mut self.tensors); }
