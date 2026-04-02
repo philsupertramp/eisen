@@ -1,10 +1,12 @@
 use eisen::graph::Graph;
-use eisen::nn::linear::Linear;
-use eisen::nn::embedding::Embedding;
 use eisen::nn::optim::AdamW;
 use eisen::nn::Module;
+use eisen::nn::embedding::Embedding;
+use eisen::nn::linear::Linear;
 use eisen::tensor::Device;
 use cudarc::driver::CudaContext;
+use std::sync::Arc;
+
 
 /// A Fixed-Window Neural Language Model (Bengio et al. 2003)
 struct BengioLM {
@@ -62,7 +64,6 @@ impl Module for BengioLM {
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
         Ok(ctx) => {
-            let ctx = ctx;
             let stream = ctx.default_stream();
             Some(Device::Gpu(ctx, stream))
         }
@@ -70,25 +71,35 @@ fn setup_gpu() -> Option<Device> {
     }
 }
 
-
-fn main() {
-    println!("=== Eisen Example: German Bengio LM (Sliding Window) ===");
+#[test]
+fn test_bengio_lm_german_learning() {
+    println!("\n=== Eisen Phase 3: Bengio Fixed-Window LM (GPU Accelerated) ===");
+    
     let device = match setup_gpu() {
         Some(d) => d,
-        None => Device::Cpu
+        None => {
+            eprintln!("No GPU found, skipping test.");
+            return;
+        }
     };
+    
     let mut g = Graph::new(device);
     
-    // Dataset: "der mensch ist was er isst ."
+    // Dataset: "der mensch ist was er isst ." (Man is what he eats)
     let vocab = vec!["der", "mensch", "ist", "was", "er", "isst", "."];
     let vocab_size = vocab.len();
-    let window_size = 2;
+    let window_size = 2; // Look at 2 previous words to predict the 3rd
     let hidden_dim = 32;
     
     let model = BengioLM::new(&mut g, vocab_size, window_size, hidden_dim);
     let mut optim = AdamW::new(model.params(), 0.01);
     
-    // (der, mensch) -> ist, etc.
+    // Prepare sliding window data
+    // (der, mensch) -> ist
+    // (mensch, ist) -> was
+    // (ist, was) -> er
+    // (was, er) -> isst
+    // (er, isst) -> .
     let x_data = vec![
         0.0, 1.0, // der, mensch
         1.0, 2.0, // mensch, ist
@@ -97,15 +108,18 @@ fn main() {
         4.0, 5.0, // er, isst
     ];
     let y_targets = vec![2, 3, 4, 5, 6];
-    let num_samples = 5;
+    let num_samples = y_targets.len();
 
-    println!("Training on: 'der mensch ist was er isst .'");
+    println!("Training Bengio LM on German sentence in VRAM...");
     for epoch in 1..=300 {
         let x_id = g.alloc(vec![num_samples, window_size], x_data.clone());
         let logits_id = model.forward(&mut g, x_id);
         let loss_id = g.cross_entropy(logits_id, &y_targets);
         
-        let loss = g.tensors[loss_id].sync_to_cpu()[0];
+        // CRITICAL: Pull the loss scalar back from VRAM to CPU to read it
+        let loss_data = g.tensors[loss_id].sync_to_cpu();
+        let loss = loss_data[0];
+        
         if epoch % 50 == 0 {
             println!("Epoch {:03} | Loss: {:.6}", epoch, loss);
         }
@@ -116,19 +130,21 @@ fn main() {
         g.tape.nodes.clear();
     }
 
-    // Inference check
-    let test_context = vec![1.0, 2.0]; // "der", "mensch"
+    // --- INFERENCE ---
+    println!("\nInference (Context size 2):");
+    let test_context = vec![0.0, 1.0]; // "der", "mensch"
     let x_test = g.alloc(vec![1, window_size], test_context);
     let logits_id = model.forward(&mut g, x_test);
     
-    let predicted_id = g.tensors[logits_id].sync_to_cpu().iter().enumerate()
+    // CRITICAL: Pull the final inference logits back from VRAM to CPU
+    let logits = g.tensors[logits_id].sync_to_cpu();
+    let predicted_id = logits.iter().enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .map(|(i, _)| i).unwrap();
     
-    println!("\nTest Context: 'der mensch'");
-    println!("Prediction:   '{}'", vocab[predicted_id]);
+    println!("Input: 'der mensch' -> Predicted: '{}'", vocab[predicted_id]);
+    assert_eq!(vocab[predicted_id], "ist");
     
-    if vocab[predicted_id] == "ist" {
-        println!("\nSUCCESS: Model correctly learned the grammatical dependency!");
-    }
+    println!("\nPhase 3 Complete: Bengio LM successfully learned German grammar dependencies fully on the GPU!");
 }
+

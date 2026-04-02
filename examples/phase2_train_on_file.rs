@@ -5,6 +5,8 @@ use eisen::nn::optim::AdamW;
 use eisen::nn::Module;
 use std::collections::HashMap;
 use std::fs;
+use eisen::tensor::Device;
+use cudarc::driver::CudaContext;
 
 /// Simple Word-Level Tokenizer for German text
 struct Tokenizer {
@@ -80,6 +82,15 @@ impl Module for BengioLM {
         p
     }
 }
+fn setup_gpu() -> Option<Device> {
+    match CudaContext::new(0) {
+        Ok(ctx) => {
+            let stream = ctx.default_stream();
+            Some(Device::Gpu(ctx, stream))
+        }
+        Err(_) => None,
+    }
+}
 
 fn main() {
     // 1. Load the text file
@@ -100,7 +111,11 @@ fn main() {
     let epochs = 50;
     let lr = 0.005;
 
-    let mut g = Graph::default();
+    let device = match setup_gpu() {
+        Some(d) => d,
+        None => Device::Cpu
+    };
+    let mut g = Graph::new(device);
     let model = BengioLM::new(&mut g, tokenizer.id_to_word.len(), window_size, hidden_dim);
     let mut optim = AdamW::new(model.params(), lr);
 
@@ -130,7 +145,7 @@ fn main() {
             let logits_id = model.forward(&mut g, x_id);
             let loss_id = g.cross_entropy(logits_id, &y_batch);
             
-            total_loss += g.tensors[loss_id].data.as_cpu()[0];
+            total_loss += g.tensors[loss_id].sync_to_cpu()[0];
             num_batches += 1;
 
             // Backward & Optimize
@@ -159,7 +174,7 @@ fn main() {
         let x_id = g.alloc(vec![1, window_size], context.iter().map(|&t| t as f32).collect());
         let logits_id = model.forward(&mut g, x_id);
         
-        let predicted_id = g.tensors[logits_id].data.as_cpu().iter().enumerate()
+        let predicted_id = g.tensors[logits_id].sync_to_cpu().iter().enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
             .map(|(i, _)| i).unwrap();
         
