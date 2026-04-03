@@ -215,7 +215,7 @@ fn main() {
     let ffn_dim = 128;      // Feed-Forward expansion
     let num_layers = 2;     // 2 full Transformer blocks
     let batch_size = 32;
-    let epochs = 30;
+    let epochs = 50;
     let lr = 0.003;
 
     let mut g = Graph::new(device);
@@ -239,12 +239,11 @@ fn main() {
             let mut x_batch = Vec::with_capacity(current_batch_size * seq_len);
             let mut y_batch = Vec::with_capacity(current_batch_size * seq_len);
 
-            // Create causal language modeling pairs (predict next token for EVERY position)
             for b in 0..current_batch_size {
                 let start_idx = i + b * seq_len;
                 for s in 0..seq_len {
                     x_batch.push(tokens[start_idx + s] as f32);
-                    y_batch.push(tokens[start_idx + s + 1]); // The target is shifted by 1
+                    y_batch.push(tokens[start_idx + s + 1]); 
                 }
             }
 
@@ -252,13 +251,12 @@ fn main() {
             let x_id = g.alloc(vec![current_batch_size, seq_len], x_batch);
             let logits_id = model.forward(&mut g, x_id);
             
-            // 2. Reshape for Loss: [Batch, Seq, Vocab] -> [Batch * Seq, Vocab]
+            // 2. Reshape for Loss
             let flat_logits_id = g.reshape(logits_id, vec![current_batch_size * seq_len, vocab_size]);
             
             // 3. Compute Loss
             let loss_id = g.cross_entropy(flat_logits_id, &y_batch);
             
-            // Pull the scalar loss to the CPU to log it
             let loss_val = g.tensors[loss_id].sync_to_cpu()[0];
             total_loss += loss_val;
             num_batches += 1;
@@ -268,18 +266,8 @@ fn main() {
             g.backward(loss_id);
             optim.step(&mut g);
             
-            // 5. Checkpoint & Reclaim VRAM
+            // 5. Clean VRAM Pool
             g.clear_activations();
-            
-            // --- VRAM LEAK FIX ---
-            // Because `g.alloc()` injects fresh allocations into the graph (like `x_id` and internal MHA masks),
-            // and `clear_activations()` deposits them into the pool, those buckets can grow infinitely.
-            // We cap bucket sizes to cleanly maintain the pool without leaking memory.
-            for bucket in g.vram_pool.values_mut() {
-                if bucket.len() > 8 {
-                    bucket.truncate(8);
-                }
-            }
         }
 
         if epoch % 5 == 0 {
@@ -291,11 +279,9 @@ fn main() {
     println!("\nGenerating from prompt...");
     let prompt = "Und der Haifisch";
     let mut input_tokens = tokenizer.encode(prompt);
-    
-    // BPE naturally handles spacing, so we don't inject extra spaces in the output loop
     print!("{}", prompt);
 
-    for _ in 0..30 { // Let's generate a bit more text now that we have subwords!
+    for _ in 0..30 {
         let start = input_tokens.len().saturating_sub(seq_len);
         let context = &input_tokens[start..];
         let current_seq_len = context.len();
@@ -304,7 +290,6 @@ fn main() {
         let logits_id = model.forward(&mut g, x_id);
         
         let logits_data = g.tensors[logits_id].sync_to_cpu();
-        
         let last_token_logits_start = (current_seq_len - 1) * vocab_size;
         let last_token_logits = &logits_data[last_token_logits_start..last_token_logits_start + vocab_size];
         
@@ -316,11 +301,7 @@ fn main() {
         input_tokens.push(predicted_id);
         
         g.clear_activations();
-        
-        // Prevent inference pool leakage
-        for bucket in g.vram_pool.values_mut() {
-            if bucket.len() > 4 { bucket.truncate(4); }
-        }
+        // Zero VRAM leak hacks needed here either!
     }
     println!("\n\nExperiment Complete: BPE + Transformer generated text successfully!");
 }

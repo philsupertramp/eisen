@@ -9,11 +9,8 @@ pub struct Graph {
     pub device: Device,
     pub functions: HashMap<String, CudaFunction>,
     
-    // --- VRAM ALLOCATOR & CHECKPOINTING ---
     pub vram_pool: HashMap<usize, Vec<Storage>>,
     pub num_params: usize, 
-    /// If true, math operations allocate pooled memory but DO NOT record to the Wengert list.
-    /// This is the core mechanism for Gradient Checkpointing.
     pub no_grad: bool,
 }
 
@@ -69,18 +66,21 @@ impl Graph {
         self.num_params = self.tensors.len();
     }
 
-    /// Returns a marker representing the current allocation state
     pub fn mark_save_point(&self) -> usize {
         self.tensors.len()
     }
 
-    /// Recycles all ephemeral tensors allocated AFTER the save_point back into the VRAM pool.
     pub fn restore_save_point(&mut self, save_point: usize) {
         while self.tensors.len() > save_point {
             let t = self.tensors.pop().unwrap();
-            let size = if t.shape.is_empty() { 1 } else { t.shape.iter().product() };
-            self.vram_pool.entry(size).or_default().push(t.data);
-            self.vram_pool.entry(size).or_default().push(t.grad);
+            
+            // ARCHITECTURAL FIX: Only recycle tensors that were specifically allocated by internal ops.
+            // If `is_pooled` is false (e.g. explicitly injected batches), it simply drops and `cudaFree`s natively!
+            if t.is_pooled {
+                let size = if t.shape.is_empty() { 1 } else { t.shape.iter().product() };
+                self.vram_pool.entry(size).or_default().push(t.data);
+                self.vram_pool.entry(size).or_default().push(t.grad);
+            }
         }
     }
 
@@ -128,16 +128,19 @@ impl Graph {
         let id = self.tensors.len();
         self.tensors.push(Tensor {
             id, shape: shape.clone(), strides, data: data_storage, grad: grad_storage, device, name: None,
+            is_pooled: true, // This tensor belongs to the internal engine pool
         });
         id
     }
 
     pub fn alloc(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
         let id = self.tensors.len();
+        // Tensor::new sets is_pooled = false automatically
         self.tensors.push(Tensor::new(id, shape, data, self.device.clone()));
         id
     }
 
+    // --- Helper Methods ---
     pub fn get_data(&self, tensor_id: usize) -> &Vec<f32> { self.tensors[tensor_id].data.as_cpu() }
     pub fn get_grad(&self, tensor_id: usize) -> &Vec<f32> { self.tensors[tensor_id].grad.as_cpu() }
     pub fn sync_grad_to_cpu(&self, tensor_id: usize) -> Vec<f32> {
@@ -150,8 +153,7 @@ impl Graph {
         }
     }
 
-    // --- CORE MATH OPS (WITH CHECKPOINTING SUPPORT) ---
-
+    // --- Core Math Ops ---
     pub fn add(&mut self, a_id: usize, b_id: usize) -> usize {
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
@@ -228,7 +230,7 @@ impl Graph {
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
         let out_shape = Tensor::get_broadcasted_shape(&a_shape, &b_shape);
-        let out_size = out_shape.iter().product::<usize>();
+        let out_size: usize = out_shape.iter().product();
         let device = self.device.clone();
 
         match &device {
