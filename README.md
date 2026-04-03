@@ -21,48 +21,50 @@
 * ✅ **Optimizer:** AdamW implementation for flat parameter buffer updates.  
 * ✅ **Milestone 2:** Successfully overfitted a tiny MLP on a classification task with loss reaching zero.
 
-## **Phase 3: Hardware Acceleration (The GPU Leap) 🚧**
+## **Phase 3: Hardware Acceleration (The GPU Leap) ✅**
 
 *Focus: Moving from RAM to VRAM and writing blazing-fast compute kernels via cudarc.*
 
 * ✅ **The Backend Abstraction:** Refactored Tensor to support Device::Cpu and Device::Gpu(Arc\<CudaContext\>, Arc\<CudaStream\>).  
 * ✅ **PTX Pipeline:** Automated .cu to .ptx compilation via build.rs and module loading in Graph.  
-* 🚧 **Custom CUDA Kernels:**  
-  * ✅ add\_f32: Forward element-wise addition (Broadcast-aware).  
-  * ✅ fill\_f32: Buffer initialization (seed gradients).  
-  * ✅ accumulate\_f32: Gradient accumulation (a \+= b with atomicAdd).  
-  * ✅ mul\_f32: Element-wise multiplication (Forward/Backward).  
-  * ✅ matmul\_f32: The core GEMM kernel (Naive 2D implementation).  
-  * ✅ silu\_f32 / silu\_backward\_f32: Fused activation pass.  
-  * \[ \] gather\_f32: Row-based indexing for Embeddings.  
-  * \[ \] rms\_norm\_f32: Fused normalization kernel.  
-  * \[ \] cross\_entropy\_f32: Fused loss and softmax kernel.  
-  * \[ \] reductions: Sum and Max kernels for dimension reduction.  
-* \[ \] **VRAM Allocator:** Implement a memory pool in the Graph to strictly manage the 6-8GB VRAM limit and avoid allocation overhead.  
-* \[ \] **Milestone 3:** Run the XOR and Bengio LM tests entirely on the GPU. Assert bit-perfect gradient matches with massive speedups.
+* ✅ **Custom CUDA Kernels:** All Core Math Operations ported to VRAM\!  
+* ✅ **VRAM Allocator:** Implemented a size-bucketed free list (Graph::vram\_pool). Activation buffers are intelligently stripped and recycled at the end of each step.  
+* ✅ **Milestone 3:** Run the XOR and Bengio LM tests entirely on the GPU with zero allocations inside the loop.
 
-## **Phase 4: The Transformer Architecture & VRAM Strategy**
+## **Phase 4: The Transformer Architecture & VRAM Strategy ✅**
 
 *Focus: Scaled dot-product attention and strict memory survival.*
 
-* **Positional Encodings:** Implement RoPE (Rotary Positional Embeddings).  
-* **Multi-Head Attention:** QKV projections, causal masking, and optimized attention.  
-* **Gradient Checkpointing:** Intentional activation dropping and recomputation to survive 6-8GB VRAM limits.  
-* **Milestone 4:** Full Transformer block forward/backward pass on GPU without OOM panics.
+* ✅ **Attention Primitives:** Added memory-efficient Batched MatMul (bmm\_f32 with inline transpose flags) and standalone softmax\_f32 kernels.  
+* ✅ **Multi-Head Attention:** Constructed MultiHeadAttention. Implemented a highly specific transpose\_0213\_f32 kernel to slice matrices into multiple heads dynamically without breaking VRAM.  
+* ✅ **Positional Encodings:** Implemented Rotary Positional Embeddings (RoPE). The frequencies are computed entirely on-the-fly in registers.  
+* ✅ **Transformer Block:** Assembled the TransformerBlock utilizing the Pre-Norm architecture with dual residual connections.  
+* ✅ **Gradient Checkpointing:** Added no\_grad, mark\_save\_point, and restore\_save\_point to the Graph. Fixed VRAM allocation provenance (is\_pooled) to ensure a zero-leak environment.  
+* ✅ **Milestone 4:** Full Transformer block forward/backward pass on GPU with zero memory leaks and fully verified gradient routing.
 
-## **Phase 5: German Optimization & Data Pipeline**
+## **Phase 5: German Optimization & Data Pipeline ✅**
 
 *Focus: Language sovereignty and keeping the CPU fed.*
 
-* **Custom BPE Tokenizer:** Byte-pair encoding tailored for German compound words.  
-* **hf-mount Integration:** Use Hugging Face's mounting tool to stream large-scale German datasets (OSCAR, Wikipedia, Gutenberg) directly into the training loop, bypassing local storage bottlenecks.  
-* **Streaming Dataloader:** Multi-threaded Rust dataloader to read from the hf-mount virtual filesystem and prep batches in CPU RAM before DMA transfer to VRAM.  
-* **Milestone 5:** Train a prototype model (10M-50M parameters) until it generates coherent German phrases.
+* ✅ **Custom BPE Tokenizer:** Byte-pair encoding tailored for German morphology. Replaces naive word splits and enables sub-word semantics.  
+* ✅ **Dataset Extraction Bridge:** Python utility utilizing datasets streaming to pipe ungated Hugging Face datasets (e.g., German Wikipedia) into flat .txt files.  
+* ✅ **BPE Sampling & Progress Tracking:** Implemented statistical chunk sampling for memory-safe BPE training on massive corpora, alongside custom zero-dependency ANSI progress bars.  
+* ✅ **Parallelized Data Preprocessor:** Built a Producer-Consumer thread pool in Rust to encode massive 100GB+ text files into binary formats at maximum CPU utilization, complete with instant byte-offset state recovery.  
+* ✅ **High-Throughput I/O Dataloader:** Upgraded the BinaryDataLoader to use massive sequential buffered chunking. Eliminated backward disk seeks, bypassing OS page-cache thrashing and perfectly sustaining maximum GPU utilization.  
+* ✅ **Milestone 5:** The engine is completely abstracted from data loading bottlenecks, capable of saturating the GPU by streaming massive German datasets with zero runtime tokenization overhead.
 
-## **Phase 6: The Hugging Face Bridge**
+## **Phase 6: The Hugging Face Bridge 🚧**
 
 *Focus: Ecosystem interoperability.*
 
-* **Parameter Naming:** Map Tensor names to standard transformers keys (Llama/Mistral).  
-* **Binary Exporter:** Write .safetensors binary format.  
-* **Milestone 6:** Load the custom Rust model natively in Python transformers for inference.
+* \[ \] **Weight Exporter:** Write a .safetensors binary writer to export Eisen parameters.  
+* \[ \] **Config Generator:** Script to output config.json compatible with Llama-style architectures.  
+* \[ \] **Milestone 6:** Load the custom Rust model natively in Python transformers for inference.
+
+## **Phase 7: Hyper-Optimization & Research Features 🚀**
+
+*Focus: Pushing the limits of 6GB VRAM and custom kernels.*
+
+* \[ \] **Flash Attention:** Implement a custom Triton-style fused kernel for Attention to bypass the $O(N^2)$ memory bottleneck.  
+* \[ \] **KV Caching:** Fast inference kernel that only computes the new token's attention.  
+* \[ \] **LoRA (Low-Rank Adaptation):** Implement $A$ and $B$ adapter matrices for parameter-efficient fine-tuning on our own tape.
