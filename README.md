@@ -46,25 +46,36 @@
 
 *Focus: Language sovereignty and keeping the CPU fed.*
 
-* ✅ **Custom BPE Tokenizer:** Byte-pair encoding tailored for German morphology. Replaces naive word splits and enables sub-word semantics.  
-* ✅ **Dataset Extraction Bridge:** Python utility utilizing datasets streaming to pipe ungated Hugging Face datasets (e.g., German Wikipedia) into flat .txt files.  
-* ✅ **BPE Sampling & Progress Tracking:** Implemented statistical chunk sampling for memory-safe BPE training on massive corpora, alongside custom zero-dependency ANSI progress bars.  
-* ✅ **Parallelized Data Preprocessor:** Built a Producer-Consumer thread pool in Rust to encode massive 100GB+ text files into binary formats at maximum CPU utilization, complete with instant byte-offset state recovery.  
-* ✅ **High-Throughput I/O Dataloader:** Upgraded the BinaryDataLoader to use massive sequential buffered chunking. Eliminated backward disk seeks, bypassing OS page-cache thrashing and perfectly sustaining maximum GPU utilization.  
-* ✅ **Milestone 5:** The engine is completely abstracted from data loading bottlenecks, capable of saturating the GPU by streaming massive German datasets with zero runtime tokenization overhead.
+* ✅ **Custom BPE Tokenizer:** Byte-pair encoding tailored for German morphology.  
+* ✅ **Dataset Extraction Bridge:** Python utility utilizing datasets streaming to pipe Hugging Face datasets into flat .txt.  
+* ✅ **Parallelized BPE Trainer:** Built a multi-threaded Rust pool with statistical sampling for memory-safe BPE training.  
+* ✅ **High-Throughput I/O Dataloader:** BinaryDataLoader uses massive sequential buffered chunking to sustain maximum GPU utilization.  
+* ✅ **EisenBoard (Telemetry):** Built a zero-dependency, raw std::net::TcpListener background thread serving a real-time dark-mode web dashboard (HTML5 Canvas). It shares loss and TPS state via Arc\<RwLock\> without blocking the GPU.  
+* ✅ **Milestone 5:** The engine is a complete research suite, fully abstracted from data bottlenecks with real-time browser monitoring.
 
-## **Phase 6: The Hugging Face Bridge 🚧**
+## **Phase 6: Hyper-Optimization & Engine Tuning 🚀**
+
+*Focus: Pushing the limits of VRAM, custom kernels, and training stability.*
+
+* \[ \] **Gradient Accumulation:** Simulate massive batch sizes (e.g., effective batch 64\) without increasing VRAM footprint to stabilize optimization noise.  
+* \[ \] **Cosine Learning Rate Decay:** Implement a dynamic learning rate scheduler to smoothly converge the model to its minimum.  
+* \[ \] **Fused AdamW (GPU):** Write a custom CUDA kernel for the optimizer to keep weights and gradients strictly in VRAM, eliminating the PCIe bus bottleneck.  
+* \[ \] **MatMul Tiling:** Utilize CUDA shared memory (SRAM) for matrix multiplication to bypass global memory bandwidth limits.  
+* \[ \] **Native BF16 Mixed Precision:** Leverage 4th-gen Tensor Cores (RTX 4070\) for 2x memory reduction and massive TFLOPS acceleration without the need for loss scaling.  
+* \[ \] **Flash Attention:** Implement a custom Triton-style fused kernel for Attention to bypass the $O(N^2)$ memory bottleneck.  
+* \[ \] **Milestone 6:** A hyper-optimized, stable engine training a 14M+ parameter model at peak GPU saturation, ready for full convergence.
+
+## **Phase 7: The Hugging Face Bridge 🚧**
 
 *Focus: Ecosystem interoperability.*
 
 * \[ \] **Weight Exporter:** Write a .safetensors binary writer to export Eisen parameters.  
 * \[ \] **Config Generator:** Script to output config.json compatible with Llama-style architectures.  
-* \[ \] **Milestone 6:** Load the custom Rust model natively in Python transformers for inference.
+* \[ \] **Milestone 7:** Load the custom Rust model natively in Python transformers for inference.
 
-## **Phase 7: Hyper-Optimization & Research Features 🚀**
+## **Phase 8: Advanced Inference & Fine-Tuning 🔮**
 
-*Focus: Pushing the limits of 6GB VRAM and custom kernels.*
+*Focus: Post-training capabilities.*
 
-* \[ \] **Flash Attention:** Implement a custom Triton-style fused kernel for Attention to bypass the $O(N^2)$ memory bottleneck.  
-* \[ \] **KV Caching:** Fast inference kernel that only computes the new token's attention.  
+* \[ \] **KV Caching:** Fast inference kernel for autoregressive generation.  
 * \[ \] **LoRA (Low-Rank Adaptation):** Implement $A$ and $B$ adapter matrices for parameter-efficient fine-tuning on our own tape.
