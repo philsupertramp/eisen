@@ -31,12 +31,21 @@ fn setup_gpu() -> Option<Device> {
 // === EISENBOARD: ZERO-DEPENDENCY RAW TCP DASHBOARD ===
 // =========================================================================
 
+#[derive(Clone)]
+struct StepRecord {
+    step: usize,
+    loss: f32,
+}
+
 #[derive(Clone, Default)]
 struct TrainStats {
     step: usize,
     loss: f32,
     lr: f32,
     tps: f32,
+    batch_time_ms: f32,
+    total_tokens: usize,
+    history: Vec<StepRecord>, // Server-side history prevents data loss on refresh!
 }
 
 const DASHBOARD_HTML: &str = r#"
@@ -48,8 +57,9 @@ const DASHBOARD_HTML: &str = r#"
     <style>
         body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 2rem; margin: 0; }
         h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
-        .stats-grid { display: flex; gap: 20px; margin-bottom: 20px; flex-wrap: wrap; }
-        .stat-box { background: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 6px; min-width: 150px; }
+        .stats-grid { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; max-width: 1000px; }
+        .stat-box { background: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 6px; flex: 1 1 150px; }
+        .stat-label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
         .stat-value { font-size: 24px; color: #7ee787; font-weight: bold; margin-top: 5px; }
         .stat-value.lr { color: #f78166; }
         canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; width: 100%; max-width: 1000px; height: 400px; }
@@ -58,22 +68,24 @@ const DASHBOARD_HTML: &str = r#"
 <body>
     <h1>EisenBoard 🚀</h1>
     <div class="stats-grid">
-        <div class="stat-box"><div>STEP</div><div id="step" class="stat-value">0</div></div>
-        <div class="stat-box"><div>LOSS</div><div id="loss" class="stat-value">0.0000</div></div>
-        <div class="stat-box"><div>LR</div><div id="lr" class="stat-value lr">0.0000</div></div>
-        <div class="stat-box"><div>TOKENS / SEC</div><div id="tps" class="stat-value">0</div></div>
+        <div class="stat-box"><div class="stat-label">STEP</div><div id="step" class="stat-value">0</div></div>
+        <div class="stat-box"><div class="stat-label">LOSS</div><div id="loss" class="stat-value">0.0000</div></div>
+        <div class="stat-box"><div class="stat-label">LR</div><div id="lr" class="stat-value lr">0.0000</div></div>
+        <div class="stat-box"><div class="stat-label">TOKENS / SEC</div><div id="tps" class="stat-value">0</div></div>
+        <div class="stat-box"><div class="stat-label">BATCH TIME</div><div id="batch_time" class="stat-value">0 ms</div></div>
+        <div class="stat-box"><div class="stat-label">TOTAL TOKENS</div><div id="total_tokens" class="stat-value">0</div></div>
     </div>
     <canvas id="lossChart" width="1000" height="400"></canvas>
     <script>
         const ctx = document.getElementById('lossChart').getContext('2d');
-        let history = [];
-        function drawChart() {
+        
+        function drawChart(history) {
             ctx.clearRect(0, 0, 1000, 400);
-            if (history.length < 2) return;
+            if (!history || history.length < 2) return;
             ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
-            for(let i=0; i<10; i++) { ctx.beginPath(); ctx.moveTo(0, i*40); ctx.lineTo(1000, i*40); ctx.stroke(); }
-            let minLoss = Math.min(...history.map(d => d.loss)) * 0.95;
-            let maxLoss = Math.max(...history.map(d => d.loss)) * 1.05;
+            for(let i=0; i<=10; i++) { ctx.beginPath(); ctx.moveTo(0, i*40); ctx.lineTo(1000, i*40); ctx.stroke(); }
+            let minLoss = Math.min(...history.map(d => d.loss)) * 0.98;
+            let maxLoss = Math.max(...history.map(d => d.loss)) * 1.02;
             let range = maxLoss - minLoss || 1;
             ctx.strokeStyle = '#ff7b72'; ctx.lineWidth = 2; ctx.beginPath();
             history.forEach((point, i) => {
@@ -87,15 +99,17 @@ const DASHBOARD_HTML: &str = r#"
             try {
                 const res = await fetch('/api/stats');
                 const data = await res.json();
-                document.getElementById('step').innerText = data.step;
+                document.getElementById('step').innerText = data.step.toLocaleString();
                 document.getElementById('loss').innerText = data.loss.toFixed(4);
                 document.getElementById('lr').innerText = data.lr.toExponential(2);
                 document.getElementById('tps').innerText = Math.round(data.tps).toLocaleString();
-                if (history.length === 0 || history[history.length-1].step !== data.step) {
-                    history.push(data);
-                    if (history.length > 200) history.shift();
-                    drawChart();
-                }
+                document.getElementById('batch_time').innerText = Math.round(data.batch_time_ms) + " ms";
+                
+                let tk = data.total_tokens;
+                let tkStr = tk > 1000000000 ? (tk/1000000000).toFixed(2) + "B" : tk > 1000000 ? (tk/1000000).toFixed(2) + "M" : tk.toLocaleString();
+                document.getElementById('total_tokens').innerText = tkStr;
+
+                drawChart(data.history);
             } catch (e) {}
         }, 1000);
     </script>
@@ -115,9 +129,12 @@ fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>) {
                     let request = String::from_utf8_lossy(&buffer[..]);
                     if request.starts_with("GET /api/stats") {
                         let s = stats.read().unwrap();
+                        let history_json: Vec<String> = s.history.iter()
+                            .map(|r| format!(r#"{{"step":{},"loss":{:.6}}}"#, r.step, r.loss))
+                            .collect();
                         let json = format!(
-                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2}}}"#,
-                            s.step, s.loss, s.lr, s.tps
+                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2},"batch_time_ms":{:.2},"total_tokens":{},"history":[{}]}}"#,
+                            s.step, s.loss, s.lr, s.tps, s.batch_time_ms, s.total_tokens, history_json.join(",")
                         );
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
@@ -259,6 +276,7 @@ fn main() {
     let mut dataloader  = BinaryDataLoader::new(bin_path, seq_len, batch_size);
     let mut step        = 0_usize;
     let mut running_loss = 0.0_f32;
+    let mut cumulative_tokens = 0_usize;
     let log_interval    = 50;   // Log every N optimizer steps
     let save_interval   = 2500;
 
@@ -318,6 +336,7 @@ fn main() {
         // One optimizer step covers all accumulated micro-batch gradients.
         optim.step(&mut g);
         step += 1;
+        cumulative_tokens += tokens_per_step;
 
         let avg_loss = step_loss / micro_count as f32;
         running_loss += avg_loss;
@@ -346,11 +365,18 @@ fn main() {
         if step % 10 == 0 {
             let elapsed = timer.elapsed().as_secs_f32();
             let tps = (10 * tokens_per_step) as f32 / elapsed.max(1e-6);
+            let batch_time_ms = (elapsed * 1000.0) / 10.0;
+            
             if let Ok(mut s) = shared_stats.write() {
                 s.step = step;
                 s.loss = avg_loss;
                 s.lr   = current_lr;
                 s.tps  = tps;
+                s.batch_time_ms = batch_time_ms;
+                s.total_tokens = cumulative_tokens;
+                
+                if s.history.len() >= 200 { s.history.remove(0); }
+                s.history.push(StepRecord { step, loss: avg_loss });
             }
             timer = Instant::now();
         }
