@@ -9,10 +9,15 @@ use eisen::data::tokenizer::BPETokenizer;
 use eisen::data::dataloader::BinaryDataLoader;
 use eisen::tensor::Device;
 use cudarc::driver::CudaContext;
-use std::sync::Arc;
-use std::time::Instant;
-use std::io::{BufWriter, Write};
+
 use std::fs::File;
+use std::fs;
+use std::sync::{Arc, RwLock};
+use std::path::Path;
+use std::time::Instant;
+use std::net::TcpListener;
+use std::io::{Read, Write, BufWriter};
+use std::thread;
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
@@ -24,6 +29,133 @@ fn setup_gpu() -> Option<Device> {
     }
 }
 
+// =========================================================================
+// === EISENBOARD: ZERO-DEPENDENCY RAW TCP DASHBOARD ===
+// =========================================================================
+
+#[derive(Clone, Default)]
+struct TrainStats {
+    epoch: usize,
+    step: usize,
+    loss: f32,
+    tps: f32, // Tokens per second
+}
+
+const DASHBOARD_HTML: &str = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>EisenBoard | Live Training</title>
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 2rem; margin: 0; }
+        h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
+        .stats-grid { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-box { background: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 6px; min-width: 150px; }
+        .stat-value { font-size: 24px; color: #7ee787; font-weight: bold; margin-top: 5px; }
+        canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; width: 100%; max-width: 1000px; height: 400px; }
+    </style>
+</head>
+<body>
+    <h1>EisenBoard 🚀</h1>
+    <div class="stats-grid">
+        <div class="stat-box"><div>EPOCH</div><div id="epoch" class="stat-value">0</div></div>
+        <div class="stat-box"><div>STEP</div><div id="step" class="stat-value">0</div></div>
+        <div class="stat-box"><div>LOSS</div><div id="loss" class="stat-value">0.0000</div></div>
+        <div class="stat-box"><div>TOKENS / SEC</div><div id="tps" class="stat-value">0</div></div>
+    </div>
+    <canvas id="lossChart" width="1000" height="400"></canvas>
+
+    <script>
+        const ctx = document.getElementById('lossChart').getContext('2d');
+        let history = [];
+
+        function drawChart() {
+            ctx.clearRect(0, 0, 1000, 400);
+            if (history.length < 2) return;
+
+            // Draw grid
+            ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+            for(let i=0; i<10; i++) { ctx.beginPath(); ctx.moveTo(0, i*40); ctx.lineTo(1000, i*40); ctx.stroke(); }
+
+            // Find min/max for scaling
+            let minLoss = Math.min(...history.map(d => d.loss)) * 0.95;
+            let maxLoss = Math.max(...history.map(d => d.loss)) * 1.05;
+            let range = maxLoss - minLoss;
+            if (range === 0) range = 1;
+
+            // Draw line
+            ctx.strokeStyle = '#ff7b72'; ctx.lineWidth = 2; ctx.beginPath();
+            history.forEach((point, i) => {
+                let x = (i / (Math.max(history.length - 1, 1))) * 1000;
+                let y = 400 - (((point.loss - minLoss) / range) * 400);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+
+        setInterval(async () => {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                
+                document.getElementById('epoch').innerText = data.epoch;
+                document.getElementById('step').innerText = data.step;
+                document.getElementById('loss').innerText = data.loss.toFixed(4);
+                document.getElementById('tps').innerText = Math.round(data.tps).toLocaleString();
+
+                // Only add new steps to history
+                if (history.length === 0 || history[history.length - 1].step !== data.step) {
+                    history.push(data);
+                    if (history.length > 100) history.shift(); // Keep last 100 points
+                    drawChart();
+                }
+            } catch (e) { console.log("Waiting for engine..."); }
+        }, 1000);
+    </script>
+</body>
+</html>
+"#;
+
+fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>) {
+    thread::spawn(move || {
+        let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind EisenBoard to port 8080");
+        println!("\n🌐 EisenBoard Live! Open http://localhost:8080 in your browser\n");
+
+        for stream in listener.incoming() {
+            if let Ok(mut stream) = stream {
+                // Prevent hanging on broken connections
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut buffer = [0; 1024];
+                
+                if stream.read(&mut buffer).unwrap_or(0) > 0 {
+                    let request = String::from_utf8_lossy(&buffer[..]);
+                    
+                    if request.starts_with("GET /api/stats") {
+                        // Serve JSON API
+                        let s = stats.read().unwrap();
+                        let json = format!(
+                            r#"{{"epoch":{},"step":{},"loss":{:.6},"tps":{:.2}}}"#,
+                            s.epoch, s.step, s.loss, s.tps
+                        );
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                            json
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.starts_with("GET / ") {
+                        // Serve HTML Dashboard
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}",
+                            DASHBOARD_HTML
+                        );
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                }
+            }
+        }
+    });
+}
 
 /// True GPT-Style Causal Language Model
 struct TransformerLM {
@@ -92,6 +224,10 @@ fn main() {
     let device = setup_gpu().expect("CUDA GPU Required!");
     println!("Device initialized: {:?}", device);
 
+    // Set up shared stats for the dashboard and spawn the server thread!
+    let shared_stats = Arc::new(RwLock::new(TrainStats::default()));
+    spawn_eisenboard(shared_stats.clone());
+
     let tokenizer_path = "data/tokenizer.model";
     let bin_path = "data/german_large_corpus.bin";
     let output_model_path = "data/eisen_model.bin";
@@ -139,6 +275,7 @@ fn main() {
     let log_interval = 100;
     let save_interval = 2500; // Save checkpoint every ~2,500 steps
     let mut last_log_time = Instant::now();
+    let mut timer = Instant::now();
 
     // Infinite loop over the dataloader stream
     while let Some((x_batch, y_batch)) = dataloader.next_batch() {
@@ -174,6 +311,22 @@ fn main() {
             last_log_time = Instant::now();
         }
 
+        // --- UPDATE EISENBOARD EVERY 10 STEPS ---
+        if step % 10 == 0 {
+            let elapsed = timer.elapsed().as_secs_f32();
+            let tokens_processed = (batch_size * seq_len * 10) as f32;
+            let current_tps = if elapsed > 0.0 { tokens_processed / elapsed } else { 0.0 };
+            
+            // Acquire write lock, update, and drop instantly
+            if let Ok(mut s) = shared_stats.write() {
+                s.epoch = 1;
+                s.step = step;
+                s.loss = loss;
+                s.tps = current_tps;
+            }
+            
+            timer = Instant::now(); // Reset timer
+        }
         // --- CHECKPOINT SAVER ---
         if step % save_interval == 0 && step > 0 {
             save_weights(&g, output_model_path);
