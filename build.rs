@@ -10,6 +10,7 @@ fn main() {
     // Ensure nvcc is in your PATH
     let status = Command::new("nvcc")
         .arg("-ptx")
+        .arg("-arch=sm_89") // CRITICAL: Target RTX 40-series (Ada Lovelace) for native BF16 & Tensor Cores
         .arg("./kernels/ops.cu")
         .arg("-o")
         .arg(out_dir.join("ops.ptx"))

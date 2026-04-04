@@ -6,7 +6,49 @@
 // of global VRAM, reducing bandwidth by ~TILE_SIZE.
 // ============================================================
 #define TILE_SIZE 16
+#include <cuda_bf16.h>
 
+extern "C" __global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst, const size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __float2bfloat16(src[i]);
+    }
+}
+
+extern "C" __global__ void cast_bf16_to_f32(const __nv_bfloat16* src, float* dst, const size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        dst[i] = __bfloat162float(src[i]);
+    }
+}
+
+extern "C" __global__ void cast_bf16_to_f32_accumulate(const __nv_bfloat16* src, float* dst, const size_t n) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        atomicAdd(&dst[i], __bfloat162float(src[i]));
+    }
+}
+
+// Mixed Precision MatMul: BF16 Inputs -> FP32 Accumulator/Output
+extern "C" __global__ void matmul_bf16_f32(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, float* out,
+    const size_t m, const size_t k, const size_t n
+) {
+    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (size_t i = 0; i < k; ++i) {
+            // nvcc with -arch=sm_89 automatically optimizes __nv_bfloat16 arithmetic 
+            // to utilize hardware where appropriate.
+            float va = __bfloat162float(a[row * k + i]);
+            float vb = __bfloat162float(b[i * n + col]);
+            sum += va * vb;
+        }
+        out[row * n + col] = sum;
+    }
+}
 // --- BROADCAST-AWARE ADDITION ---
 extern "C" __global__ void add_f32(
     const float* a,

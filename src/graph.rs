@@ -45,6 +45,10 @@ impl Graph {
                 "transpose_0213_f32", "transpose_0213_backward_f32",
                 "rope_f32", "rope_backward_f32",
                 "adamw_step_f32",
+
+                // BF16 specific kernels
+                "cast_f32_to_bf16", "cast_bf16_to_f32", "cast_bf16_to_f32_accumulate",
+                "matmul_bf16_f32"
             ];
             for name in names {
                 let f = module.load_function(name).expect(&format!("Failed to load {} kernel", name));
@@ -85,25 +89,27 @@ impl Graph {
         }
     }
 
+    // --- Helper Methods ---
     pub fn load_tensor_data(&mut self, id: usize, host_data: &[f32]) {
         let tensor = &mut self.tensors[id];
+        let size = if tensor.shape.is_empty() { 1 } else { tensor.shape.iter().product::<usize>() };
         
         // Sanity check to prevent catastrophic memory corruption
         assert_eq!(
-            tensor.size(), 
+            size, 
             host_data.len(), 
             "Shape mismatch: Tensor {} expects {} elements, but got {}.", 
-            id, tensor.size(), host_data.len()
+            id, size, host_data.len()
         );
 
         match &mut tensor.data {
             // CPU fallback: fast memory copy
-            crate::tensor::Storage::Cpu(cpu_vec) => {
+            Storage::Cpu(cpu_vec) => {
                 cpu_vec.copy_from_slice(host_data);
             }
             // GPU path: push via PCIe bus to VRAM
-            crate::tensor::Storage::Gpu(gpu_slice) => {
-                if let crate::tensor::Device::Gpu(_ctx, stream) = &self.device {
+            Storage::Gpu(gpu_slice) => {
+                if let Device::Gpu(ctx, stream) = &self.device {
                     stream
                         .memcpy_htod(host_data, gpu_slice)
                         .expect("Failed to copy weights from Host RAM to VRAM!");
@@ -111,8 +117,20 @@ impl Graph {
                     panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
                 }
             }
+            Storage::GpuBf16(gpu_slice) => {
+                if let Device::Gpu(ctx, stream) = &self.device {
+                    // Convert f32 to bf16 by shifting off the lower 16 bits of the mantissa
+                    let u16_data: Vec<u16> = host_data.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+                    stream
+                        .memcpy_htod(u16_data.as_slice(), gpu_slice)
+                        .expect("Failed to copy BF16 weights from Host RAM to VRAM!");
+                } else {
+                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
+                }
+            }
         }
     }
+
     pub fn clear_activations(&mut self) {
         self.tape.nodes.clear();
         self.restore_save_point(self.num_params);
@@ -178,6 +196,11 @@ impl Graph {
             Storage::Gpu(s) => {
                 let (_, stream) = match &self.device { Device::Gpu(_, s) => (None::<f32>, s), _ => unreachable!() };
                 stream.clone_dtoh(s).unwrap()
+            },
+            Storage::GpuBf16(s) => {
+                let (_, stream) = match &self.device { Device::Gpu(_, s) => (None::<f32>, s), _ => unreachable!() };
+                let u16_data = stream.clone_dtoh(s).unwrap();
+                u16_data.into_iter().map(|b| f32::from_bits((b as u32) << 16)).collect()
             }
         }
     }

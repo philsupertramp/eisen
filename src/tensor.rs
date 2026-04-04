@@ -19,6 +19,7 @@ impl std::fmt::Debug for Device {
 pub enum Storage {
     Cpu(Vec<f32>),
     Gpu(CudaSlice<f32>),
+    GpuBf16(CudaSlice<u16>), // New: Native BF16 VRAM buffer
 }
 
 impl Clone for Storage {
@@ -26,6 +27,7 @@ impl Clone for Storage {
         match self {
             Storage::Cpu(v) => Storage::Cpu(v.clone()),
             Storage::Gpu(_) => panic!("Cloning GPU storage is not yet supported. Use explicit device-to-device transfers."),
+            Storage::GpuBf16(_) => panic!("Cloning GPU BF16 storage is not yet supported."),
         }
     }
 }
@@ -34,7 +36,8 @@ impl std::fmt::Debug for Storage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Storage::Cpu(v) => write!(f, "Cpu({:?})", v),
-            Storage::Gpu(_) => write!(f, "Gpu(CudaSlice)"),
+            Storage::Gpu(_) => write!(f, "Gpu(CudaSlice<f32>)"),
+            Storage::GpuBf16(_) => write!(f, "GpuBf16(CudaSlice<u16>)"),
         }
     }
 }
@@ -44,23 +47,25 @@ impl Storage {
         match self {
             Storage::Cpu(v) => v.len(),
             Storage::Gpu(s) => s.len(),
+            Storage::GpuBf16(s) => s.len(),
         }
     }
 
     pub fn as_cpu(&self) -> &Vec<f32> {
         match self {
             Storage::Cpu(v) => v,
-            Storage::Gpu(_) => panic!("Attempted to access GPU data as CPU slice. Did you forget to call sync_to_cpu()?"),
+            _ => panic!("Attempted to access GPU data as CPU slice. Did you forget to call sync_to_cpu()?"),
         }
     }
 
     pub fn as_cpu_mut(&mut self) -> &mut Vec<f32> {
         match self {
             Storage::Cpu(v) => v,
-            Storage::Gpu(_) => panic!("Attempted to access GPU data as CPU slice."),
+            _ => panic!("Attempted to access GPU data as CPU slice."),
         }
     }
 }
+
 
 #[derive(Debug, Clone)]
 pub struct Tensor {
@@ -113,6 +118,15 @@ impl Tensor {
                     _ => unreachable!(),
                 };
                 stream.clone_dtoh(s).expect("Failed to copy data from VRAM to Host")
+            },
+            Storage::GpuBf16(s) => {
+                let (_ctx, stream) = match &self.device {
+                    Device::Gpu(c, s) => (c, s),
+                    _ => unreachable!(),
+                };
+                let u16_data = stream.clone_dtoh(s).expect("Failed to copy BF16 data from VRAM to Host");
+                // Convert BF16 bits back to f32 on the CPU by shifting the bits into the upper 16 bits of a u32
+                u16_data.into_iter().map(|b| f32::from_bits((b as u32) << 16)).collect()
             }
         }
     }

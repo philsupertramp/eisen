@@ -57,10 +57,10 @@
 
 *Focus: Pushing the limits of VRAM, custom kernels, and training stability.*
 
+* \[x\] **Cosine Learning Rate Decay:** Implement a dynamic learning rate scheduler to smoothly converge the model to its minimum.  
+* \[x\] **Fused AdamW (GPU):** Write a custom CUDA kernel for the optimizer to keep weights and gradients strictly in VRAM, eliminating the PCIe bus bottleneck.  
+* \[x\] **MatMul Tiling:** Utilize CUDA shared memory (SRAM) for matrix multiplication to bypass global memory bandwidth limits.  
 * \[ \] **Gradient Accumulation:** Simulate massive batch sizes (e.g., effective batch 64\) without increasing VRAM footprint to stabilize optimization noise.  
-* \[ \] **Cosine Learning Rate Decay:** Implement a dynamic learning rate scheduler to smoothly converge the model to its minimum.  
-* \[ \] **Fused AdamW (GPU):** Write a custom CUDA kernel for the optimizer to keep weights and gradients strictly in VRAM, eliminating the PCIe bus bottleneck.  
-* \[ \] **MatMul Tiling:** Utilize CUDA shared memory (SRAM) for matrix multiplication to bypass global memory bandwidth limits.  
 * \[ \] **Native BF16 Mixed Precision:** Leverage 4th-gen Tensor Cores (RTX 4070\) for 2x memory reduction and massive TFLOPS acceleration without the need for loss scaling.  
 * \[ \] **Flash Attention:** Implement a custom Triton-style fused kernel for Attention to bypass the $O(N^2)$ memory bottleneck.  
 * \[ \] **Milestone 6:** A hyper-optimized, stable engine training a 14M+ parameter model at peak GPU saturation, ready for full convergence.
