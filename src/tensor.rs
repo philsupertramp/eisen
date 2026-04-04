@@ -163,4 +163,8 @@ impl Tensor {
     pub fn nd_to_flat(nd: &[usize], strides: &[usize]) -> usize {
         nd.iter().zip(strides.iter()).map(|(n, s)| n * s).sum()
     }
+
+    pub fn size(&self) -> usize {
+        self.shape.iter().product()
+    }
 }

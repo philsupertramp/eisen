@@ -44,6 +44,7 @@ impl Graph {
                 "softmax_f32", "softmax_backward_f32",
                 "transpose_0213_f32", "transpose_0213_backward_f32",
                 "rope_f32", "rope_backward_f32",
+                "adamw_step_f32",
             ];
             for name in names {
                 let f = module.load_function(name).expect(&format!("Failed to load {} kernel", name));
@@ -84,6 +85,34 @@ impl Graph {
         }
     }
 
+    pub fn load_tensor_data(&mut self, id: usize, host_data: &[f32]) {
+        let tensor = &mut self.tensors[id];
+        
+        // Sanity check to prevent catastrophic memory corruption
+        assert_eq!(
+            tensor.size(), 
+            host_data.len(), 
+            "Shape mismatch: Tensor {} expects {} elements, but got {}.", 
+            id, tensor.size(), host_data.len()
+        );
+
+        match &mut tensor.data {
+            // CPU fallback: fast memory copy
+            crate::tensor::Storage::Cpu(cpu_vec) => {
+                cpu_vec.copy_from_slice(host_data);
+            }
+            // GPU path: push via PCIe bus to VRAM
+            crate::tensor::Storage::Gpu(gpu_slice) => {
+                if let crate::tensor::Device::Gpu(_ctx, stream) = &self.device {
+                    stream
+                        .memcpy_htod(host_data, gpu_slice)
+                        .expect("Failed to copy weights from Host RAM to VRAM!");
+                } else {
+                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
+                }
+            }
+        }
+    }
     pub fn clear_activations(&mut self) {
         self.tape.nodes.clear();
         self.restore_save_point(self.num_params);
