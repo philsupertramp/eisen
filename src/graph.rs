@@ -1,6 +1,8 @@
 use crate::tape::{Tape, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{LaunchConfig, CudaFunction, PushKernelArg};
+#[cfg(feature = "bf16")]
+use cudarc::driver::CudaSlice;
 use std::collections::HashMap;
 
 pub struct Graph {
@@ -30,7 +32,7 @@ impl Graph {
                 .load_module(ptx.into())
                 .expect("Failed to load PTX module");
 
-            let names = [
+            let names = vec![
                 "add_f32", "fill_f32", "accumulate_f32", 
                 "mul_f32", "mul_backward_f32",
                 "matmul_f32", "matmul_backward_a_f32", "matmul_backward_b_f32",
