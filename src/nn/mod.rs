@@ -4,6 +4,7 @@ pub mod embedding;
 pub mod rmsnorm;
 pub mod attention;
 pub mod transformer;
+pub mod scheduler;
 
 use crate::graph::Graph;
 
