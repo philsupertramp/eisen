@@ -14,12 +14,13 @@ use std::sync::Arc;
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
-        Ok(ctx) => Some(Device::Gpu(ctx.clone(), ctx.default_stream())),
+        Ok(ctx) => { let stream = ctx.default_stream(); Some(Device::Gpu(ctx, stream)) }
         Err(_) => None,
     }
 }
 
-// Stelle sicher, dass dies exakt der 13.8M Parameter Architektur entspricht
+
+// Ensure this matches your 13.8M parameter architecture exactly
 struct TransformerLM {
     token_emb: Embedding,
     blocks: Vec<TransformerBlock>,
@@ -55,9 +56,9 @@ impl Module for TransformerLM {
     }
 }
 
-/// Lädt flache f32 Gewichte sicher von der Festplatte
+/// Loads flat f32 weights safely from disk
 fn load_weights(g: &mut Graph, params: &[usize], path: &str) {
-    let mut file = File::open(path).expect("Konnte Modellgewichte nicht finden!");
+    let mut file = File::open(path).expect("Could not find model weights!");
     let mut buffer = Vec::new();
     file.read_to_end(&mut buffer).unwrap();
 
@@ -70,23 +71,23 @@ fn load_weights(g: &mut Graph, params: &[usize], path: &str) {
     for &p_id in params {
         let size = g.tensors[p_id].size();
         if offset + size > raw_floats.len() {
-            panic!("Gewichtsdatei ist abgeschnitten! Erwartete mehr als {} Floats.", raw_floats.len());
+            panic!("Weight file is truncated! Expected more than {} floats.", raw_floats.len());
         }
         let chunk = &raw_floats[offset..offset + size];
         g.load_tensor_data(p_id, chunk); 
         offset += size;
     }
-    println!("Erfolgreich {} Parameter geladen.", offset);
+    println!("Successfully loaded {} parameters.", offset);
 }
 
 fn main() {
     println!("=== Eisen Interactive CLI ===");
-    let device = setup_gpu().expect("CUDA wird benötigt!");
+    let device = setup_gpu().expect("CUDA is required!");
 
     let tokenizer = BPETokenizer::load("data/tokenizer.model").unwrap();
     let vocab_size = tokenizer.vocab.len();
 
-    // 13.8M Param Architektur
+    // 13.8M Param Architecture
     let seq_len = 256;
     let hidden_dim = 384;
     let num_heads = 6;
@@ -96,16 +97,16 @@ fn main() {
     let mut g = Graph::new(device);
     let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers);
     
-    // KRITISCHER FIX: Parameter sperren, damit clear_activations sie nicht löscht!
+    // CRITICAL FIX: Lock parameters so clear_activations doesn't delete them!
     g.mark_params(); 
     
-    // Autograd-Tracking für Inferenz deaktivieren, um Speicher zu sparen
+    // Disable autograd tracking for inference to save memory
     g.no_grad = true;
     
-    println!("Lade Gewichte vom Checkpoint...");
+    println!("Loading weights from checkpoint...");
     load_weights(&mut g, &model.params(), "data/eisen_model.bin");
 
-    println!("\nModell bereit! Gib deinen Prompt unten ein. Tippe 'exit' zum Beenden.");
+    println!("\nModel ready! Type your prompt below. Type 'exit' to quit.");
     println!("---------------------------------------------------------");
 
     let mut input = String::new();
@@ -144,9 +145,9 @@ fn main() {
 
             tokens.push(predicted_id);
             
-            // Tape leeren
+            // Clear the tape
             g.clear_activations(); 
-            // KRITISCHER OOM FIX: Den VRAM Pool hart leeren, da sich die Größen (seq_len) dynamisch ändern!
+            // CRITICAL OOM FIX: Hard clear the VRAM pool since sizes (seq_len) change dynamically!
             g.vram_pool.clear(); 
         }
         println!("\n");
