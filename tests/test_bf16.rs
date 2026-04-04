@@ -1,11 +1,12 @@
+#![cfg(feature = "bf16")]
 use eisen::tensor::{Device, Storage};
 use eisen::graph::Graph;
-use cudarc::driver::{CudaContext, LaunchConfig};
+use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
 use std::sync::Arc;
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
-        Ok(ctx) => Some(Device::Gpu(Arc::new(ctx.clone()), Arc::new(ctx.default_stream()))),
+        Ok(ctx) => Some(Device::Gpu(ctx.clone(), ctx.default_stream())),
         Err(_) => None,
     }
 }

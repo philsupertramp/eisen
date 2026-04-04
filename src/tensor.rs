@@ -19,6 +19,7 @@ impl std::fmt::Debug for Device {
 pub enum Storage {
     Cpu(Vec<f32>),
     Gpu(CudaSlice<f32>),
+    #[cfg(feature = "bf16")]
     GpuBf16(CudaSlice<u16>), // New: Native BF16 VRAM buffer
 }
 
@@ -27,6 +28,7 @@ impl Clone for Storage {
         match self {
             Storage::Cpu(v) => Storage::Cpu(v.clone()),
             Storage::Gpu(_) => panic!("Cloning GPU storage is not yet supported. Use explicit device-to-device transfers."),
+            #[cfg(feature = "bf16")]
             Storage::GpuBf16(_) => panic!("Cloning GPU BF16 storage is not yet supported."),
         }
     }
@@ -37,6 +39,7 @@ impl std::fmt::Debug for Storage {
         match self {
             Storage::Cpu(v) => write!(f, "Cpu({:?})", v),
             Storage::Gpu(_) => write!(f, "Gpu(CudaSlice<f32>)"),
+            #[cfg(feature = "bf16")]
             Storage::GpuBf16(_) => write!(f, "GpuBf16(CudaSlice<u16>)"),
         }
     }
@@ -47,6 +50,7 @@ impl Storage {
         match self {
             Storage::Cpu(v) => v.len(),
             Storage::Gpu(s) => s.len(),
+            #[cfg(feature = "bf16")]
             Storage::GpuBf16(s) => s.len(),
         }
     }
@@ -119,6 +123,7 @@ impl Tensor {
                 };
                 stream.clone_dtoh(s).expect("Failed to copy data from VRAM to Host")
             },
+            #[cfg(feature = "bf16")]
             Storage::GpuBf16(s) => {
                 let (_ctx, stream) = match &self.device {
                     Device::Gpu(c, s) => (c, s),

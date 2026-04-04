@@ -45,11 +45,16 @@ impl Graph {
                 "transpose_0213_f32", "transpose_0213_backward_f32",
                 "rope_f32", "rope_backward_f32",
                 "adamw_step_f32",
+            ];
 
-                // BF16 specific kernels
+            // BF16 specific kernels
+            #[cfg(feature = "bf16")]
+            names.extend_from_slice(&[
                 "cast_f32_to_bf16", "cast_bf16_to_f32", "cast_bf16_to_f32_accumulate",
                 "matmul_bf16_f32"
-            ];
+            ]);
+
+
             for name in names {
                 let f = module.load_function(name).expect(&format!("Failed to load {} kernel", name));
                 functions.insert(name.to_string(), f);
@@ -117,6 +122,7 @@ impl Graph {
                     panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
                 }
             }
+            #[cfg(feature = "bf16")]
             Storage::GpuBf16(gpu_slice) => {
                 if let Device::Gpu(ctx, stream) = &self.device {
                     // Convert f32 to bf16 by shifting off the lower 16 bits of the mantissa
@@ -197,6 +203,7 @@ impl Graph {
                 let (_, stream) = match &self.device { Device::Gpu(_, s) => (None::<f32>, s), _ => unreachable!() };
                 stream.clone_dtoh(s).unwrap()
             },
+            #[cfg(feature = "bf16")]
             Storage::GpuBf16(s) => {
                 let (_, stream) = match &self.device { Device::Gpu(_, s) => (None::<f32>, s), _ => unreachable!() };
                 let u16_data = stream.clone_dtoh(s).unwrap();

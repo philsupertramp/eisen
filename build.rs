@@ -8,12 +8,16 @@ fn main() {
     
     // Compile the CUDA kernel to PTX
     // Ensure nvcc is in your PATH
-    let status = Command::new("nvcc")
+    let mut command = Command::new("nvcc");
+    command
         .arg("-ptx")
-        .arg("-arch=sm_89") // CRITICAL: Target RTX 40-series (Ada Lovelace) for native BF16 & Tensor Cores
         .arg("./kernels/ops.cu")
         .arg("-o")
-        .arg(out_dir.join("ops.ptx"))
+        .arg(out_dir.join("ops.ptx"));
+    if std::env::var("CARGO_FEATURE_BF16").is_ok() {
+        command.arg("-arch=sm_89");
+    }
+    let status = command
         .status()
         .expect("Failed to run nvcc. Is the CUDA Toolkit installed and in your PATH?");
 

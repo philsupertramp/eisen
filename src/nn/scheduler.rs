@@ -11,14 +11,14 @@
 ///
 /// At progress = 0 → lr_max, at progress = 1 → lr_min.
 ///
-/// Usage:
-/// ```
-/// let sched = CosineScheduler::new(3e-4, 1e-5, 100, 50_000);
-/// for step in 0..50_000 {
-///     optim.lr = sched.get_lr(step);
-///     optim.step(&mut g);
-/// }
-/// ```
+// Usage:
+// ```
+// let sched = CosineScheduler::new(3e-4, 1e-5, 100, 50_000);
+// for step in 0..50_000 {
+//     optim.lr = sched.get_lr(step);
+//     optim.step(&mut g);
+// }
+// ```
 pub struct CosineScheduler {
     /// Peak learning rate (reached at end of warmup).
     pub lr_max: f32,
