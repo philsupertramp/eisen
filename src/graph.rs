@@ -446,20 +446,20 @@ impl Graph {
  
         // ── Forward ────────────────────────────────────────────────────────────
  
-        // 1. Read a as FP32 (resident on GPU).
-        let a_fp32 = match &self.tensors[a_id].data {
-            Storage::Gpu(s) => s,
-            _ => unreachable!("matmul_bf16_streamed: a must be GPU storage"),
-        };
- 
-        // 2. htod b (CPU f32) → b_fp32_temp (GPU f32)
+        // 1. htod b (CPU f32) → b_fp32_temp (GPU f32)
         let b_cpu_data = self.tensors[b_id].data.as_cpu().clone();
         let b_fp32_temp: CudaSlice<f32> = stream
             .clone_htod(b_cpu_data.as_slice())
             .expect("bf16_streamed: forward htod failed");
  
-        // 3. BF16-style matmul (FP32 inputs quantized on-the-fly) → FP32 output
+        // 2. Allocate output first (mutable borrow of self ends here).
         let out_id = self.alloc_pooled(vec![m, n]);
+
+        // 3. Borrow tensor storages for launch arguments.
+        let a_fp32 = match &self.tensors[a_id].data {
+            Storage::Gpu(s) => s,
+            _ => unreachable!("matmul_bf16_streamed: a must be GPU storage"),
+        };
         let o_fp32 = match &self.tensors[out_id].data {
             Storage::Gpu(s) => s,
             _ => unreachable!(),
@@ -843,6 +843,11 @@ impl Graph {
                 let f_bwd_a   = self.functions.get("matmul_backward_a_f32").unwrap().clone();
                 let f_bwd_b   = self.functions.get("matmul_backward_b_f32").unwrap().clone();
                 let stream_clone = stream.clone();
+
+                // Allocate output first to avoid aliasing immutable tensor borrows
+                // with a mutable borrow of `self`.
+                let out_id = self.alloc_pooled(vec![m, n]);
+
                 let a_fp32 = match &self.tensors[a_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
@@ -852,7 +857,6 @@ impl Graph {
                     _ => unreachable!(),
                 };
                 // ── BF16-style compute (on-the-fly quantization) → FP32 output ─────
-                let out_id = self.alloc_pooled(vec![m, n]);
                 let o_fp32 = match &self.tensors[out_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
