@@ -29,25 +29,46 @@ extern "C" __global__ void cast_bf16_to_f32_accumulate(const __nv_bfloat16* src,
     }
 }
 
-// Mixed Precision MatMul: BF16 Inputs -> FP32 Accumulator/Output
+// Mixed Precision MatMul:
+// FP32 inputs are cast to BF16 tile-by-tile in shared memory, then
+// multiplied with FP32 accumulation/output.
 extern "C" __global__ void matmul_bf16_f32(
-    const __nv_bfloat16* a, const __nv_bfloat16* b, float* out,
+    const float* a, const float* b, float* out,
     const size_t m, const size_t k, const size_t n
 ) {
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row < m && col < n) {
-        float sum = 0.0f;
-        for (size_t i = 0; i < k; ++i) {
-            // nvcc with -arch=sm_89 automatically optimizes __nv_bfloat16 arithmetic 
-            // to utilize hardware where appropriate.
-            float va = __bfloat162float(a[row * k + i]);
-            float vb = __bfloat162float(b[i * n + col]);
+    __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int b_row = t * TILE_SIZE + threadIdx.y;
+
+        float a_val = (row < (int)m && a_col < (int)k)
+            ? a[row * k + a_col] : 0.0f;
+        float b_val = (b_row < (int)k && col < (int)n)
+            ? b[b_row * n + col] : 0.0f;
+
+        tile_A[threadIdx.y][threadIdx.x] = __float2bfloat16(a_val);
+        tile_B[threadIdx.y][threadIdx.x] = __float2bfloat16(b_val);
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            float va = __bfloat162float(tile_A[threadIdx.y][i]);
+            float vb = __bfloat162float(tile_B[i][threadIdx.x]);
             sum += va * vb;
         }
-        out[row * n + col] = sum;
+
+        __syncthreads();
     }
+
+    if (row < (int)m && col < (int)n)
+        out[row * n + col] = sum;
 }
 // --- BROADCAST-AWARE ADDITION ---
 extern "C" __global__ void add_f32(

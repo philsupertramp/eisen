@@ -1,8 +1,6 @@
 use crate::tape::{Tape, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{LaunchConfig, CudaFunction, PushKernelArg};
-#[cfg(feature = "bf16")]
-use cudarc::driver::CudaSlice;
 use std::collections::HashMap;
 
 pub struct Graph {
@@ -420,15 +418,14 @@ impl Graph {
 
     /// Mixed-precision matrix multiplication.
     ///
-    /// Forward:  A_fp32 → BF16  |  B_fp32 → BF16  |  BF16 × BF16 → FP32 out
+    /// Forward:  A_fp32 / B_fp32 are cast to BF16 per tile in shared memory,
+    ///           then multiplied with FP32 accumulation.
     /// Backward: standard FP32 matmul gradients (no loss scaling required for BF16)
     ///
     /// Master weights (B) always stay FP32, so the AdamW optimizer and the
     /// rest of the graph are completely unmodified.
     ///
-    /// The two temporary BF16 VRAM buffers (a_bf16, b_bf16) are moved into
-    /// the backward closure so they remain alive until after the forward
-    /// kernels are guaranteed to have completed.
+    /// This avoids allocating full-size temporary BF16 tensors in VRAM.
     #[cfg(feature = "bf16")]
     pub fn matmul_bf16(&mut self, a_id: usize, b_id: usize) -> usize {
         let a_shape = self.tensors[a_id].shape.clone();
@@ -440,51 +437,21 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
-                let f_cast    = self.functions.get("cast_f32_to_bf16").unwrap().clone();
                 let f_matmul  = self.functions.get("matmul_bf16_f32").unwrap().clone();
                 // Backward uses the existing tiled FP32 kernels — no new kernel needed.
                 let f_bwd_a   = self.functions.get("matmul_backward_a_f32").unwrap().clone();
                 let f_bwd_b   = self.functions.get("matmul_backward_b_f32").unwrap().clone();
                 let stream_clone = stream.clone();
-
-                // ── Allocate temporary BF16 VRAM buffers ────────────────────────────
-                // These are NOT drawn from the pool because they are u16, not f32.
-                // They live only for the duration of the forward kernel; ownership is
-                // transferred into the backward closure to prevent premature dealloc.
-                let a_bf16: CudaSlice<u16> = stream
-                    .alloc_zeros::<u16>(m * k)
-                    .expect("BF16: failed to alloc a_bf16");
-                let b_bf16: CudaSlice<u16> = stream
-                    .alloc_zeros::<u16>(k * n)
-                    .expect("BF16: failed to alloc b_bf16");
-
-                // ── Cast A → BF16 ────────────────────────────────────────────────────
                 let a_fp32 = match &self.tensors[a_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let n_a = (m * k) as u64;
-                let mut builder = stream.launch_builder(&f_cast);
-                builder.arg(a_fp32).arg(&a_bf16).arg(&n_a);
-                unsafe {
-                    builder.launch(LaunchConfig::for_num_elems((m * k) as u32))
-                }
-                .unwrap();
-
-                // ── Cast B → BF16 ────────────────────────────────────────────────────
                 let b_fp32 = match &self.tensors[b_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let n_b = (k * n) as u64;
-                let mut builder = stream.launch_builder(&f_cast);
-                builder.arg(b_fp32).arg(&b_bf16).arg(&n_b);
-                unsafe {
-                    builder.launch(LaunchConfig::for_num_elems((k * n) as u32))
-                }
-                .unwrap();
 
-                // ── BF16 × BF16 → FP32 output ───────────────────────────────────────
+                // ── Tile-wise BF16 matmul with FP32 output ──────────────────────────
                 let out_id = self.alloc_pooled(vec![m, n]);
                 let o_fp32 = match &self.tensors[out_id].data {
                     Storage::Gpu(s) => s,
@@ -500,8 +467,8 @@ impl Graph {
                 };
                 let mut builder = stream.launch_builder(&f_matmul);
                 builder
-                    .arg(&a_bf16)
-                    .arg(&b_bf16)
+                    .arg(a_fp32)
+                    .arg(b_fp32)
                     .arg(o_fp32)
                     .arg(&m_u64)
                     .arg(&k_u64)
@@ -509,19 +476,9 @@ impl Graph {
                 unsafe { builder.launch(cfg_fwd) }.unwrap();
 
                 // ── Backward closure ─────────────────────────────────────────────────
-                //
-                // We move a_bf16 / b_bf16 into the closure even though they are not
-                // used during the backward pass. This keeps the CudaSlice alive until
-                // the closure is called, by which point the forward kernels are
-                // guaranteed to have completed on the same CUDA stream.
-                //
                 // Gradients are computed entirely in FP32 using the existing tiled
                 // kernels (matmul_backward_a_f32 / matmul_backward_b_f32).
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    // Keep BF16 buffers alive until backward runs, then drop.
-                    let _fwd_a = a_bf16;
-                    let _fwd_b = b_bf16;
-
                     let out_grad = match &tensors[out_id].grad {
                         Storage::Gpu(s) => s,
                         _ => unreachable!(),
