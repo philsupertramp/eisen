@@ -462,9 +462,12 @@ impl Graph {
  
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
-        let m = a_shape[0];
-        let k = a_shape[1];
+        assert!(a_shape.len() >= 2, "matmul_bf16_streamed: lhs must have rank >= 2");
+        assert_eq!(b_shape.len(), 2, "matmul_bf16_streamed: rhs must have rank 2 [k, n]");
+        let k = *a_shape.last().unwrap();
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
         let n = b_shape[1];
+        assert_eq!(b_shape[0], k, "matmul_bf16_streamed: lhs last dim must equal rhs first dim");
  
         let stream = match &self.device {
             Device::Gpu(_, s) => s.clone(),
@@ -778,7 +781,12 @@ impl Graph {
 
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
-        let m = a_shape[0]; let k = a_shape[1]; let n = b_shape[1];
+        assert!(a_shape.len() >= 2, "matmul: lhs must have rank >= 2");
+        assert_eq!(b_shape.len(), 2, "matmul: rhs must have rank 2 [k, n]");
+        let k = *a_shape.last().unwrap();
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let n = b_shape[1];
+        assert_eq!(b_shape[0], k, "matmul: lhs last dim must equal rhs first dim");
         let device = self.device.clone();
 
         match &device {
@@ -864,9 +872,12 @@ impl Graph {
         }
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
-        let m = a_shape[0];
-        let k = a_shape[1];
+        assert!(a_shape.len() >= 2, "matmul_bf16: lhs must have rank >= 2");
+        assert_eq!(b_shape.len(), 2, "matmul_bf16: rhs must have rank 2 [k, n]");
+        let k = *a_shape.last().unwrap();
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
         let n = b_shape[1];
+        assert_eq!(b_shape[0], k, "matmul_bf16: lhs last dim must equal rhs first dim");
         let device = self.device.clone();
 
         match &device {
@@ -1009,9 +1020,12 @@ impl Graph {
     fn matmul_streamed(&mut self, a_id: usize, b_id: usize) -> usize {
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
-        let m = a_shape[0];
-        let k = a_shape[1];
+        assert!(a_shape.len() >= 2, "matmul_streamed: lhs must have rank >= 2");
+        assert_eq!(b_shape.len(), 2, "matmul_streamed: rhs must have rank 2 [k, n]");
+        let k = *a_shape.last().unwrap();
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
         let n = b_shape[1];
+        assert_eq!(b_shape[0], k, "matmul_streamed: lhs last dim must equal rhs first dim");
  
         let stream = match &self.device {
             Device::Gpu(_, s) => s.clone(),
@@ -1636,6 +1650,16 @@ impl Graph {
                 out_id
             }
         }
+    }
+
+    /// Reinterpret tensor metadata as a new contiguous shape without allocating.
+    /// Caller must ensure the element count matches.
+    pub fn reinterpret_shape(&mut self, tensor_id: usize, new_shape: Vec<usize>) {
+        let old_elems = self.tensors[tensor_id].shape.iter().product::<usize>();
+        let new_elems = if new_shape.is_empty() { 1 } else { new_shape.iter().product::<usize>() };
+        assert_eq!(old_elems, new_elems, "reinterpret_shape: element count mismatch");
+        self.tensors[tensor_id].shape = new_shape.clone();
+        self.tensors[tensor_id].strides = Tensor::compute_strides(&new_shape);
     }
 
     pub fn transpose(&mut self, a_id: usize, dim0: usize, dim1: usize) -> usize {
