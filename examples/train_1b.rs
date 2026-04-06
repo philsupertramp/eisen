@@ -35,6 +35,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::net::TcpListener;
 use std::thread;
+use std::env;
 
 // ─── GPU setup ────────────────────────────────────────────────────────────────
 
@@ -42,6 +43,13 @@ fn setup_gpu() -> Device {
     let ctx    = CudaContext::new(0).expect("CUDA GPU required for 1B training");
     let stream = ctx.default_stream();
     Device::Gpu(ctx, stream)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 // ─── EisenBoard (carried over from train_large_lm.rs unchanged) ───────────────
@@ -263,11 +271,11 @@ fn main() {
     //   Warmup 1,000 steps → cosine decay to lr_min over 100,000 steps
     //   Peak lr 3e-4 is standard for models in this range with AdamW
     //
-    let seq_len          = 128;//512;
+    let seq_len          = env_usize("EISEN_SEQ_LEN", 128);
     // Keep this conservative by default: attention transpose/bmm activations
     // can still OOM at 4 on smaller consumer GPUs even with streaming.
-    let micro_batch_size = 2;
-    let accum_steps      = 8_usize;
+    let micro_batch_size = env_usize("EISEN_MICRO_BATCH", 2);
+    let accum_steps      = env_usize("EISEN_ACCUM_STEPS", 8);
     let effective_batch  = micro_batch_size * accum_steps;
     let tokens_per_step  = effective_batch * seq_len;
 
@@ -303,9 +311,11 @@ fn main() {
         .collect();
 
     println!("Planing memory streaming...");
+    let vram_budget_mb   = env_usize("EISEN_VRAM_BUDGET_MB", 5120);
+    let reserve_mb       = env_usize("EISEN_ACTIVATION_RESERVE_MB", 500);
     let report = g.plan_streaming(
-        5 * 1024_usize.pow(3),  // 7 GB VRAM budget
-        500 * 1024 * 1024,      // 500 MB activation + checkpointing reserve
+        vram_budget_mb * 1024 * 1024,
+        reserve_mb * 1024 * 1024,
         &pinned,
     );
     println!("{}", report);
