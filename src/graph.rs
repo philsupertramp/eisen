@@ -90,7 +90,7 @@ impl Graph {
             #[cfg(feature = "bf16")]
             names.extend_from_slice(&[
                 "cast_f32_to_bf16", "cast_bf16_to_f32", "cast_bf16_to_f32_accumulate",
-                "matmul_bf16_f32"
+                "matmul_bf16_f32", "matmul_f32_bf16accum_f32"
             ]);
 
 
@@ -394,31 +394,27 @@ impl Graph {
     ///
     /// ```
     ///   a_fp32 (GPU, resident)
-    ///   │
-    ///   ├─ cast_f32_to_bf16 ──► a_bf16  (GPU temp, ~½ size of a)
-    ///   │
-    ///   b_cpu (CPU RAM, home)
+    ///   b_cpu  (CPU RAM, home)
     ///   │
     ///   ├─ htod ──────────────► b_fp32_temp  (GPU temp, 1 block)
-    ///   ├─ cast_f32_to_bf16 ──► b_bf16       (GPU temp, ½ block)
     ///   │
-    ///   matmul_bf16_f32(a_bf16, b_bf16) ──► out_fp32
+    ///   matmul_f32_bf16accum_f32(a_fp32, b_fp32_temp) ──► out_fp32
     ///   │
     ///   stream.synchronize()
-    ///   drop(a_bf16, b_fp32_temp, b_bf16)   ← peak is here, then immediately freed
+    ///   drop(b_fp32_temp)   ← temp freed before next streamed matmul
     ///   │
-    ///   peak ≈ a_size×2 + b_size×1.5 bytes  (BF16 = 2 bytes, FP32 = 4 bytes)
+    ///   peak ≈ a_size + b_size bytes (plus output/activations)
     /// ```
     ///
     /// For a single transformer block (hidden=1536, ffn=4096):
-    ///   Largest matmul: 1536×4096 weight = 24MB (FP32) → 12MB BF16 + 24MB temp = 36MB peak.
-    ///   Well within the 84MB streaming headroom budget.
+    ///   Largest streamed weight tile is 1536×4096 = 24MB FP32 temp.
+    ///   No additional full BF16 staging buffers are required.
     ///
     /// ## Backward VRAM profile
     ///
     /// Backward uses FP32 kernels on the CPU master weights (re-htod'd),
     /// giving full-precision gradients to AdamW — identical to matmul_streamed.
-    /// The BF16 cast is forward-only.
+    /// BF16 quantization is forward-only and happens per multiply in-kernel.
     ///
     /// ```
     ///   htod b_cpu ──► b_fp32_bwd  (GPU temp)
@@ -443,26 +439,18 @@ impl Graph {
         };
  
         // Kernels
-        let f_cast_f32_bf16 = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-        let f_matmul_bf16   = self.functions.get("matmul_bf16_f32").unwrap().clone();
+        let f_matmul_bf16   = self.functions.get("matmul_f32_bf16accum_f32").unwrap().clone();
         let f_bwd_a         = self.functions.get("matmul_backward_a_f32").unwrap().clone();
         let f_bwd_b         = self.functions.get("matmul_backward_b_f32").unwrap().clone();
         let stream_bwd      = stream.clone();
  
         // ── Forward ────────────────────────────────────────────────────────────
  
-        // 1. Cast a (GPU f32) → a_bf16
+        // 1. Read a as FP32 (resident on GPU).
         let a_fp32 = match &self.tensors[a_id].data {
             Storage::Gpu(s) => s,
             _ => unreachable!("matmul_bf16_streamed: a must be GPU storage"),
         };
-        let a_bf16: CudaSlice<u16> = stream
-            .alloc_zeros::<u16>(m * k)
-            .expect("bf16_streamed: a_bf16 alloc failed");
-        let n_a = (m * k) as u64;
-        let mut builder = stream.launch_builder(&f_cast_f32_bf16);
-        builder.arg(a_fp32).arg(&a_bf16).arg(&n_a);
-        unsafe { builder.launch(LaunchConfig::for_num_elems((m * k) as u32)) }.unwrap();
  
         // 2. htod b (CPU f32) → b_fp32_temp (GPU f32)
         let b_cpu_data = self.tensors[b_id].data.as_cpu().clone();
@@ -470,16 +458,7 @@ impl Graph {
             .clone_htod(b_cpu_data.as_slice())
             .expect("bf16_streamed: forward htod failed");
  
-        // 3. Cast b_fp32_temp → b_bf16
-        let b_bf16: CudaSlice<u16> = stream
-            .alloc_zeros::<u16>(k * n)
-            .expect("bf16_streamed: b_bf16 alloc failed");
-        let n_b = (k * n) as u64;
-        let mut builder = stream.launch_builder(&f_cast_f32_bf16);
-        builder.arg(&b_fp32_temp).arg(&b_bf16).arg(&n_b);
-        unsafe { builder.launch(LaunchConfig::for_num_elems((k * n) as u32)) }.unwrap();
- 
-        // 4. BF16 matmul → FP32 output
+        // 3. BF16-style matmul (FP32 inputs quantized on-the-fly) → FP32 output
         let out_id = self.alloc_pooled(vec![m, n]);
         let o_fp32 = match &self.tensors[out_id].data {
             Storage::Gpu(s) => s,
@@ -495,25 +474,19 @@ impl Graph {
         };
         let mut builder = stream.launch_builder(&f_matmul_bf16);
         builder
-            .arg(&a_bf16)
-            .arg(&b_bf16)
+            .arg(a_fp32)
+            .arg(&b_fp32_temp)
             .arg(o_fp32)
             .arg(&m_u64)
             .arg(&k_u64)
             .arg(&n_u64);
         unsafe { builder.launch(cfg_fwd) }.unwrap();
  
-        // 5. Sync then free all forward temporaries.
-        //    Drops happen in reverse order: b_bf16, b_fp32_temp, a_bf16.
-        //    All three are freed before the next kernel can start, keeping
-        //    peak VRAM to: out + a_fp32 + (a_bf16 + b_fp32_temp + b_bf16)
-        //    The BF16 pair and fp32_temp are freed here, not in the closure.
+        // 4. Sync then free the streamed weight temp.
         stream
             .synchronize()
             .expect("bf16_streamed: forward sync failed");
-        drop(b_bf16);
         drop(b_fp32_temp);
-        drop(a_bf16);
  
         // ── Backward closure ───────────────────────────────────────────────────
         //
@@ -845,9 +818,8 @@ impl Graph {
     /// Master weights (B) always stay FP32, so the AdamW optimizer and the
     /// rest of the graph are completely unmodified.
     ///
-    /// The two temporary BF16 VRAM buffers (a_bf16, b_bf16) are moved into
-    /// the backward closure so they remain alive until after the forward
-    /// kernels are guaranteed to have completed.
+    /// BF16 quantization happens on-the-fly in the forward kernel, so
+    /// no full-size BF16 staging tensors are allocated in VRAM.
     #[cfg(feature = "bf16")]
     pub fn matmul_bf16(&mut self, a_id: usize, b_id: usize) -> usize {
         // Streaming dispatch: if b is CPU-homed (weight streaming), use the
@@ -866,51 +838,20 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
-                let f_cast    = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                let f_matmul  = self.functions.get("matmul_bf16_f32").unwrap().clone();
+                let f_matmul  = self.functions.get("matmul_f32_bf16accum_f32").unwrap().clone();
                 // Backward uses the existing tiled FP32 kernels — no new kernel needed.
                 let f_bwd_a   = self.functions.get("matmul_backward_a_f32").unwrap().clone();
                 let f_bwd_b   = self.functions.get("matmul_backward_b_f32").unwrap().clone();
                 let stream_clone = stream.clone();
-
-                // ── Allocate temporary BF16 VRAM buffers ────────────────────────────
-                // These are NOT drawn from the pool because they are u16, not f32.
-                // They live only for the duration of the forward kernel; ownership is
-                // transferred into the backward closure to prevent premature dealloc.
-                let a_bf16: CudaSlice<u16> = stream
-                    .alloc_zeros::<u16>(m * k)
-                    .expect("BF16: failed to alloc a_bf16");
-                let b_bf16: CudaSlice<u16> = stream
-                    .alloc_zeros::<u16>(k * n)
-                    .expect("BF16: failed to alloc b_bf16");
-
-                // ── Cast A → BF16 ────────────────────────────────────────────────────
                 let a_fp32 = match &self.tensors[a_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let n_a = (m * k) as u64;
-                let mut builder = stream.launch_builder(&f_cast);
-                builder.arg(a_fp32).arg(&a_bf16).arg(&n_a);
-                unsafe {
-                    builder.launch(LaunchConfig::for_num_elems((m * k) as u32))
-                }
-                .unwrap();
-
-                // ── Cast B → BF16 ────────────────────────────────────────────────────
                 let b_fp32 = match &self.tensors[b_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let n_b = (k * n) as u64;
-                let mut builder = stream.launch_builder(&f_cast);
-                builder.arg(b_fp32).arg(&b_bf16).arg(&n_b);
-                unsafe {
-                    builder.launch(LaunchConfig::for_num_elems((k * n) as u32))
-                }
-                .unwrap();
-
-                // ── BF16 × BF16 → FP32 output ───────────────────────────────────────
+                // ── BF16-style compute (on-the-fly quantization) → FP32 output ─────
                 let out_id = self.alloc_pooled(vec![m, n]);
                 let o_fp32 = match &self.tensors[out_id].data {
                     Storage::Gpu(s) => s,
@@ -926,8 +867,8 @@ impl Graph {
                 };
                 let mut builder = stream.launch_builder(&f_matmul);
                 builder
-                    .arg(&a_bf16)
-                    .arg(&b_bf16)
+                    .arg(a_fp32)
+                    .arg(b_fp32)
                     .arg(o_fp32)
                     .arg(&m_u64)
                     .arg(&k_u64)
@@ -936,16 +877,8 @@ impl Graph {
 
                 // ── Backward closure ─────────────────────────────────────────────────
                 //
-                // We move a_bf16 / b_bf16 into the closure even though they are not
-                // used during the backward pass. This keeps the CudaSlice alive until
-                // the closure is called, by which point the forward kernels are
-                // guaranteed to have completed on the same CUDA stream.
-                //
                 // Gradients are computed entirely in FP32 using the existing tiled
                 // kernels (matmul_backward_a_f32 / matmul_backward_b_f32).
-                // Keep BF16 buffers alive until backward runs, then drop.
-                let _fwd_a = a_bf16;
-                let _fwd_b = b_bf16;
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
 
                     let out_grad = match &tensors[out_id].grad {
