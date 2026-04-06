@@ -3,7 +3,44 @@ use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{LaunchConfig, CudaFunction, PushKernelArg};
 #[cfg(feature = "bf16")]
 use cudarc::driver::CudaSlice;
-use std::collections::HashMap;
+use std::collections::{HashSet, HashMap};
+ 
+// ── StreamingReport ────────────────────────────────────────────────────────────
+ 
+/// Returned by `Graph::plan_streaming`. Describes what ended up where.
+pub struct StreamingReport {
+    /// Param tensor IDs kept in VRAM (data + grad + adam moments all GPU).
+    pub resident_param_ids: Vec<usize>,
+    /// Param tensor IDs moved to CPU RAM (data + grad + adam moments all CPU).
+    pub streamed_param_ids: Vec<usize>,
+    /// Total bytes of resident params (×4: data+grad+m+v per param).
+    pub resident_bytes: usize,
+    /// Total bytes of streamed param data (just the weight bytes; moments
+    /// are additional ×3 in CPU RAM).
+    pub streamed_bytes: usize,
+    /// Peak VRAM consumed by a single streaming temp buffer during a
+    /// forward or backward pass (= size of the largest streamed param).
+    pub streaming_headroom_bytes: usize,
+}
+ 
+impl std::fmt::Display for StreamingReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn gb(b: usize) -> f64 { b as f64 / 1024f64.powi(3) }
+        fn mb(b: usize) -> f64 { b as f64 / 1024f64.powi(2) }
+        writeln!(f, "=== Streaming Layout ===")?;
+        writeln!(f, "  VRAM-resident params:  {} tensors  ({:.2} GB × 4 = {:.2} GB VRAM)",
+            self.resident_param_ids.len(),
+            gb(self.resident_bytes / 4),
+            gb(self.resident_bytes))?;
+        writeln!(f, "  CPU-streamed params:   {} tensors  ({:.2} GB weights + {:.2} GB moments)",
+            self.streamed_param_ids.len(),
+            gb(self.streamed_bytes),
+            gb(self.streamed_bytes * 3))?;
+        writeln!(f, "  Peak streaming temp:   {:.0} MB  (one block at a time)",
+            mb(self.streaming_headroom_bytes))?;
+        write!(f, "========================")
+    }
+}
 
 pub struct Graph {
     pub tensors: Vec<Tensor>,
@@ -32,7 +69,7 @@ impl Graph {
                 .load_module(ptx.into())
                 .expect("Failed to load PTX module");
 
-            let names = vec![
+            let mut names = vec![
                 "add_f32", "fill_f32", "accumulate_f32", 
                 "mul_f32", "mul_backward_f32",
                 "matmul_f32", "matmul_backward_a_f32", "matmul_backward_b_f32",
@@ -195,6 +232,380 @@ impl Graph {
         id
     }
 
+    /// Allocate a tensor that permanently lives in CPU RAM, even when the
+    /// Graph device is GPU. Use this for weights that should be streamed
+    /// rather than resident in VRAM.
+    ///
+    /// In practice you rarely call this directly — `plan_streaming` converts
+    /// existing GPU-resident params to CPU storage automatically.
+    pub fn alloc_cpu_homed(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
+        let id   = self.tensors.len();
+        let size = if shape.is_empty() { 1 } else { shape.iter().product::<usize>() };
+        let strides = Tensor::compute_strides(&shape);
+ 
+        self.tensors.push(Tensor {
+            id,
+            shape,
+            strides,
+            data:      Storage::Cpu(data),
+            grad:      Storage::Cpu(vec![0.0; size]),
+            device:    self.device.clone(), // graph device (GPU) — sync_to_cpu still works
+            name:      None,
+            is_pooled: false,
+        });
+        id
+    }
+ 
+    /// Decide which parameters stay in VRAM and which stream from CPU RAM,
+    /// then convert the overflow params in place.
+    ///
+    /// # Arguments
+    /// * `vram_budget_bytes`      — total VRAM budget (e.g. `7 * 1024_usize.pow(3)`)
+    /// * `activation_reserve_bytes` — VRAM to reserve for activations and
+    ///                               checkpointing overhead (400–600 MB is safe)
+    /// * `pinned_ids`             — param IDs that MUST stay in VRAM regardless of budget
+    ///                             (typically: embedding weights, lm_head, final norm)
+    ///
+    /// # Returns
+    /// A `StreamingReport` describing the final layout. Print it to verify.
+    ///
+    /// # Panics
+    /// Panics if called on a CPU graph (streaming is GPU-only).
+    pub fn plan_streaming(
+        &mut self,
+        vram_budget_bytes:       usize,
+        activation_reserve_bytes: usize,
+        pinned_ids:              &[usize],
+    ) -> StreamingReport {
+        assert!(
+            matches!(&self.device, Device::Gpu(_, _)),
+            "plan_streaming requires a GPU graph"
+        );
+        assert!(
+            self.num_params > 0,
+            "call mark_params() before plan_streaming()"
+        );
+ 
+        let pinned_set: HashSet<usize> = pinned_ids.iter().cloned().collect();
+ 
+        // ── Phase 1: VRAM consumed by pinned params (data + grad + m + v = ×4) ──
+        let pinned_vram: usize = pinned_ids
+            .iter()
+            .map(|&pid| self.tensors[pid].size() * 4 * 4)
+            .sum();
+ 
+        let budget_after_fixed = vram_budget_bytes
+            .saturating_sub(activation_reserve_bytes)
+            .saturating_sub(pinned_vram);
+ 
+        // ── Phase 2: greedily assign non-pinned params ─────────────────────────
+        // We also need to reserve headroom for the largest single streamed
+        // param (the peak temp buffer). We compute this after the first pass
+        // and check that the headroom fits — if not, bump one more param to CPU.
+ 
+        let candidate_ids: Vec<usize> = (0..self.num_params)
+            .filter(|id| !pinned_set.contains(id))
+            .collect();
+ 
+        let mut resident: Vec<usize> = Vec::new();
+        let mut streamed: Vec<usize> = Vec::new();
+        let mut used = 0usize;
+ 
+        for pid in &candidate_ids {
+            let cost = self.tensors[*pid].size() * 4 * 4; // ×4 buffers ×4 bytes
+            if used + cost <= budget_after_fixed {
+                used += cost;
+                resident.push(*pid);
+            } else {
+                streamed.push(*pid);
+            }
+        }
+ 
+        // Streaming headroom = size of largest single streamed param.
+        // This must fit in the remaining VRAM alongside the resident params.
+        let max_stream_bytes = streamed
+            .iter()
+            .map(|&pid| self.tensors[pid].size() * 4)
+            .max()
+            .unwrap_or(0);
+ 
+        // If the headroom doesn't fit, demote the largest resident param.
+        // This keeps the invariant: at any moment, only 1 streaming temp
+        // is alive in VRAM (because we sync-free before returning from matmul).
+        while max_stream_bytes > budget_after_fixed.saturating_sub(used)
+            && !resident.is_empty()
+        {
+            // Demote the largest resident param to streaming
+            let largest_idx = resident
+                .iter()
+                .enumerate()
+                .max_by_key(|&(_, &pid)| self.tensors[pid].size())
+                .map(|(i, _)| i)
+                .unwrap();
+            let pid = resident.remove(largest_idx);
+            used -= self.tensors[pid].size() * 4 * 4;
+            streamed.push(pid);
+        }
+ 
+        // ── Phase 3: dtoh + convert streamed params to Storage::Cpu ────────────
+        let stream = match &self.device {
+            Device::Gpu(_, s) => s.clone(),
+            Device::Cpu       => unreachable!(),
+        };
+ 
+        let mut streamed_bytes = 0usize;
+        for &pid in &streamed {
+            let size = self.tensors[pid].size();
+            streamed_bytes += size * 4;
+ 
+            let cpu_data = match &self.tensors[pid].data {
+                Storage::Gpu(s) => {
+                    stream.clone_dtoh(s).expect("plan_streaming: dtoh weight failed")
+                }
+                Storage::Cpu(_) => continue, // already CPU — nothing to do
+                #[cfg(feature = "bf16")]
+                Storage::GpuBf16(_) => panic!("plan_streaming: BF16 streaming not yet supported"),
+            };
+ 
+            // Replacing data/grad drops the old CudaSlices → cudaFree
+            self.tensors[pid].data = Storage::Cpu(cpu_data);
+            self.tensors[pid].grad = Storage::Cpu(vec![0.0; size]);
+        }
+ 
+        // ── Report ──────────────────────────────────────────────────────────────
+        let resident_bytes: usize = pinned_ids
+            .iter()
+            .chain(resident.iter())
+            .map(|&pid| self.tensors[pid].size() * 4 * 4)
+            .sum();
+ 
+        StreamingReport {
+            resident_param_ids: pinned_ids.iter().cloned().chain(resident).collect(),
+            streamed_param_ids: streamed,
+            resident_bytes,
+            streamed_bytes,
+            streaming_headroom_bytes: max_stream_bytes,
+        }
+    }
+
+    /// BF16 mixed-precision matrix multiplication for CPU-homed (streamed) weights.
+    ///
+    /// ## Forward VRAM profile
+    ///
+    /// ```
+    ///   a_fp32 (GPU, resident)
+    ///   │
+    ///   ├─ cast_f32_to_bf16 ──► a_bf16  (GPU temp, ~½ size of a)
+    ///   │
+    ///   b_cpu (CPU RAM, home)
+    ///   │
+    ///   ├─ htod ──────────────► b_fp32_temp  (GPU temp, 1 block)
+    ///   ├─ cast_f32_to_bf16 ──► b_bf16       (GPU temp, ½ block)
+    ///   │
+    ///   matmul_bf16_f32(a_bf16, b_bf16) ──► out_fp32
+    ///   │
+    ///   stream.synchronize()
+    ///   drop(a_bf16, b_fp32_temp, b_bf16)   ← peak is here, then immediately freed
+    ///   │
+    ///   peak ≈ a_size×2 + b_size×1.5 bytes  (BF16 = 2 bytes, FP32 = 4 bytes)
+    /// ```
+    ///
+    /// For a single transformer block (hidden=1536, ffn=4096):
+    ///   Largest matmul: 1536×4096 weight = 24MB (FP32) → 12MB BF16 + 24MB temp = 36MB peak.
+    ///   Well within the 84MB streaming headroom budget.
+    ///
+    /// ## Backward VRAM profile
+    ///
+    /// Backward uses FP32 kernels on the CPU master weights (re-htod'd),
+    /// giving full-precision gradients to AdamW — identical to matmul_streamed.
+    /// The BF16 cast is forward-only.
+    ///
+    /// ```
+    ///   htod b_cpu ──► b_fp32_bwd  (GPU temp)
+    ///   matmul_backward_a_f32(grad_out, b_fp32_bwd) → grad_a  (GPU, accumulate)
+    ///   matmul_backward_b_f32(a_fp32, grad_out)     → grad_b_temp  (GPU temp)
+    ///   sync → dtoh grad_b_temp → accumulate into b_cpu_grad (CPU Vec)
+    ///   drop(b_fp32_bwd, grad_b_temp)
+    /// ```
+    #[cfg(feature = "bf16")]
+    fn matmul_bf16_streamed(&mut self, a_id: usize, b_id: usize) -> usize {
+        use cudarc::driver::CudaSlice;
+ 
+        let a_shape = self.tensors[a_id].shape.clone();
+        let b_shape = self.tensors[b_id].shape.clone();
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = b_shape[1];
+ 
+        let stream = match &self.device {
+            Device::Gpu(_, s) => s.clone(),
+            Device::Cpu => unreachable!("matmul_bf16_streamed called on CPU graph"),
+        };
+ 
+        // Kernels
+        let f_cast_f32_bf16 = self.functions.get("cast_f32_to_bf16").unwrap().clone();
+        let f_matmul_bf16   = self.functions.get("matmul_bf16_f32").unwrap().clone();
+        let f_bwd_a         = self.functions.get("matmul_backward_a_f32").unwrap().clone();
+        let f_bwd_b         = self.functions.get("matmul_backward_b_f32").unwrap().clone();
+        let stream_bwd      = stream.clone();
+ 
+        // ── Forward ────────────────────────────────────────────────────────────
+ 
+        // 1. Cast a (GPU f32) → a_bf16
+        let a_fp32 = match &self.tensors[a_id].data {
+            Storage::Gpu(s) => s,
+            _ => unreachable!("matmul_bf16_streamed: a must be GPU storage"),
+        };
+        let a_bf16: CudaSlice<u16> = stream
+            .alloc_zeros::<u16>(m * k)
+            .expect("bf16_streamed: a_bf16 alloc failed");
+        let n_a = (m * k) as u64;
+        let mut builder = stream.launch_builder(&f_cast_f32_bf16);
+        builder.arg(a_fp32).arg(&a_bf16).arg(&n_a);
+        unsafe { builder.launch(LaunchConfig::for_num_elems((m * k) as u32)) }.unwrap();
+ 
+        // 2. htod b (CPU f32) → b_fp32_temp (GPU f32)
+        let b_cpu_data = self.tensors[b_id].data.as_cpu().clone();
+        let b_fp32_temp: CudaSlice<f32> = stream
+            .clone_htod(b_cpu_data.as_slice())
+            .expect("bf16_streamed: forward htod failed");
+ 
+        // 3. Cast b_fp32_temp → b_bf16
+        let b_bf16: CudaSlice<u16> = stream
+            .alloc_zeros::<u16>(k * n)
+            .expect("bf16_streamed: b_bf16 alloc failed");
+        let n_b = (k * n) as u64;
+        let mut builder = stream.launch_builder(&f_cast_f32_bf16);
+        builder.arg(&b_fp32_temp).arg(&b_bf16).arg(&n_b);
+        unsafe { builder.launch(LaunchConfig::for_num_elems((k * n) as u32)) }.unwrap();
+ 
+        // 4. BF16 matmul → FP32 output
+        let out_id = self.alloc_pooled(vec![m, n]);
+        let o_fp32 = match &self.tensors[out_id].data {
+            Storage::Gpu(s) => s,
+            _ => unreachable!(),
+        };
+        let m_u64 = m as u64;
+        let k_u64 = k as u64;
+        let n_u64 = n as u64;
+        let cfg_fwd = LaunchConfig {
+            grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(&f_matmul_bf16);
+        builder
+            .arg(&a_bf16)
+            .arg(&b_bf16)
+            .arg(o_fp32)
+            .arg(&m_u64)
+            .arg(&k_u64)
+            .arg(&n_u64);
+        unsafe { builder.launch(cfg_fwd) }.unwrap();
+ 
+        // 5. Sync then free all forward temporaries.
+        //    Drops happen in reverse order: b_bf16, b_fp32_temp, a_bf16.
+        //    All three are freed before the next kernel can start, keeping
+        //    peak VRAM to: out + a_fp32 + (a_bf16 + b_fp32_temp + b_bf16)
+        //    The BF16 pair and fp32_temp are freed here, not in the closure.
+        stream
+            .synchronize()
+            .expect("bf16_streamed: forward sync failed");
+        drop(b_bf16);
+        drop(b_fp32_temp);
+        drop(a_bf16);
+ 
+        // ── Backward closure ───────────────────────────────────────────────────
+        //
+        // The BF16 cast is forward-only. Backward uses full FP32 master weights
+        // (re-htod'd from CPU), giving accurate gradients to AdamW.
+        // This is the same pattern as matmul_streamed's backward.
+        let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+            // Re-htod the CPU master weight for backward kernels
+            let b_cpu_bwd = tensors[b_id].data.as_cpu();
+            let b_fp32_bwd: CudaSlice<f32> = stream_bwd
+                .clone_htod(b_cpu_bwd)
+                .expect("bf16_streamed: backward htod failed");
+ 
+            let out_grad = match &tensors[out_id].grad {
+                Storage::Gpu(s) => s,
+                _ => unreachable!(),
+            };
+            let a_grad = match &tensors[a_id].grad {
+                Storage::Gpu(s) => s,
+                _ => unreachable!(),
+            };
+            let a_data = match &tensors[a_id].data {
+                Storage::Gpu(s) => s,
+                _ => unreachable!(),
+            };
+ 
+            // grad_a = grad_out @ b^T  (FP32, accumulates in-place into GPU grad)
+            let cfg_a = LaunchConfig {
+                grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b1 = stream_bwd.launch_builder(&f_bwd_a);
+            b1.arg(out_grad)
+                .arg(&b_fp32_bwd)
+                .arg(a_grad)
+                .arg(&m_u64)
+                .arg(&k_u64)
+                .arg(&n_u64);
+            unsafe { b1.launch(cfg_a) }.unwrap();
+ 
+            // grad_b = a^T @ grad_out  (FP32, into a fresh GPU temp)
+            let grad_b_temp: CudaSlice<f32> = stream_bwd
+                .alloc_zeros::<f32>(k * n)
+                .expect("bf16_streamed: grad_b_temp alloc failed");
+            let cfg_b = LaunchConfig {
+                grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b2 = stream_bwd.launch_builder(&f_bwd_b);
+            b2.arg(a_data)
+                .arg(out_grad)
+                .arg(&grad_b_temp)
+                .arg(&m_u64)
+                .arg(&k_u64)
+                .arg(&n_u64);
+            unsafe { b2.launch(cfg_b) }.unwrap();
+ 
+            // Sync before dtoh: both backward kernels must be complete
+            stream_bwd
+                .synchronize()
+                .expect("bf16_streamed: backward sync failed");
+ 
+            let grad_b_cpu = stream_bwd
+                .clone_dtoh(&grad_b_temp)
+                .expect("bf16_streamed: grad dtoh failed");
+ 
+            // Free GPU temporaries as early as possible
+            drop(b_fp32_bwd);
+            drop(grad_b_temp);
+ 
+            // Accumulate into CPU grad buffer.
+            // Correct under gradient accumulation: zero_grad resets this between
+            // optimizer steps; multiple micro-batch backward passes add up here.
+            let b_grad = tensors[b_id].grad.as_cpu_mut();
+            for (acc, delta) in b_grad.iter_mut().zip(grad_b_cpu.iter()) {
+                *acc += delta;
+            }
+        });
+ 
+        if !self.no_grad {
+            self.tape.nodes.push(TapeNode {
+                inputs: vec![a_id, b_id],
+                output: out_id,
+                backward_fn,
+            });
+        }
+ 
+        out_id
+    }
+
     // --- Helper Methods ---
     pub fn get_data(&self, tensor_id: usize) -> &Vec<f32> { self.tensors[tensor_id].data.as_cpu() }
     pub fn get_grad(&self, tensor_id: usize) -> &Vec<f32> { self.tensors[tensor_id].grad.as_cpu() }
@@ -351,6 +762,14 @@ impl Graph {
     }
 
     pub fn matmul(&mut self, a_id: usize, b_id: usize) -> usize {
+        // Streaming dispatch: if b is CPU-homed (weight streaming), use the
+        // streaming path which htods b on demand and frees it immediately.
+        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_));
+        if a_is_gpu && b_is_cpu {
+           return self.matmul_streamed(a_id, b_id);
+        }
+
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
         let m = a_shape[0]; let k = a_shape[1]; let n = b_shape[1];
@@ -431,6 +850,13 @@ impl Graph {
     /// kernels are guaranteed to have completed.
     #[cfg(feature = "bf16")]
     pub fn matmul_bf16(&mut self, a_id: usize, b_id: usize) -> usize {
+        // Streaming dispatch: if b is CPU-homed (weight streaming), use the
+        // streaming path which htods b on demand and frees it immediately.
+        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_));
+        if a_is_gpu && b_is_cpu {
+           return self.matmul_bf16_streamed(a_id, b_id);
+        }
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
         let m = a_shape[0];
@@ -517,10 +943,10 @@ impl Graph {
                 //
                 // Gradients are computed entirely in FP32 using the existing tiled
                 // kernels (matmul_backward_a_f32 / matmul_backward_b_f32).
+                // Keep BF16 buffers alive until backward runs, then drop.
+                let _fwd_a = a_bf16;
+                let _fwd_b = b_bf16;
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    // Keep BF16 buffers alive until backward runs, then drop.
-                    let _fwd_a = a_bf16;
-                    let _fwd_b = b_bf16;
 
                     let out_grad = match &tensors[out_id].grad {
                         Storage::Gpu(s) => s,
@@ -590,6 +1016,183 @@ impl Graph {
             // On CPU we silently use the standard FP32 path so tests still pass.
             Device::Cpu => self.matmul(a_id, b_id),
         }
+    }
+
+    /// Matrix multiplication where `b` is a CPU-homed weight that must be
+    /// streamed to VRAM for the forward kernel, then freed immediately.
+    ///
+    /// Called automatically by `matmul` when it detects Storage::Cpu on b.
+    ///
+    /// ## VRAM profile
+    /// ```
+    /// forward:  htod(b) → kernel → sync → FREE b_temp     [peak = 1 block]
+    /// backward: htod(b) → kernel    (grad_a)
+    ///           alloc grad_b_temp → kernel → sync → dtoh → accumulate → FREE
+    /// ```
+    /// Peak VRAM at any point = resident params + 1 streaming temp + activations.
+    ///
+    /// ## Why `stream.synchronize()` before `drop`
+    /// `cuMemFree` is not stream-ordered. Without a sync, the matmul kernel
+    /// may still be reading `b_temp` when the Rust drop fires the free.
+    /// For large matmuls (the common case) the kernel finishes long before
+    /// the next CPU instruction, so the sync is effectively free in practice.
+    fn matmul_streamed(&mut self, a_id: usize, b_id: usize) -> usize {
+        let a_shape = self.tensors[a_id].shape.clone();
+        let b_shape = self.tensors[b_id].shape.clone();
+        let m = a_shape[0];
+        let k = a_shape[1];
+        let n = b_shape[1];
+ 
+        let stream = match &self.device {
+            Device::Gpu(_, s) => s.clone(),
+            Device::Cpu       => unreachable!("matmul_streamed called on CPU graph"),
+        };
+ 
+        let f_fwd   = self.functions.get("matmul_f32").unwrap().clone();
+        let f_bwd_a = self.functions.get("matmul_backward_a_f32").unwrap().clone();
+        let f_bwd_b = self.functions.get("matmul_backward_b_f32").unwrap().clone();
+        let stream_bwd = stream.clone();
+ 
+        // ── Forward: htod b → kernel → SYNC → FREE ─────────────────────────────
+        let b_cpu = self.tensors[b_id].data.as_cpu().clone(); // cheap clone of the Vec ref
+        let b_temp_fwd = stream
+            .clone_htod(b_cpu.as_slice())
+            .expect("matmul_streamed: forward htod failed");
+ 
+        let out_id = self.alloc_pooled(vec![m, n]);
+ 
+        let a_s = match &self.tensors[a_id].data {
+            Storage::Gpu(s) => s,
+            _ => unreachable!("matmul_streamed: input a must be GPU storage"),
+        };
+        let o_s = match &self.tensors[out_id].data {
+            Storage::Gpu(s) => s,
+            _ => unreachable!(),
+        };
+ 
+        let m_u64 = m as u64;
+        let k_u64 = k as u64;
+        let n_u64 = n as u64;
+        let cfg_fwd = LaunchConfig {
+            grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+ 
+        let mut builder = stream.launch_builder(&f_fwd);
+        builder
+            .arg(a_s)
+            .arg(&b_temp_fwd)
+            .arg(o_s)
+            .arg(&m_u64)
+            .arg(&k_u64)
+            .arg(&n_u64);
+        unsafe { builder.launch(cfg_fwd) }.unwrap();
+ 
+        // Sync before free: guarantees the matmul kernel has finished reading
+        // b_temp_fwd before cudaFree is called. For large matmuls this is
+        // effectively zero-cost — the kernel is already done.
+        stream
+            .synchronize()
+            .expect("matmul_streamed: forward sync failed");
+        drop(b_temp_fwd); // cudaFree — now safe
+ 
+        // ── Backward closure ────────────────────────────────────────────────────
+        // NOTE: b_cpu (the Vec<f32>) is moved into the closure. This is just
+        // a Vec on the CPU heap — not VRAM. The closure re-htods it during
+        // backward to get a fresh GPU buffer for the backward kernels.
+        let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+            // Re-htod the CPU weight for backward kernels.
+            // We read directly from tensors[b_id].data rather than the captured
+            // b_cpu so that any weight update applied between forward and backward
+            // (which shouldn't happen but is safe to handle) is reflected.
+            let b_cpu_bwd = tensors[b_id].data.as_cpu();
+            let b_temp_bwd = stream_bwd
+                .clone_htod(b_cpu_bwd)
+                .expect("matmul_streamed: backward htod failed");
+ 
+            let out_grad = match &tensors[out_id].grad {
+                Storage::Gpu(s) => s,
+                _ => unreachable!(),
+            };
+            let a_grad = match &tensors[a_id].grad {
+                Storage::Gpu(s) => s,
+                _ => unreachable!(),
+            };
+            let a_data = match &tensors[a_id].data {
+                Storage::Gpu(s) => s,
+                _ => unreachable!(),
+            };
+ 
+            // grad_a = grad_out @ b^T   (GPU → GPU, accumulate in-place)
+            let cfg_a = LaunchConfig {
+                grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b1 = stream_bwd.launch_builder(&f_bwd_a);
+            b1.arg(out_grad)
+                .arg(&b_temp_bwd)
+                .arg(a_grad)
+                .arg(&m_u64)
+                .arg(&k_u64)
+                .arg(&n_u64);
+            unsafe { b1.launch(cfg_a) }.unwrap();
+ 
+            // grad_b = a^T @ grad_out  (GPU temp → dtoh → accumulate into CPU grad)
+            //
+            // We cannot atomicAdd directly into CPU RAM from a CUDA kernel, so we
+            // compute into a fresh GPU buffer, dtoh it, then add on the CPU.
+            // alloc_zeros initialises to 0, and the backward kernel uses atomicAdd,
+            // so grad_b_temp is the exact gradient for this micro-batch.
+            let grad_b_temp = stream_bwd
+                .alloc_zeros::<f32>(k * n)
+                .expect("matmul_streamed: grad_b_temp alloc failed");
+ 
+            let cfg_b = LaunchConfig {
+                grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
+                block_dim: (16, 16, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b2 = stream_bwd.launch_builder(&f_bwd_b);
+            b2.arg(a_data)
+                .arg(out_grad)
+                .arg(&grad_b_temp)
+                .arg(&m_u64)
+                .arg(&k_u64)
+                .arg(&n_u64);
+            unsafe { b2.launch(cfg_b) }.unwrap();
+ 
+            // Sync before dtoh: the backward kernel must be done before we read
+            stream_bwd
+                .synchronize()
+                .expect("matmul_streamed: backward sync failed");
+ 
+            let grad_b_gpu = stream_bwd
+                .clone_dtoh(&grad_b_temp)
+                .expect("matmul_streamed: grad dtoh failed");
+ 
+            // Free GPU temporaries now that data is on CPU
+            drop(b_temp_bwd);
+            drop(grad_b_temp);
+ 
+            // Accumulate into the CPU grad buffer (supports gradient accumulation:
+            // multiple backward passes add up here, zero_grad resets between steps)
+            let b_grad = tensors[b_id].grad.as_cpu_mut();
+            for (acc, delta) in b_grad.iter_mut().zip(grad_b_gpu.iter()) {
+                *acc += delta;
+            }
+        });
+ 
+        if !self.no_grad {
+            self.tape.nodes.push(TapeNode {
+                inputs: vec![a_id, b_id],
+                output: out_id,
+                backward_fn,
+            });
+        }
+ 
+        out_id
     }
 
     pub fn bmm(&mut self, a_id: usize, b_id: usize, trans_b: bool) -> usize {
