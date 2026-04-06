@@ -257,10 +257,10 @@ fn main() {
     //   ──────────────────────────────────────────────────────────────────────
     //   Total              : ~1.07B
     //
-    let hidden_dim = 1536;
-    let num_heads  = 12;     // head_dim = 128
-    let ffn_dim    = 4096;
-    let num_layers = 48;
+    let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 1536);
+    let num_heads  = env_usize("EISEN_NUM_HEADS", 12); // head_dim = hidden/heads
+    let ffn_dim    = env_usize("EISEN_FFN_DIM", 4096);
+    let num_layers = env_usize("EISEN_NUM_LAYERS", 48);
 
     // ── Training hyperparameters ─────────────────────────────────────────────
     //
