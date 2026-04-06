@@ -255,6 +255,32 @@ impl Graph {
         });
         id
     }
+
+    /// Move an existing tensor's data+grad storage to CPU RAM.
+    ///
+    /// Useful when building very large models on GPU without first holding all
+    /// parameters resident in VRAM. If the tensor is already CPU-homed this is
+    /// a no-op.
+    pub fn demote_tensor_to_cpu(&mut self, tensor_id: usize) {
+        let size = self.tensors[tensor_id].size();
+        let stream = match &self.device {
+            Device::Gpu(_, s) => Some(s.clone()),
+            Device::Cpu => None,
+        };
+
+        let cpu_data = match &self.tensors[tensor_id].data {
+            Storage::Cpu(v) => v.clone(),
+            Storage::Gpu(s) => {
+                let st = stream.as_ref().expect("GPU storage without GPU stream");
+                st.clone_dtoh(s).expect("demote_tensor_to_cpu: dtoh data failed")
+            }
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(_) => panic!("demote_tensor_to_cpu: BF16 tensor demotion not supported"),
+        };
+
+        self.tensors[tensor_id].data = Storage::Cpu(cpu_data);
+        self.tensors[tensor_id].grad = Storage::Cpu(vec![0.0; size]);
+    }
  
     /// Decide which parameters stay in VRAM and which stream from CPU RAM,
     /// then convert the overflow params in place.

@@ -7,9 +7,10 @@
 //
 // Memory strategy:
 //   - Embeddings, final norm, lm_head: always VRAM (frequently accessed, small)
-//   - Transformer blocks: 19 resident in VRAM, 29 streamed from CPU RAM
-//   - Peak streaming temp: ~84 MB (one block at a time, sync-freed)
-//   - CPU RAM for streamed params: ~9.5 GB (weights + grad + adam m + v)
+//   - Transformer blocks are demoted to CPU immediately during init to avoid
+//     OOM before streaming layout is planned
+//   - plan_streaming() then decides final residency and reports peak temp usage
+//   - CPU RAM holds streamed weights (+ grad + Adam moments)
 //
 // Run:
 //   cargo run --release --example train_1b [--features bf16]
@@ -157,9 +158,18 @@ impl TransformerLM {
         num_layers: usize,
     ) -> Self {
         let token_emb = Embedding::new(g, vocab_size, hidden_dim);
-        let blocks = (0..num_layers)
-            .map(|_| TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim))
-            .collect();
+
+        // Build blocks one-by-one and immediately demote their parameters to
+        // CPU so model init does not require full-model VRAM residency.
+        let mut blocks = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
+            for pid in block.params() {
+                g.demote_tensor_to_cpu(pid);
+            }
+            blocks.push(block);
+        }
+
         let norm_f  = RMSNorm::new(g, hidden_dim, 1e-5);
         let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
         Self { token_emb, blocks, norm_f, lm_head }
