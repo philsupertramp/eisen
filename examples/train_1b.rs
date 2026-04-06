@@ -256,15 +256,17 @@ fn main() {
 
     // ── Training hyperparameters ─────────────────────────────────────────────
     //
-    // Effective batch = micro_batch × accum_steps = 4 × 8 = 32 sequences
-    // Effective tokens per step = 32 × 512 = 16,384
+    // Effective batch = micro_batch × accum_steps = 2 × 8 = 16 sequences
+    // Effective tokens per step = 16 × 128 = 2,048
     //
     // LR recipe (Chinchilla-style):
     //   Warmup 1,000 steps → cosine decay to lr_min over 100,000 steps
     //   Peak lr 3e-4 is standard for models in this range with AdamW
     //
     let seq_len          = 128;//512;
-    let micro_batch_size = 4;
+    // Keep this conservative by default: attention transpose/bmm activations
+    // can still OOM at 4 on smaller consumer GPUs even with streaming.
+    let micro_batch_size = 2;
     let accum_steps      = 8_usize;
     let effective_batch  = micro_batch_size * accum_steps;
     let tokens_per_step  = effective_batch * seq_len;
