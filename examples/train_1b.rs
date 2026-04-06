@@ -7,8 +7,9 @@
 //
 // Memory strategy:
 //   - Embeddings, final norm, lm_head: always VRAM (frequently accessed, small)
-//   - Transformer blocks are demoted to CPU immediately during init to avoid
-//     OOM before streaming layout is planned
+//   - Transformer block matrix weights are demoted to CPU immediately during
+//     init to avoid OOM before streaming layout is planned
+//   - Tiny RMSNorm scale vectors stay in VRAM (RMSNorm kernels are GPU-only)
 //   - plan_streaming() then decides final residency and reports peak temp usage
 //   - CPU RAM holds streamed weights (+ grad + Adam moments)
 //
@@ -165,7 +166,11 @@ impl TransformerLM {
         for _ in 0..num_layers {
             let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
             for pid in block.params() {
-                g.demote_tensor_to_cpu(pid);
+                // Keep tiny 1D norm scales resident; stream only matrix weights.
+                // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
+                if g.tensors[pid].shape.len() == 2 {
+                    g.demote_tensor_to_cpu(pid);
+                }
             }
             blocks.push(block);
         }
