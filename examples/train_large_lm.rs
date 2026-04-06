@@ -245,7 +245,7 @@ fn main() {
 
     // ---- Cosine LR with Warmup ------------------------------------
     // Standard recipe: warm up for ~1% of total steps, then decay.
-    let total_steps   = 50_000_usize; // One full run cap
+    let total_steps   = 19850_usize; // One full run cap
     let warmup_steps  = 500_usize;
     let lr_max        = 3e-4_f32;
     let lr_min        = 3e-5_f32;
@@ -261,13 +261,33 @@ fn main() {
     println!("  Warmup: {} steps → cosine decay over {} steps", warmup_steps, total_steps);
     println!("  LR: {:.2e} → {:.2e}", lr_max, lr_min);
 
-    let mut g = Graph::new(device);
-    let model  = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers);
+    // The call order matters. Exactly here:
 
-    // Start with the scheduler's initial lr (warmup step 0)
-    let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
+    let mut g     = Graph::new(device);
+    let model     = TransformerLM::new(&mut g, vocab_size, hidden_dim,
+                                       num_heads, ffn_dim, num_layers);
+
+    // ① Lock parameter watermark BEFORE planning
     g.mark_params();
-    println!("\nVRAM pool active. Parameter tensors locked: {}", g.num_params);
+
+    // ② Decide which params stream, convert overflow to CPU storage.
+    //    pinned = always-VRAM: embedding + final_norm + lm_head
+    let pinned: Vec<usize> = model.token_emb.params()
+       .into_iter()
+       .chain(model.norm_f.params())
+       .chain(model.lm_head.params())
+       .collect();
+
+    let report = g.plan_streaming(
+        7 * 1024_usize.pow(3),   // 7 GB VRAM budget
+        500 * 1024 * 1024,       // 500 MB activation reserve
+        &pinned,
+    );
+    println!("{}", report);
+
+    // ③ Create optimizer AFTER plan_streaming so moment buffers
+    //    are initialised lazily in the correct memory space
+    let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
 
     // ---------------------------------------------------------------
     // Training Loop
