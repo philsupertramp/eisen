@@ -280,6 +280,13 @@ impl Graph {
 
         self.tensors[tensor_id].data = Storage::Cpu(cpu_data);
         self.tensors[tensor_id].grad = Storage::Cpu(vec![0.0; size]);
+
+        // Ensure dtoh and subsequent drops are fully retired so VRAM is
+        // actually reclaimed during large model initialization.
+        if let Some(st) = stream {
+            st.synchronize()
+                .expect("demote_tensor_to_cpu: stream sync failed");
+        }
     }
  
     /// Decide which parameters stay in VRAM and which stream from CPU RAM,
