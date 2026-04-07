@@ -21,6 +21,21 @@ fn as_json_array(values: &[usize]) -> String {
     format!("[{}]", items.join(","))
 }
 
+fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
+fn should_transpose_for_hf(name: &str, shape: &[usize]) -> bool {
+    shape.len() == 2 && name != "model.embed_tokens.weight"
+}
+
+
 /// Writes a tiny, dependency-free `config.json` that follows
 /// Llama-style keys expected by `transformers`.
 pub fn write_llama_config(path: &str, cfg: &LlamaConfig) -> std::io::Result<()> {
@@ -80,13 +95,22 @@ pub fn write_safetensors(
 
     for (name, tid) in named_params {
         let t = &g.tensors[*tid];
-        let data = t.sync_to_cpu();
+        let mut shape = t.shape.clone();
+        let mut data = t.sync_to_cpu();
+
+        // Eisen linear layers store weights as [in_features, out_features],
+        // while Hugging Face Llama expects [out_features, in_features].
+        if should_transpose_for_hf(name, &shape) {
+            data = transpose_2d(&data, shape[0], shape[1]);
+            shape.swap(0, 1);
+        }
+
         let begin = payload.len();
         for v in &data {
             payload.extend_from_slice(&v.to_le_bytes());
         }
         let end = payload.len();
-        entries.insert(name.clone(), (t.shape.clone(), begin, end));
+        entries.insert(name.clone(), (shape, begin, end));
     }
 
     let mut header = String::from("{");
