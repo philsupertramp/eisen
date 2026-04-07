@@ -36,13 +36,6 @@ impl Module for Linear {
         let x_shape = g.tensors[x_id].shape.clone();
         let is_3d = x_shape.len() == 3;
 
-        // Flatten 3D inputs [Batch, Seq, Dim] -> [Batch * Seq, Dim] for 2D matmul.
-        let flat_x_id = if is_3d {
-            g.reshape(x_id, vec![x_shape[0] * x_shape[1], x_shape[2]])
-        } else {
-            x_id
-        };
-
         // ---------------------------------------------------------------
         // Mixed-Precision Dispatch
         //
@@ -55,10 +48,10 @@ impl Module for Linear {
         // the original behaviour).
         // ---------------------------------------------------------------
         #[cfg(feature = "bf16")]
-        let out_id = g.matmul_bf16(flat_x_id, self.weight_id);
+        let out_id = g.matmul_bf16(x_id, self.weight_id);
 
         #[cfg(not(feature = "bf16"))]
-        let out_id = g.matmul(flat_x_id, self.weight_id);
+        let out_id = g.matmul(x_id, self.weight_id);
 
         let out_biased_id = if let Some(b_id) = self.bias_id {
             g.add(out_id, b_id)
@@ -69,7 +62,8 @@ impl Module for Linear {
         // Restore the 3D shape: [Batch, Seq, OutDim]
         if is_3d {
             let out_dim = g.tensors[self.weight_id].shape[1];
-            g.reshape(out_biased_id, vec![x_shape[0], x_shape[1], out_dim])
+            g.reinterpret_shape(out_biased_id, vec![x_shape[0], x_shape[1], out_dim]);
+            out_biased_id
         } else {
             out_biased_id
         }

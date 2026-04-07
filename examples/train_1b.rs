@@ -7,9 +7,11 @@
 //
 // Memory strategy:
 //   - Embeddings, final norm, lm_head: always VRAM (frequently accessed, small)
-//   - Transformer blocks: 19 resident in VRAM, 29 streamed from CPU RAM
-//   - Peak streaming temp: ~84 MB (one block at a time, sync-freed)
-//   - CPU RAM for streamed params: ~9.5 GB (weights + grad + adam m + v)
+//   - Transformer block matrix weights are demoted to CPU immediately during
+//     init to avoid OOM before streaming layout is planned
+//   - Tiny RMSNorm scale vectors stay in VRAM (RMSNorm kernels are GPU-only)
+//   - plan_streaming() then decides final residency and reports peak temp usage
+//   - CPU RAM holds streamed weights (+ grad + Adam moments)
 //
 // Run:
 //   cargo run --release --example train_1b [--features bf16]
@@ -33,6 +35,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 use std::net::TcpListener;
 use std::thread;
+use std::env;
 
 // ─── GPU setup ────────────────────────────────────────────────────────────────
 
@@ -40,6 +43,13 @@ fn setup_gpu() -> Device {
     let ctx    = CudaContext::new(0).expect("CUDA GPU required for 1B training");
     let stream = ctx.default_stream();
     Device::Gpu(ctx, stream)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 // ─── EisenBoard (carried over from train_large_lm.rs unchanged) ───────────────
@@ -157,9 +167,22 @@ impl TransformerLM {
         num_layers: usize,
     ) -> Self {
         let token_emb = Embedding::new(g, vocab_size, hidden_dim);
-        let blocks = (0..num_layers)
-            .map(|_| TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim))
-            .collect();
+
+        // Build blocks one-by-one and immediately demote their parameters to
+        // CPU so model init does not require full-model VRAM residency.
+        let mut blocks = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
+            for pid in block.params() {
+                // Keep tiny 1D norm scales resident; stream only matrix weights.
+                // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
+                if g.tensors[pid].shape.len() == 2 {
+                    g.demote_tensor_to_cpu(pid);
+                }
+            }
+            blocks.push(block);
+        }
+
         let norm_f  = RMSNorm::new(g, hidden_dim, 1e-5);
         let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
         Self { token_emb, blocks, norm_f, lm_head }
@@ -234,23 +257,25 @@ fn main() {
     //   ──────────────────────────────────────────────────────────────────────
     //   Total              : ~1.07B
     //
-    let hidden_dim = 1536;
-    let num_heads  = 12;     // head_dim = 128
-    let ffn_dim    = 4096;
-    let num_layers = 48;
+    let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 1536);
+    let num_heads  = env_usize("EISEN_NUM_HEADS", 12); // head_dim = hidden/heads
+    let ffn_dim    = env_usize("EISEN_FFN_DIM", 4096);
+    let num_layers = env_usize("EISEN_NUM_LAYERS", 48);
 
     // ── Training hyperparameters ─────────────────────────────────────────────
     //
-    // Effective batch = micro_batch × accum_steps = 4 × 8 = 32 sequences
-    // Effective tokens per step = 32 × 512 = 16,384
+    // Effective batch = micro_batch × accum_steps = 2 × 8 = 16 sequences
+    // Effective tokens per step = 16 × 128 = 2,048
     //
     // LR recipe (Chinchilla-style):
     //   Warmup 1,000 steps → cosine decay to lr_min over 100,000 steps
     //   Peak lr 3e-4 is standard for models in this range with AdamW
     //
-    let seq_len          = 128;//512;
-    let micro_batch_size = 4;
-    let accum_steps      = 8_usize;
+    let seq_len          = env_usize("EISEN_SEQ_LEN", 128);
+    // Keep this conservative by default: attention transpose/bmm activations
+    // can still OOM at 4 on smaller consumer GPUs even with streaming.
+    let micro_batch_size = env_usize("EISEN_MICRO_BATCH", 2);
+    let accum_steps      = env_usize("EISEN_ACCUM_STEPS", 8);
     let effective_batch  = micro_batch_size * accum_steps;
     let tokens_per_step  = effective_batch * seq_len;
 
@@ -286,9 +311,11 @@ fn main() {
         .collect();
 
     println!("Planing memory streaming...");
+    let vram_budget_mb   = env_usize("EISEN_VRAM_BUDGET_MB", 5120);
+    let reserve_mb       = env_usize("EISEN_ACTIVATION_RESERVE_MB", 500);
     let report = g.plan_streaming(
-        5 * 1024_usize.pow(3),  // 7 GB VRAM budget
-        500 * 1024 * 1024,      // 500 MB activation + checkpointing reserve
+        vram_budget_mb * 1024 * 1024,
+        reserve_mb * 1024 * 1024,
         &pinned,
     );
     println!("{}", report);

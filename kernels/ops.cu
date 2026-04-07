@@ -49,6 +49,29 @@ extern "C" __global__ void matmul_bf16_f32(
         out[row * n + col] = sum;
     }
 }
+
+// Mixed Precision MatMul without full BF16 staging buffers.
+//
+// Inputs remain FP32 in global memory. Each multiply converts both operands
+// to BF16 and accumulates in FP32, matching the numerical intent of
+// `matmul_bf16_f32` while avoiding whole-matrix BF16 temp allocations.
+extern "C" __global__ void matmul_f32_bf16accum_f32(
+    const float* a, const float* b, float* out,
+    const size_t m, const size_t k, const size_t n
+) {
+    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
+    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m && col < n) {
+        float sum = 0.0f;
+        for (size_t i = 0; i < k; ++i) {
+            __nv_bfloat16 a_bf16 = __float2bfloat16(a[row * k + i]);
+            __nv_bfloat16 b_bf16 = __float2bfloat16(b[i * n + col]);
+            sum += __bfloat162float(a_bf16) * __bfloat162float(b_bf16);
+        }
+        out[row * n + col] = sum;
+    }
+}
 // --- BROADCAST-AWARE ADDITION ---
 extern "C" __global__ void add_f32(
     const float* a,
