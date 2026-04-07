@@ -60,7 +60,7 @@ fn test_cpu_rope_and_flash_attention_reference_match() {
     let v = g_ref.alloc(vec![1, 2, 2], vec![0.0, 1.0, 2.0, 3.0]);
 
     let scores = g_ref.bmm(q, k, true);
-    let scale_id = g_ref.scalar(1.0 / (2.0f32).sqrt());
+    let scale_id = g_ref.alloc(vec![], vec![1.0 / (2.0f32).sqrt()]);
     let scaled = g_ref.mul(scores, scale_id);
     let probs = g_ref.softmax(scaled);
     let ref_id = g_ref.bmm(probs, v, false);
