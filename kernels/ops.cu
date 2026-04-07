@@ -617,6 +617,68 @@ extern "C" __global__ void softmax_backward_f32(const float* out, const float* g
     }
 }
 
+// ============================================================
+// FLASH ATTENTION (forward, inference/no_grad path)
+//
+// Computes:
+//   out[b, i, :] = softmax((q[b, i, :] @ k[b, :, :]^T) * scale + mask) @ v[b, :, :]
+//
+// without materializing the [N x N] attention matrix.
+// ============================================================
+#define FLASH_MAX_HEAD_DIM 256
+extern "C" __global__ void flash_attention_f32(
+    const float* q,
+    const float* k,
+    const float* v,
+    float* out,
+    const size_t batch,
+    const size_t m,
+    const size_t n,
+    const size_t d,
+    const float scale,
+    const bool causal
+) {
+    size_t row_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    size_t total_rows = batch * m;
+    if (row_idx >= total_rows || d > FLASH_MAX_HEAD_DIM) return;
+
+    size_t b = row_idx / m;
+    size_t i = row_idx % m;
+
+    const float* q_row = q + b * (m * d) + i * d;
+    const float* k_batch = k + b * (n * d);
+    const float* v_batch = v + b * (n * d);
+    float* out_row = out + b * (m * d) + i * d;
+
+    float acc[FLASH_MAX_HEAD_DIM];
+    for (size_t x = 0; x < d; ++x) acc[x] = 0.0f;
+
+    float running_max = -1e20f;
+    float running_l = 0.0f;
+
+    for (size_t j = 0; j < n; ++j) {
+        float score = 0.0f;
+        const float* k_row = k_batch + j * d;
+        for (size_t x = 0; x < d; ++x) score += q_row[x] * k_row[x];
+        score *= scale;
+        if (causal && j > i) score = -1e20f;
+
+        float new_max = fmaxf(running_max, score);
+        float alpha = expf(running_max - new_max);
+        float p = expf(score - new_max);
+        float new_l = running_l * alpha + p;
+
+        const float* v_row = v_batch + j * d;
+        for (size_t x = 0; x < d; ++x) acc[x] = acc[x] * alpha + p * v_row[x];
+
+        running_max = new_max;
+        running_l = new_l;
+    }
+
+    float inv_l = 1.0f / fmaxf(running_l, 1e-9f);
+    for (size_t x = 0; x < d; ++x) out_row[x] = acc[x] * inv_l;
+}
+
 extern "C" __global__ void transpose_0213_f32(
     const float* src, float* dst,
     const size_t B, const size_t S, const size_t H, const size_t D
