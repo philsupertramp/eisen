@@ -16,30 +16,30 @@
 // Run:
 //   cargo run --release --example train_llm [--features bf16]
 
+use cudarc::driver::CudaContext;
+use eisen::data::dataloader::BinaryDataLoader;
+use eisen::data::tokenizer::BPETokenizer;
 use eisen::graph::Graph;
+use eisen::nn::Module;
 use eisen::nn::optim::AdamW;
 use eisen::nn::scheduler::CosineScheduler;
 use eisen::nn::transformer::TransformerLM;
-use eisen::nn::Module;
-use eisen::data::tokenizer::BPETokenizer;
-use eisen::data::dataloader::BinaryDataLoader;
 use eisen::tensor::Device;
-use eisen::tools::huggingface::{write_llama_config, write_safetensors, LlamaConfig};
-use cudarc::driver::CudaContext;
+use eisen::tools::huggingface::{LlamaConfig, write_llama_config, write_safetensors};
 
+use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write, Read};
+use std::io::{BufWriter, Write};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
-use std::net::TcpListener;
-use std::thread;
-use std::env;
+use std::time::{Instant, UNIX_EPOCH, SystemTime};
+
+use eisenboard::{StepRecord, TrainStats, spawn_eisenboard};
 
 // ─── GPU setup ────────────────────────────────────────────────────────────────
 
 fn setup_gpu() -> Device {
-    let ctx    = CudaContext::new(0).expect("CUDA GPU required for 1B training");
+    let ctx = CudaContext::new(0).expect("CUDA GPU required for 1B training");
     let stream = ctx.default_stream();
     Device::Gpu(ctx, stream)
 }
@@ -51,144 +51,47 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-// ─── EisenBoard (carried over from train_large_lm.rs unchanged) ───────────────
-#[derive(Clone)]
-struct StepRecord {
-    step: usize,
-    loss: f32,
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
-#[derive(Clone, Default)]
-struct TrainStats {
-    step: usize,
-    loss: f32,
-    lr: f32,
-    tps: f32,
-    batch_time_ms: f32,
-    total_tokens: usize,
-    history: Vec<StepRecord>, // Server-side history prevents data loss on refresh!
+fn env_f32(name: &str, default: f32) -> f32 {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(default)
 }
 
-const DASHBOARD_HTML: &str = r#"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <title>EisenBoard | Live Training</title>
-    <style>
-        body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 2rem; margin: 0; }
-        h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
-        .stats-grid { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; max-width: 1000px; }
-        .stat-box { background: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 6px; flex: 1 1 150px; }
-        .stat-label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
-        .stat-value { font-size: 24px; color: #7ee787; font-weight: bold; margin-top: 5px; }
-        .stat-value.lr { color: #f78166; }
-        canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; width: 100%; max-width: 1000px; height: 400px; }
-    </style>
-</head>
-<body>
-    <h1>EisenBoard 🚀</h1>
-    <div class="stats-grid">
-        <div class="stat-box"><div class="stat-label">STEP</div><div id="step" class="stat-value">0</div></div>
-        <div class="stat-box"><div class="stat-label">LOSS</div><div id="loss" class="stat-value">0.0000</div></div>
-        <div class="stat-box"><div class="stat-label">LR</div><div id="lr" class="stat-value lr">0.0000</div></div>
-        <div class="stat-box"><div class="stat-label">TOKENS / SEC</div><div id="tps" class="stat-value">0</div></div>
-        <div class="stat-box"><div class="stat-label">BATCH TIME</div><div id="batch_time" class="stat-value">0 ms</div></div>
-        <div class="stat-box"><div class="stat-label">TOTAL TOKENS</div><div id="total_tokens" class="stat-value">0</div></div>
-    </div>
-    <canvas id="lossChart" width="1000" height="400"></canvas>
-    <script>
-        const ctx = document.getElementById('lossChart').getContext('2d');
-        
-        function drawChart(history) {
-            ctx.clearRect(0, 0, 1000, 400);
-            if (!history || history.length < 2) return;
-            ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
-            for(let i=0; i<=10; i++) { ctx.beginPath(); ctx.moveTo(0, i*40); ctx.lineTo(1000, i*40); ctx.stroke(); }
-            let minLoss = Math.min(...history.map(d => d.loss)) * 0.98;
-            let maxLoss = Math.max(...history.map(d => d.loss)) * 1.02;
-            let range = maxLoss - minLoss || 1;
-            ctx.strokeStyle = '#ff7b72'; ctx.lineWidth = 2; ctx.beginPath();
-            history.forEach((point, i) => {
-                let x = (i / Math.max(history.length - 1, 1)) * 1000;
-                let y = 400 - (((point.loss - minLoss) / range) * 400);
-                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-            });
-            ctx.stroke();
-        }
-        setInterval(async () => {
-            try {
-                const res = await fetch('/api/stats');
-                const data = await res.json();
-                document.getElementById('step').innerText = data.step.toLocaleString();
-                document.getElementById('loss').innerText = data.loss.toFixed(4);
-                document.getElementById('lr').innerText = data.lr.toExponential(2);
-                document.getElementById('tps').innerText = Math.round(data.tps).toLocaleString();
-                document.getElementById('batch_time').innerText = Math.round(data.batch_time_ms) + " ms";
-                
-                let tk = data.total_tokens;
-                let tkStr = tk > 1000000000 ? (tk/1000000000).toFixed(2) + "B" : tk > 1000000 ? (tk/1000000).toFixed(2) + "M" : tk.toLocaleString();
-                document.getElementById('total_tokens').innerText = tkStr;
-
-                drawChart(data.history);
-            } catch (e) {}
-        }, 1000);
-    </script>
-</body>
-</html>
-"#;
-
-fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>) {
-    thread::spawn(move || {
-        let listener =
-            TcpListener::bind("0.0.0.0:8080").expect("Failed to bind EisenBoard to port 8080");
-        println!("\n🌐 EisenBoard Live! Open http://localhost:8080 in your browser\n");
-        for stream in listener.incoming() {
-            if let Ok(mut stream) = stream {
-                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                let mut buffer = [0; 1024];
-                if stream.read(&mut buffer).unwrap_or(0) > 0 {
-                    let request = String::from_utf8_lossy(&buffer[..]);
-                    if request.starts_with("GET /api/stats") {
-                        let s = stats.read().unwrap();
-                        let history_json: Vec<String> = s
-                            .history
-                            .iter()
-                            .map(|r| format!(r#"{{"step":{},"loss":{:.6}}}"#, r.step, r.loss))
-                            .collect();
-                        let json = format!(
-                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2},"batch_time_ms":{:.2},"total_tokens":{},"history":[{}]}}"#,
-                            s.step,
-                            s.loss,
-                            s.lr,
-                            s.tps,
-                            s.batch_time_ms,
-                            s.total_tokens,
-                            history_json.join(",")
-                        );
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
-                            json
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                    } else if request.starts_with("GET / ") {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}",
-                            DASHBOARD_HTML
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                    }
-                }
-            }
-        }
-    });
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(default)
 }
+
+fn apply_reproducibility_controls(deterministic: bool, seed: u64) {
+    unsafe { env::set_var("EISEN_SEED", seed.to_string()) };
+    if deterministic {
+        unsafe { env::set_var("CUBLAS_WORKSPACE_CONFIG", ":4096:8") };
+        unsafe { env::set_var("CUDA_LAUNCH_BLOCKING", "1") };
+    }
+}
+
+fn write_run_manifest(path: &str, content: &str) {
+    fs::write(path, content).expect("Failed to write run manifest");
+    println!("Run manifest written to {}", path);
+}
+
+// ─── EisenBoard (dedicated crate: `eisenboard`) ─────────────────────────────
 
 // ─── Checkpoint I/O ───────────────────────────────────────────────────────────
 
 fn save_weights(g: &Graph, path: &str) {
     println!("Saving checkpoint to {}…", path);
-    let f   = File::create(path).expect("Cannot create checkpoint file");
+    let f = File::create(path).expect("Cannot create checkpoint file");
     let mut w = BufWriter::new(f);
     for i in 0..g.num_params {
         let data = g.tensors[i].sync_to_cpu();
@@ -239,15 +142,21 @@ fn main() {
     println!("║  Eisen Engine — 1.07B Parameter Pre-Training            ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 
-    let device       = setup_gpu();
+    let device = setup_gpu();
     let shared_stats = Arc::new(RwLock::new(TrainStats::default()));
-    spawn_eisenboard(shared_stats.clone());
+    let board_bind = env::var("EISEN_BOARD_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
+    spawn_eisenboard(shared_stats.clone(), &board_bind);
 
     // ── Paths ────────────────────────────────────────────────────────────────
     let tokenizer_path = "data/tokenizer.model";
     let bin_path = "data/german_large_corpus.bin";
     let output_path = "data/eisen_model.bin";
     let hf_out_dir = "data/hf_export";
+
+    let grad_clip_norm = env_f32("EISEN_GRAD_CLIP_NORM", 1.0);
+    let seed = env_u64("EISEN_SEED", 1337);
+    let deterministic = env_bool("EISEN_DETERMINISTIC", true);
+    apply_reproducibility_controls(deterministic, seed);
 
     // ── Tokenizer ────────────────────────────────────────────────────────────
     println!("\nLoading tokenizer…");
@@ -268,8 +177,8 @@ fn main() {
     //   Total              : ~1.07B
     //
     let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 1536);
-    let num_heads  = env_usize("EISEN_NUM_HEADS", 12); // head_dim = hidden/heads
-    let ffn_dim    = env_usize("EISEN_FFN_DIM", 4096);
+    let num_heads = env_usize("EISEN_NUM_HEADS", 12); // head_dim = hidden/heads
+    let ffn_dim = env_usize("EISEN_FFN_DIM", 4096);
     let num_layers = env_usize("EISEN_NUM_LAYERS", 48);
 
     // ── Training hyperparameters ─────────────────────────────────────────────
@@ -281,23 +190,23 @@ fn main() {
     //   Warmup 1,000 steps → cosine decay to lr_min over 100,000 steps
     //   Peak lr 3e-4 is standard for models in this range with AdamW
     //
-    let seq_len          = env_usize("EISEN_SEQ_LEN", 128);
+    let seq_len = env_usize("EISEN_SEQ_LEN", 128);
     // Keep this conservative by default: attention transpose/bmm activations
     // can still OOM at 4 on smaller consumer GPUs even with streaming.
     let micro_batch_size = env_usize("EISEN_MICRO_BATCH", 2);
-    let accum_steps      = env_usize("EISEN_ACCUM_STEPS", 8);
-    let effective_batch  = micro_batch_size * accum_steps;
-    let tokens_per_step  = effective_batch * seq_len;
+    let accum_steps = env_usize("EISEN_ACCUM_STEPS", 8);
+    let effective_batch = micro_batch_size * accum_steps;
+    let tokens_per_step = effective_batch * seq_len;
     let tokens_per_micro = micro_batch_size * seq_len;
 
-    let total_steps  = 100_000_usize;
+    let total_steps = 100_000_usize;
     let warmup_steps = 1_000_usize;
-    let lr_max       = 3e-4_f32;
-    let lr_min       = 3e-5_f32;
-    let scheduler    = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
+    let lr_max = 3e-4_f32;
+    let lr_min = 3e-5_f32;
+    let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
-    let log_interval  = 50_usize;
+    let log_interval = 50_usize;
 
     // ── Model + streaming layout ──────────────────────────────────────────────
     println!("\nBuilding model…");
@@ -315,15 +224,17 @@ fn main() {
     // - norm_f:    tiny (1536 floats), used in final layer
     // - lm_head:   large but accessed every step; streaming it would add
     //              vocab×hidden×3 PCIe traffic every micro-batch
-    let pinned: Vec<usize> = model.token_emb.params()
+    let pinned: Vec<usize> = model
+        .token_emb
+        .params()
         .into_iter()
         .chain(model.norm_f.params())
         .chain(model.lm_head.params())
         .collect();
 
     println!("Planing memory streaming...");
-    let vram_budget_mb   = env_usize("EISEN_VRAM_BUDGET_MB", 5120);
-    let reserve_mb       = env_usize("EISEN_ACTIVATION_RESERVE_MB", 500);
+    let vram_budget_mb = env_usize("EISEN_VRAM_BUDGET_MB", 5120);
+    let reserve_mb = env_usize("EISEN_ACTIVATION_RESERVE_MB", 500);
     let report = g.plan_streaming(
         vram_budget_mb * 1024 * 1024,
         reserve_mb * 1024 * 1024,
@@ -336,38 +247,122 @@ fn main() {
     // plan_streaming already converted overflow params to Storage::Cpu,
     // so AdamW will correctly allocate CPU moments for those params.
     let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
+    optim.set_grad_clip_norm(grad_clip_norm);
 
+    let total_params: usize = model
+        .params()
+        .iter()
+        .map(|&id| g.tensors[id].shape.iter().product::<usize>())
+        .sum();
     println!("\nArchitecture summary:");
-    println!("  Layers:  {} | Hidden: {} | Heads: {} | FFN: {}", num_layers, hidden_dim, num_heads, ffn_dim);
-    println!("  Micro-batch: {} | Accum: {} | Effective batch: {}", micro_batch_size, accum_steps, effective_batch);
-    println!("  Tokens/step: {} | Total steps: {}", tokens_per_step, total_steps);
-    println!("  LR: {:.1e} → {:.1e} over {} steps ({} warmup)",
-        lr_max, lr_min, total_steps, warmup_steps);
+    println!("Trainable parameters: {}", total_params);
+    println!(
+        "  Layers:  {} | Hidden: {} | Heads: {} | FFN: {}",
+        num_layers, hidden_dim, num_heads, ffn_dim
+    );
+    println!(
+        "  Micro-batch: {} | Accum: {} | Effective batch: {}",
+        micro_batch_size, accum_steps, effective_batch
+    );
+    println!(
+        "  Tokens/step: {} | Total steps: {}",
+        tokens_per_step, total_steps
+    );
+    println!(
+        "  LR: {:.1e} → {:.1e} over {} steps ({} warmup)",
+        lr_max, lr_min, total_steps, warmup_steps
+    );
+    println!("  Grad clip norm: {:.3}", grad_clip_norm);
+    println!(
+        "  Reproducibility: deterministic={} | seed={}",
+        deterministic, seed
+    );
 
     #[cfg(feature = "bf16")]
     println!("  Precision: BF16 forward + FP32 accumulation (streaming-aware)");
     #[cfg(not(feature = "bf16"))]
     println!("  Precision: FP32");
+    if let Ok(mut s) = shared_stats.write() {
+        s.vocab_size = vocab_size;
+        s.hidden_dim = hidden_dim;
+        s.num_heads = num_heads;
+        s.ffn_dim = ffn_dim;
+        s.num_layers = num_layers;
+        s.total_params = total_params;
+        s.seq_len = seq_len;
+        s.micro_batch_size = micro_batch_size;
+        s.accum_steps = accum_steps;
+        s.effective_batch = effective_batch;
+    }
+
+    // ── Stability + reproducibility controls ────────────────────────────────
+    let grad_clip_max_norm = env_f32("EISEN_GRAD_CLIP_NORM", 1.0);
+    let run_seed = env_u64("EISEN_SEED", 1337);
+    let deterministic = env_bool("EISEN_DETERMINISTIC", true);
+    let manifest_path =
+        env::var("EISEN_RUN_MANIFEST").unwrap_or_else(|_| "data/run_manifest.json".to_string());
+    let started_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    if deterministic {
+        unsafe {
+            env::set_var("CUBLAS_WORKSPACE_CONFIG", ":4096:8");
+        }
+        println!(
+            "Determinism: enabled (seed={}, cublas workspace pinned)",
+            run_seed
+        );
+    } else {
+        println!("Determinism: disabled (seed={} logged only)", run_seed);
+    }
+
+    let run_manifest = format!(
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
+        started_unix,
+        run_seed,
+        deterministic,
+        grad_clip_max_norm,
+        hidden_dim,
+        num_heads,
+        ffn_dim,
+        num_layers,
+        seq_len,
+        micro_batch_size,
+        accum_steps,
+        effective_batch,
+        lr_max,
+        lr_min,
+        warmup_steps,
+        total_steps,
+    );
+    write_run_manifest(&manifest_path, &run_manifest);
 
     // ── Training loop ─────────────────────────────────────────────────────────
     println!("\nStarting training…");
-    let mut dataloader   = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
-    let mut step         = 0_usize;
+    let mut dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
+    let mut step = 0_usize;
     let mut running_loss = 0.0_f32;
-    let mut total_tokens = 0_usize;
     let mut cumulative_tokens = 0_usize;
 
-    let mut last_log     = Instant::now();
-    let mut board_timer  = Instant::now();
+    let mut last_log = Instant::now();
+    let mut board_timer = Instant::now();
+
+    let mut last_grad_norm = 0.0_f32;
+    let mut last_clip_coef = 1.0_f32;
+
 
     'training: loop {
-        if step >= total_steps { break; }
+        if step >= total_steps {
+            break;
+        }
 
         let current_lr = scheduler.get_lr(step);
         optim.lr = current_lr;
         optim.zero_grad(&mut g);
 
-        let mut step_loss   = 0.0_f32;
+        let mut step_loss = 0.0_f32;
         let mut micro_count = 0_usize;
 
         // ── Gradient accumulation inner loop ──────────────────────────────────
@@ -391,12 +386,12 @@ fn main() {
                 }
             };
             let (x_batch, y_batch) = batch;
-            let tokens_this_micro  = micro_batch_size * seq_len;
+            let tokens_this_micro = micro_batch_size * seq_len;
 
-            let x_id        = g.alloc(vec![micro_batch_size, seq_len], x_batch);
-            let logits_id   = model.forward(&mut g, x_id);
+            let x_id = g.alloc(vec![micro_batch_size, seq_len], x_batch);
+            let logits_id = model.forward(&mut g, x_id);
             let flat_logits = g.reshape(logits_id, vec![tokens_this_micro, vocab_size]);
-            let loss_id     = g.cross_entropy(flat_logits, &y_batch);
+            let loss_id = g.cross_entropy(flat_logits, &y_batch);
 
             step_loss += g.tensors[loss_id].sync_to_cpu()[0];
             micro_count += 1;
@@ -405,18 +400,26 @@ fn main() {
             g.clear_activations();
         }
 
+        if micro_count == 0 {
+            break;
+        }
+
+        let (grad_norm, grad_clip_coef) = optim.clip_grad_norm(&mut g, grad_clip_max_norm);
+        last_grad_norm = grad_norm;
+        last_clip_coef = grad_clip_coef;
+
         optim.step(&mut g);
         step += 1;
-        total_tokens += tokens_per_step;
+        cumulative_tokens += micro_count * tokens_per_micro;
 
         let avg_loss = step_loss / micro_count as f32;
         running_loss += avg_loss;
 
         // ── Logging ───────────────────────────────────────────────────────────
         if step % log_interval == 0 {
-            let elapsed     = last_log.elapsed().as_secs_f32();
-            let throughput  = (log_interval * tokens_per_step) as f32 / elapsed.max(1e-6);
-            let avg         = running_loss / log_interval as f32;
+            let elapsed = last_log.elapsed().as_secs_f32();
+            let throughput = (log_interval * tokens_per_step) as f32 / elapsed.max(1e-6);
+            let avg = running_loss / log_interval as f32;
 
             println!(
                 "Step {:06} | Loss {:.4} | LR {:.2e} | {:.0} tok/s",
@@ -424,7 +427,7 @@ fn main() {
             );
 
             running_loss = 0.0;
-            last_log     = Instant::now();
+            last_log = Instant::now();
         }
 
         // ── EisenBoard telemetry ──────────────────────────────────────────────
@@ -440,6 +443,12 @@ fn main() {
                 s.tps = tps;
                 s.batch_time_ms = batch_time_ms;
                 s.total_tokens = cumulative_tokens;
+                s.grad_norm = last_grad_norm;
+                s.grad_clip_coef = last_clip_coef;
+                s.accum_steps = accum_steps;
+                s.seq_len = seq_len;
+                s.micro_batch_size = micro_batch_size;
+                s.effective_batch = effective_batch;
 
                 if s.history.len() >= 200 {
                     s.history.remove(0);
@@ -447,11 +456,11 @@ fn main() {
                 s.history.push(StepRecord {
                     step,
                     loss: avg_loss,
+                    grad_norm: optim.last_grad_norm(),
                 });
             }
             board_timer = Instant::now();
         }
-
 
         // ── Checkpoint ────────────────────────────────────────────────────────
         if step % save_interval == 0 && step > 0 {
@@ -477,13 +486,13 @@ fn main() {
 
     g.no_grad = true;
     for _ in 0..80 {
-        let start   = tokens.len().saturating_sub(seq_len);
+        let start = tokens.len().saturating_sub(seq_len);
         let context = &tokens[start..];
-        let csl     = context.len();
+        let csl = context.len();
 
-        let x_id      = g.alloc(vec![1, csl], context.iter().map(|&t| t as f32).collect());
+        let x_id = g.alloc(vec![1, csl], context.iter().map(|&t| t as f32).collect());
         let logits_id = model.forward(&mut g, x_id);
-        let logits    = g.tensors[logits_id].sync_to_cpu();
+        let logits = g.tensors[logits_id].sync_to_cpu();
 
         let predicted = logits[(csl - 1) * vocab_size..]
             .iter()
@@ -496,6 +505,24 @@ fn main() {
         tokens.push(predicted);
         g.clear_activations();
     }
+
+    let finished_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let completed_manifest = format!(
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"finished_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"steps_completed\": {},\n  \"tokens_processed\": {},\n  \"last_grad_norm\": {:.6},\n  \"last_clip_coef\": {:.6}\n}}",
+        started_unix,
+        finished_unix,
+        run_seed,
+        deterministic,
+        step,
+        cumulative_tokens,
+        last_grad_norm,
+        last_clip_coef,
+    );
+    write_run_manifest(&manifest_path, &completed_manifest);
+
 
     println!("\n\nRun complete. Weights at {}", output_path);
 }

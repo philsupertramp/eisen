@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 cudarc = { version = "0.19.4", features = ["cuda-version-from-build-system", "driver"] }
 rand = "0.8.5"
+eisenboard = { path = "eisenboard" }
 
 [features]
 bf16 = []
