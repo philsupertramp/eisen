@@ -3,111 +3,11 @@ use eisen::nn::embedding::Embedding;
 use eisen::nn::linear::Linear;
 use eisen::nn::optim::AdamW;
 use eisen::nn::rmsnorm::RMSNorm;
-use eisen::nn::transformer::TransformerBlock;
+use eisen::nn::transformer::{TransformerBlock, TransformerLM};
 use eisen::nn::Module;
 use eisen::tensor::Device;
 use eisen::tools::huggingface::{write_llama_config, write_safetensors, LlamaConfig};
 use std::fs;
-
-/// Tiny CPU-only LM for a quick Phase 7 smoke test.
-struct TinyTransformerLM {
-    token_emb: Embedding,
-    blocks: Vec<TransformerBlock>,
-    norm_f: RMSNorm,
-    lm_head: Linear,
-}
-
-impl TinyTransformerLM {
-    fn new(
-        g: &mut Graph,
-        vocab_size: usize,
-        hidden_dim: usize,
-        num_heads: usize,
-        ffn_dim: usize,
-        num_layers: usize,
-    ) -> Self {
-        let token_emb = Embedding::new(g, vocab_size, hidden_dim);
-        let mut blocks = Vec::new();
-        for _ in 0..num_layers {
-            blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim));
-        }
-        let norm_f = RMSNorm::new(g, hidden_dim, 1e-5);
-        let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
-        Self {
-            token_emb,
-            blocks,
-            norm_f,
-            lm_head,
-        }
-    }
-
-    fn named_params(&self) -> Vec<(String, usize)> {
-        let mut out = Vec::new();
-        out.push((
-            "model.embed_tokens.weight".to_string(),
-            self.token_emb.weight_id,
-        ));
-        for (i, b) in self.blocks.iter().enumerate() {
-            out.push((
-                format!("model.layers.{i}.input_layernorm.weight"),
-                b.norm1.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.self_attn.q_proj.weight"),
-                b.attn.q_proj.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.self_attn.k_proj.weight"),
-                b.attn.k_proj.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.self_attn.v_proj.weight"),
-                b.attn.v_proj.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.self_attn.o_proj.weight"),
-                b.attn.out_proj.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.post_attention_layernorm.weight"),
-                b.norm2.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.mlp.up_proj.weight"),
-                b.ffn1.weight_id,
-            ));
-            out.push((
-                format!("model.layers.{i}.mlp.down_proj.weight"),
-                b.ffn2.weight_id,
-            ));
-        }
-        out.push(("model.norm.weight".to_string(), self.norm_f.weight_id));
-        out.push(("lm_head.weight".to_string(), self.lm_head.weight_id));
-        out
-    }
-}
-
-impl Module for TinyTransformerLM {
-    fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
-        let mut h_id = self.token_emb.forward(g, x_id);
-        for block in &self.blocks {
-            h_id = block.forward_with_mask(g, h_id, true);
-        }
-        h_id = self.norm_f.forward(g, h_id);
-        self.lm_head.forward(g, h_id)
-    }
-
-    fn params(&self) -> Vec<usize> {
-        let mut p = Vec::new();
-        p.extend(self.token_emb.params());
-        for block in &self.blocks {
-            p.extend(block.params());
-        }
-        p.extend(self.norm_f.params());
-        p.extend(self.lm_head.params());
-        p
-    }
-}
 
 fn main() {
     println!("=== Phase 7 Tiny HF Smoke Run (CPU) ===");
@@ -123,9 +23,10 @@ fn main() {
     let num_layers = 1usize;
     let batch_size = 4usize;
 
-    let model = TinyTransformerLM::new(
+    let model = TransformerLM::new(
         &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers,
     );
+    g.mark_params();
     let mut optim = AdamW::new(model.params(), 1e-3);
 
     // Deterministic synthetic token stream: 0..31 repeating.
