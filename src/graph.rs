@@ -1701,22 +1701,49 @@ impl Graph {
                 let out_id = self.alloc(vec![batch, m, n], out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
-                    let a_grad = tensors[a_id].grad.as_cpu_mut();
-                    let b_grad = tensors[b_id].grad.as_cpu_mut();
 
-                    for bb in 0..batch {
-                        for i in 0..m {
-                            for j in 0..n {
-                                let go = out_grad[(bb * m + i) * n + j];
-                                for kk in 0..k {
-                                    let a_idx = ((bb * m + i) * k) + kk;
-                                    let b_idx = if trans_b {
-                                        ((bb * n + j) * k) + kk
-                                    } else {
-                                        ((bb * k + kk) * n) + j
-                                    };
-                                    a_grad[a_idx] += go * b_data[b_idx];
-                                    b_grad[b_idx] += go * a_data[a_idx];
+                    if a_id == b_id {
+                        let grad = tensors[a_id].grad.as_cpu_mut();
+                        for bb in 0..batch {
+                            for i in 0..m {
+                                for j in 0..n {
+                                    let go = out_grad[(bb * m + i) * n + j];
+                                    for kk in 0..k {
+                                        let a_idx = ((bb * m + i) * k) + kk;
+                                        let b_idx = if trans_b {
+                                            ((bb * n + j) * k) + kk
+                                        } else {
+                                            ((bb * k + kk) * n) + j
+                                        };
+                                        grad[a_idx] += go * b_data[b_idx];
+                                        grad[b_idx] += go * a_data[a_idx];
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let (a_grad, b_grad) = if a_id < b_id {
+                            let (left, right) = tensors.split_at_mut(b_id);
+                            (left[a_id].grad.as_cpu_mut(), right[0].grad.as_cpu_mut())
+                        } else {
+                            let (left, right) = tensors.split_at_mut(a_id);
+                            (right[0].grad.as_cpu_mut(), left[b_id].grad.as_cpu_mut())
+                        };
+
+                        for bb in 0..batch {
+                            for i in 0..m {
+                                for j in 0..n {
+                                    let go = out_grad[(bb * m + i) * n + j];
+                                    for kk in 0..k {
+                                        let a_idx = ((bb * m + i) * k) + kk;
+                                        let b_idx = if trans_b {
+                                            ((bb * n + j) * k) + kk
+                                        } else {
+                                            ((bb * k + kk) * n) + j
+                                        };
+                                        a_grad[a_idx] += go * b_data[b_idx];
+                                        b_grad[b_idx] += go * a_data[a_idx];
+                                    }
                                 }
                             }
                         }
