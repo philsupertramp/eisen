@@ -127,6 +127,7 @@ impl Graph {
                 "cast_bf16_to_f32_accumulate",
                 "matmul_bf16_f32",
                 "matmul_f32_bf16accum_f32",
+                "bmm_f32_bf16accum_f32",
             ]);
 
             for name in names {
@@ -1539,6 +1540,9 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
+                #[cfg(feature = "bf16")]
+                let f_fwd = self.functions.get("bmm_f32_bf16accum_f32").unwrap().clone();
+                #[cfg(not(feature = "bf16"))]
                 let f_fwd = self.functions.get("bmm_f32").unwrap().clone();
                 let f_bwd_a = self
                     .functions

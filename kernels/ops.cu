@@ -34,18 +34,35 @@ extern "C" __global__ void matmul_bf16_f32(
     const __nv_bfloat16* a, const __nv_bfloat16* b, float* out,
     const size_t m, const size_t k, const size_t n
 ) {
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    if (row < m && col < n) {
-        float sum = 0.0f;
-        for (size_t i = 0; i < k; ++i) {
-            // nvcc with -arch=sm_89 automatically optimizes __nv_bfloat16 arithmetic 
-            // to utilize hardware where appropriate.
-            float va = __bfloat162float(a[row * k + i]);
-            float vb = __bfloat162float(b[i * n + col]);
-            sum += va * vb;
+    __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int b_row = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+            ? a[row * k + a_col]
+            : __float2bfloat16(0.0f);
+        tile_B[threadIdx.y][threadIdx.x] = (b_row < (int)k && col < (int)n)
+            ? b[b_row * n + col]
+            : __float2bfloat16(0.0f);
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            sum += __bfloat162float(tile_A[threadIdx.y][i]) * __bfloat162float(tile_B[i][threadIdx.x]);
         }
+
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)n) {
         out[row * n + col] = sum;
     }
 }
@@ -59,16 +76,35 @@ extern "C" __global__ void matmul_f32_bf16accum_f32(
     const float* a, const float* b, float* out,
     const size_t m, const size_t k, const size_t n
 ) {
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
+    __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
 
-    if (row < m && col < n) {
-        float sum = 0.0f;
-        for (size_t i = 0; i < k; ++i) {
-            __nv_bfloat16 a_bf16 = __float2bfloat16(a[row * k + i]);
-            __nv_bfloat16 b_bf16 = __float2bfloat16(b[i * n + col]);
-            sum += __bfloat162float(a_bf16) * __bfloat162float(b_bf16);
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int b_row = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+            ? __float2bfloat16(a[row * k + a_col])
+            : __float2bfloat16(0.0f);
+        tile_B[threadIdx.y][threadIdx.x] = (b_row < (int)k && col < (int)n)
+            ? __float2bfloat16(b[b_row * n + col])
+            : __float2bfloat16(0.0f);
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            sum += __bfloat162float(tile_A[threadIdx.y][i]) * __bfloat162float(tile_B[i][threadIdx.x]);
         }
+
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)n) {
         out[row * n + col] = sum;
     }
 }
@@ -514,18 +550,87 @@ extern "C" __global__ void bmm_f32(
     const size_t batch, const size_t m, const size_t k, const size_t n,
     const bool trans_b
 ) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t b_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    if (b_idx < batch && row < m && col < n) {
-        float sum = 0.0f;
-        const float* a_batch = a + b_idx * (m * k);
-        const float* b_batch = b + b_idx * (trans_b ? (n * k) : (k * n));
-        for (size_t i = 0; i < k; ++i) {
-            float val_a = a_batch[row * k + i];
-            float val_b = trans_b ? b_batch[col * k + i] : b_batch[i * n + col];
-            sum += val_a * val_b;
+    __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ float tile_B[TILE_SIZE][TILE_SIZE];
+
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int b_idx = blockIdx.z;
+    if (b_idx >= (int)batch) return;
+
+    const float* a_batch = a + b_idx * (m * k);
+    const float* b_batch = b + b_idx * (trans_b ? (n * k) : (k * n));
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int k_idx = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+            ? a_batch[row * k + a_col]
+            : 0.0f;
+
+        tile_B[threadIdx.y][threadIdx.x] = (col < (int)n && k_idx < (int)k)
+            ? (trans_b ? b_batch[col * k + k_idx] : b_batch[k_idx * n + col])
+            : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            sum += tile_A[threadIdx.y][i] * tile_B[i][threadIdx.x];
         }
+
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)n) {
+        out[b_idx * (m * n) + row * n + col] = sum;
+    }
+}
+
+extern "C" __global__ void bmm_f32_bf16accum_f32(
+    const float* a, const float* b, float* out,
+    const size_t batch, const size_t m, const size_t k, const size_t n,
+    const bool trans_b
+) {
+    __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
+
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int b_idx = blockIdx.z;
+    if (b_idx >= (int)batch) return;
+
+    const float* a_batch = a + b_idx * (m * k);
+    const float* b_batch = b + b_idx * (trans_b ? (n * k) : (k * n));
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int k_idx = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+            ? __float2bfloat16(a_batch[row * k + a_col])
+            : __float2bfloat16(0.0f);
+
+        float b_val = 0.0f;
+        if (col < (int)n && k_idx < (int)k) {
+            b_val = trans_b ? b_batch[col * k + k_idx] : b_batch[k_idx * n + col];
+        }
+        tile_B[threadIdx.y][threadIdx.x] = __float2bfloat16(b_val);
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            sum += __bfloat162float(tile_A[threadIdx.y][i]) * __bfloat162float(tile_B[i][threadIdx.x]);
+        }
+
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)n) {
         out[b_idx * (m * n) + row * n + col] = sum;
     }
 }
