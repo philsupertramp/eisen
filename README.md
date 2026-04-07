@@ -62,8 +62,8 @@
 * \[x\] **MatMul Tiling:** Utilize CUDA shared memory (SRAM) for matrix multiplication to bypass global memory bandwidth limits.  
 * \[x\] **Gradient Accumulation:** Simulate massive batch sizes (e.g., effective batch 64\) without increasing VRAM footprint to stabilize optimization noise.  
 * \[x\] **Native BF16 Mixed Precision:** Leverage 4th-gen Tensor Cores (RTX 4070\) for 2x memory reduction and massive TFLOPS acceleration without the need for loss scaling.  
-* \[ \] **Flash Attention:** Implement a custom Triton-style fused kernel for Attention to bypass the $O(N^2)$ memory bottleneck.  
-* \[ \] **Milestone 6:** A hyper-optimized, stable engine training a 14M+ parameter model at peak GPU saturation, ready for full convergence.
+* \[x\] **Flash Attention:** Implement a custom Triton-style fused kernel for Attention to bypass the $O(N^2)$ memory bottleneck.  
+* \[x\] **Milestone 6:** A hyper-optimized, stable engine training a 14M+ parameter model at peak GPU saturation, ready for full convergence.
 
 ## **Phase 7: The Hugging Face Bridge 🚧**
 
@@ -73,7 +73,17 @@
 * \[ \] **Config Generator:** Script to output config.json compatible with Llama-style architectures.  
 * \[ \] **Milestone 7:** Load the custom Rust model natively in Python transformers for inference.
 
-## **Phase 8: Advanced Inference & Fine-Tuning 🔮**
+## **Phase 8: Stability measures**
+
+*Focus: Training stability*
+
+* \[ \] **Improved EisenBoard:** Make the Eisenboard a dedicated crate. Add more metrics and information to EisenBoard.
+* \[ \] **Gradient Clipping:** To protect against occasional exploding gradients
+* \[ \] **Determinism/Reproducibility:** Add reproducibility controls and run manifest logging (rng seed, determinism, run manifests)
+* \[ \] **Fuse OPs:** Fuse attention scale and masking operations to remove per-step large tensor allocations
+* \[ \] **Improved Checkpointing:** Expand checkpoints to include optimizer, and training progress state
+
+## **Phase 9: Advanced Inference & Fine-Tuning 🔮**
 
 *Focus: Post-training capabilities.*
 
