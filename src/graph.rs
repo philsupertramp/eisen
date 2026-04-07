@@ -1675,7 +1675,90 @@ impl Graph {
                 }
                 out_id
             }
-            Device::Cpu => panic!("BMM not fully implemented for CPU in this phase"),
+            Device::Cpu => {
+                let a_data = self.tensors[a_id].data.as_cpu().clone();
+                let b_data = self.tensors[b_id].data.as_cpu().clone();
+                let mut out_data = vec![0.0; batch * m * n];
+
+                for bb in 0..batch {
+                    for i in 0..m {
+                        for j in 0..n {
+                            let mut acc = 0.0;
+                            for kk in 0..k {
+                                let a_idx = ((bb * m + i) * k) + kk;
+                                let b_idx = if trans_b {
+                                    ((bb * n + j) * k) + kk
+                                } else {
+                                    ((bb * k + kk) * n) + j
+                                };
+                                acc += a_data[a_idx] * b_data[b_idx];
+                            }
+                            out_data[(bb * m + i) * n + j] = acc;
+                        }
+                    }
+                }
+
+                let out_id = self.alloc(vec![batch, m, n], out_data);
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = tensors[out_id].grad.as_cpu().clone();
+
+                    if a_id == b_id {
+                        let grad = tensors[a_id].grad.as_cpu_mut();
+                        for bb in 0..batch {
+                            for i in 0..m {
+                                for j in 0..n {
+                                    let go = out_grad[(bb * m + i) * n + j];
+                                    for kk in 0..k {
+                                        let a_idx = ((bb * m + i) * k) + kk;
+                                        let b_idx = if trans_b {
+                                            ((bb * n + j) * k) + kk
+                                        } else {
+                                            ((bb * k + kk) * n) + j
+                                        };
+                                        grad[a_idx] += go * b_data[b_idx];
+                                        grad[b_idx] += go * a_data[a_idx];
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        let (a_grad, b_grad) = if a_id < b_id {
+                            let (left, right) = tensors.split_at_mut(b_id);
+                            (left[a_id].grad.as_cpu_mut(), right[0].grad.as_cpu_mut())
+                        } else {
+                            let (left, right) = tensors.split_at_mut(a_id);
+                            (right[0].grad.as_cpu_mut(), left[b_id].grad.as_cpu_mut())
+                        };
+
+                        for bb in 0..batch {
+                            for i in 0..m {
+                                for j in 0..n {
+                                    let go = out_grad[(bb * m + i) * n + j];
+                                    for kk in 0..k {
+                                        let a_idx = ((bb * m + i) * k) + kk;
+                                        let b_idx = if trans_b {
+                                            ((bb * n + j) * k) + kk
+                                        } else {
+                                            ((bb * k + kk) * n) + j
+                                        };
+                                        a_grad[a_idx] += go * b_data[b_idx];
+                                        b_grad[b_idx] += go * a_data[a_idx];
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if !self.no_grad {
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![a_id, b_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
         }
     }
 
@@ -1735,7 +1818,55 @@ impl Graph {
                 }
                 out_id
             }
-            Device::Cpu => panic!("Softmax not fully implemented for CPU in this phase"),
+            Device::Cpu => {
+                let a_data = self.tensors[a_id].data.as_cpu().clone();
+                let a_shape = self.tensors[a_id].shape.clone();
+                let n = *a_shape.last().unwrap();
+                let b = a_data.len() / n;
+                let mut out_data = vec![0.0; a_data.len()];
+
+                for row in 0..b {
+                    let off = row * n;
+                    let row_slice = &a_data[off..off + n];
+                    let max_v = row_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum_exp = 0.0;
+                    for j in 0..n {
+                        let e = (row_slice[j] - max_v).exp();
+                        out_data[off + j] = e;
+                        sum_exp += e;
+                    }
+                    for j in 0..n {
+                        out_data[off + j] /= sum_exp;
+                    }
+                }
+
+                let out_fwd = out_data.clone();
+                let out_id = self.alloc(a_shape, out_data);
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = tensors[out_id].grad.as_cpu().clone();
+                    let a_grad = tensors[a_id].grad.as_cpu_mut();
+
+                    for row in 0..b {
+                        let off = row * n;
+                        let mut dot = 0.0;
+                        for j in 0..n {
+                            dot += out_grad[off + j] * out_fwd[off + j];
+                        }
+                        for j in 0..n {
+                            a_grad[off + j] += out_fwd[off + j] * (out_grad[off + j] - dot);
+                        }
+                    }
+                });
+
+                if !self.no_grad {
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![a_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
         }
     }
 
@@ -1817,7 +1948,54 @@ impl Graph {
                 unsafe { builder.launch(LaunchConfig::for_num_elems(total_rows)) }.unwrap();
                 out_id
             }
-            Device::Cpu => panic!("flash_attention CPU fallback not supported"),
+            Device::Cpu => {
+                let q_data = self.tensors[q_id].data.as_cpu();
+                let k_data = self.tensors[k_id].data.as_cpu();
+                let v_data = self.tensors[v_id].data.as_cpu();
+                let mut out = vec![0.0; batch * m * d];
+                let mut scores = vec![0.0; n];
+                let mut probs = vec![0.0; n];
+
+                for bb in 0..batch {
+                    for i in 0..m {
+                        for j in 0..n {
+                            if causal && j > i {
+                                scores[j] = f32::NEG_INFINITY;
+                                continue;
+                            }
+                            let mut dot = 0.0;
+                            for dd in 0..d {
+                                let q_idx = ((bb * m + i) * d) + dd;
+                                let k_idx = ((bb * n + j) * d) + dd;
+                                dot += q_data[q_idx] * k_data[k_idx];
+                            }
+                            scores[j] = dot * scale;
+                        }
+
+                        let max_score = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut denom = 0.0;
+                        for j in 0..n {
+                            let e = (scores[j] - max_score).exp();
+                            probs[j] = e;
+                            denom += e;
+                        }
+                        for j in 0..n {
+                            probs[j] /= denom;
+                        }
+
+                        for dd in 0..d {
+                            let mut acc = 0.0;
+                            for j in 0..n {
+                                let v_idx = ((bb * n + j) * d) + dd;
+                                acc += probs[j] * v_data[v_idx];
+                            }
+                            out[((bb * m + i) * d) + dd] = acc;
+                        }
+                    }
+                }
+
+                self.alloc(vec![batch, m, d], out)
+            }
         }
     }
 
@@ -1890,7 +2068,76 @@ impl Graph {
                 }
                 out_id
             }
-            Device::Cpu => panic!("RoPE not fully implemented for CPU"),
+            Device::Cpu => {
+                let a_data = self.tensors[a_id].data.as_cpu().clone();
+                let batch = shape[0];
+                let mut out_data = a_data.clone();
+
+                for bb in 0..batch {
+                    for pos in 0..seq_len {
+                        for base in (0..hidden_dim).step_by(head_dim) {
+                            let pair_limit = head_dim / 2;
+                            for pair in 0..pair_limit {
+                                let even = base + 2 * pair;
+                                let odd = even + 1;
+                                if odd >= base + head_dim || odd >= hidden_dim {
+                                    continue;
+                                }
+                                let idx0 = ((bb * seq_len + pos) * hidden_dim) + even;
+                                let idx1 = ((bb * seq_len + pos) * hidden_dim) + odd;
+
+                                let theta = (pos as f32)
+                                    / 10000_f32.powf((2.0 * pair as f32) / (head_dim as f32));
+                                let (sin_t, cos_t) = theta.sin_cos();
+                                let x0 = a_data[idx0];
+                                let x1 = a_data[idx1];
+                                out_data[idx0] = x0 * cos_t - x1 * sin_t;
+                                out_data[idx1] = x0 * sin_t + x1 * cos_t;
+                            }
+                        }
+                    }
+                }
+
+                let out_id = self.alloc(shape, out_data);
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = tensors[out_id].grad.as_cpu().clone();
+                    let a_grad = tensors[a_id].grad.as_cpu_mut();
+
+                    for bb in 0..batch {
+                        for pos in 0..seq_len {
+                            for base in (0..hidden_dim).step_by(head_dim) {
+                                let pair_limit = head_dim / 2;
+                                for pair in 0..pair_limit {
+                                    let even = base + 2 * pair;
+                                    let odd = even + 1;
+                                    if odd >= base + head_dim || odd >= hidden_dim {
+                                        continue;
+                                    }
+                                    let idx0 = ((bb * seq_len + pos) * hidden_dim) + even;
+                                    let idx1 = ((bb * seq_len + pos) * hidden_dim) + odd;
+
+                                    let theta = (pos as f32)
+                                        / 10000_f32.powf((2.0 * pair as f32) / (head_dim as f32));
+                                    let (sin_t, cos_t) = theta.sin_cos();
+                                    let g0 = out_grad[idx0];
+                                    let g1 = out_grad[idx1];
+                                    a_grad[idx0] += g0 * cos_t + g1 * sin_t;
+                                    a_grad[idx1] += -g0 * sin_t + g1 * cos_t;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if !self.no_grad {
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![a_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
         }
     }
 
@@ -1968,7 +2215,48 @@ impl Graph {
                 }
                 out_id
             }
-            Device::Cpu => panic!("transpose_0213 CPU fallback not supported"),
+            Device::Cpu => {
+                let a_data = self.tensors[a_id].data.as_cpu().clone();
+                let mut out_data = vec![0.0; size];
+
+                for bb in 0..b {
+                    for ss in 0..s {
+                        for hh in 0..h {
+                            for dd in 0..d {
+                                let in_idx = (((bb * s + ss) * h + hh) * d) + dd;
+                                let out_idx = (((bb * h + hh) * s + ss) * d) + dd;
+                                out_data[out_idx] = a_data[in_idx];
+                            }
+                        }
+                    }
+                }
+
+                let out_id = self.alloc(out_shape, out_data);
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let out_grad = tensors[out_id].grad.as_cpu().clone();
+                    let a_grad = tensors[a_id].grad.as_cpu_mut();
+                    for bb in 0..b {
+                        for ss in 0..s {
+                            for hh in 0..h {
+                                for dd in 0..d {
+                                    let in_idx = (((bb * s + ss) * h + hh) * d) + dd;
+                                    let out_idx = (((bb * h + hh) * s + ss) * d) + dd;
+                                    a_grad[in_idx] += out_grad[out_idx];
+                                }
+                            }
+                        }
+                    }
+                });
+
+                if !self.no_grad {
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![a_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
         }
     }
 
