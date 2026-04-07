@@ -85,6 +85,7 @@ impl Graph {
             let mut names = vec![
                 "add_f32",
                 "fill_f32",
+                "scale_f32",
                 "accumulate_f32",
                 "mul_f32",
                 "mul_backward_f32",

@@ -160,6 +160,14 @@ extern "C" __global__ void fill_f32(
     if (i < n) { data[i] = value; }
 }
 
+extern "C" __global__ void scale_f32(
+    float* data,
+    const float scale,
+    const size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) { data[i] *= scale; }
+}
 extern "C" __global__ void mul_f32(
     const float* a, const float* b, float* out, const size_t n
 ) {

@@ -22,8 +22,13 @@ name = "eisen"
 version = "0.1.0"
 dependencies = [
  "cudarc",
+ "eisenboard",
  "rand",
 ]
+
+[[package]]
+name = "eisenboard"
+version = "0.1.0"
 
 [[package]]
 name = "getrandom"
