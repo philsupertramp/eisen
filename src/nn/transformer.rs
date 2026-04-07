@@ -3,6 +3,7 @@ use crate::nn::Module;
 use crate::nn::attention::MultiHeadAttention;
 use crate::nn::linear::Linear;
 use crate::nn::rmsnorm::RMSNorm;
+use crate::nn::embedding::Embedding;
 
 /// A standard Pre-Norm Transformer Block.
 pub struct TransformerBlock {
@@ -59,3 +60,112 @@ impl Module for TransformerBlock {
         p
     }
 }
+
+pub struct TransformerLM {
+    pub token_emb: Embedding,
+    pub blocks:    Vec<TransformerBlock>,
+    pub norm_f:    RMSNorm,
+    pub lm_head:   Linear,
+}
+
+impl TransformerLM {
+    pub fn new(
+        g:          &mut Graph,
+        vocab_size: usize,
+        hidden_dim: usize,
+        num_heads:  usize,
+        ffn_dim:    usize,
+        num_layers: usize,
+    ) -> Self {
+        let token_emb = Embedding::new(g, vocab_size, hidden_dim);
+
+        // Build blocks one-by-one and immediately demote their parameters to
+        // CPU so model init does not require full-model VRAM residency.
+        let mut blocks = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
+            for pid in block.params() {
+                // Keep tiny 1D norm scales resident; stream only matrix weights.
+                // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
+                if g.tensors[pid].shape.len() == 2 {
+                    g.demote_tensor_to_cpu(pid);
+                }
+            }
+            blocks.push(block);
+        }
+
+        let norm_f  = RMSNorm::new(g, hidden_dim, 1e-5);
+        let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
+        Self { token_emb, blocks, norm_f, lm_head }
+    }
+
+    pub fn named_params(&self) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        out.push((
+            "model.embed_tokens.weight".to_string(),
+            self.token_emb.weight_id,
+        ));
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.push((
+                format!("model.layers.{i}.input_layernorm.weight"),
+                b.norm1.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.q_proj.weight"),
+                b.attn.q_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.k_proj.weight"),
+                b.attn.k_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.v_proj.weight"),
+                b.attn.v_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.o_proj.weight"),
+                b.attn.out_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.post_attention_layernorm.weight"),
+                b.norm2.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.mlp.gate_proj.weight"),
+                b.ffn1.weight_id,
+            ));
+
+            out.push((
+                format!("model.layers.{i}.mlp.up_proj.weight"),
+                b.ffn1.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.mlp.down_proj.weight"),
+                b.ffn2.weight_id,
+            ));
+        }
+        out.push(("model.norm.weight".to_string(), self.norm_f.weight_id));
+        out.push(("lm_head.weight".to_string(), self.lm_head.weight_id));
+        out
+    }
+
+}
+
+impl Module for TransformerLM {
+    fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
+        let mut h = self.token_emb.forward(g, x_id);
+        for block in &self.blocks {
+            h = block.forward_with_mask(g, h, true);
+        }
+        h = self.norm_f.forward(g, h);
+        self.lm_head.forward(g, h)
+    }
+    fn params(&self) -> Vec<usize> {
+        let mut p = self.token_emb.params();
+        for b in &self.blocks { p.extend(b.params()); }
+        p.extend(self.norm_f.params());
+        p.extend(self.lm_head.params());
+        p
+    }
+}
+

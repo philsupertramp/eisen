@@ -1,6 +1,6 @@
-// examples/train_1b.rs
+// examples/train_llm.rs
 //
-// Eisen Engine — 1.07B Parameter Pre-Training Run
+// Eisen Engine - default settings 1.07B Parameter Pre-Training Run
 //
 // Architecture:
 //   hidden=1536 | heads=12 | head_dim=128 | ffn=4096 | layers=48 | vocab=4096
@@ -14,21 +14,20 @@
 //   - CPU RAM holds streamed weights (+ grad + Adam moments)
 //
 // Run:
-//   cargo run --release --example train_1b [--features bf16]
+//   cargo run --release --example train_llm [--features bf16]
 
 use eisen::graph::Graph;
-use eisen::nn::embedding::Embedding;
-use eisen::nn::linear::Linear;
 use eisen::nn::optim::AdamW;
-use eisen::nn::rmsnorm::RMSNorm;
 use eisen::nn::scheduler::CosineScheduler;
-use eisen::nn::transformer::TransformerBlock;
+use eisen::nn::transformer::TransformerLM;
 use eisen::nn::Module;
 use eisen::data::tokenizer::BPETokenizer;
 use eisen::data::dataloader::BinaryDataLoader;
 use eisen::tensor::Device;
+use eisen::tools::huggingface::{write_llama_config, write_safetensors, LlamaConfig};
 use cudarc::driver::CudaContext;
 
+use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write, Read};
 use std::sync::{Arc, RwLock};
@@ -53,158 +52,136 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 // ─── EisenBoard (carried over from train_large_lm.rs unchanged) ───────────────
+#[derive(Clone)]
+struct StepRecord {
+    step: usize,
+    loss: f32,
+}
 
 #[derive(Clone, Default)]
 struct TrainStats {
-    step:           usize,
-    loss:           f32,
-    lr:             f32,
-    tps:            f32,
-    batch_time_ms:  f32,
-    total_tokens:   usize,
-    history:        Vec<(usize, f32)>,
+    step: usize,
+    loss: f32,
+    lr: f32,
+    tps: f32,
+    batch_time_ms: f32,
+    total_tokens: usize,
+    history: Vec<StepRecord>, // Server-side history prevents data loss on refresh!
 }
 
-const DASHBOARD_HTML: &str = r#"<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8"><title>EisenBoard | 1B</title>
-<style>
-body{background:#0d1117;color:#c9d1d9;font-family:monospace;padding:2rem;margin:0}
-h1{color:#58a6ff;border-bottom:1px solid #30363d;padding-bottom:10px}
-.grid{display:flex;gap:15px;margin-bottom:20px;flex-wrap:wrap;max-width:1100px}
-.box{background:#161b22;border:1px solid #30363d;padding:15px;border-radius:6px;flex:1 1 150px}
-.lbl{font-size:12px;color:#8b949e;text-transform:uppercase;letter-spacing:1px}
-.val{font-size:24px;color:#7ee787;font-weight:bold;margin-top:5px}
-.val.lr{color:#f78166}
-canvas{background:#161b22;border:1px solid #30363d;border-radius:6px;width:100%;max-width:1100px;height:400px}
-</style></head><body>
-<h1>EisenBoard 🚀  <small style="font-size:14px;color:#8b949e">1.07B — Eisen Engine</small></h1>
-<div class="grid">
-  <div class="box"><div class="lbl">STEP</div><div id="s" class="val">0</div></div>
-  <div class="box"><div class="lbl">LOSS</div><div id="l" class="val">0.0000</div></div>
-  <div class="box"><div class="lbl">LR</div><div id="r" class="val lr">0</div></div>
-  <div class="box"><div class="lbl">TOK/SEC</div><div id="t" class="val">0</div></div>
-  <div class="box"><div class="lbl">BATCH ms</div><div id="b" class="val">0</div></div>
-  <div class="box"><div class="lbl">TOTAL TOKENS</div><div id="k" class="val">0</div></div>
-</div>
-<canvas id="c" width="1100" height="400"></canvas>
-<script>
-const ctx=document.getElementById('c').getContext('2d');
-function draw(h){
-  ctx.clearRect(0,0,1100,400);if(!h||h.length<2)return;
-  ctx.strokeStyle='#30363d';ctx.lineWidth=1;
-  for(let i=0;i<=10;i++){ctx.beginPath();ctx.moveTo(0,i*40);ctx.lineTo(1100,i*40);ctx.stroke();}
-  let mn=Math.min(...h.map(d=>d[1]))*0.98,mx=Math.max(...h.map(d=>d[1]))*1.02,rng=mx-mn||1;
-  ctx.strokeStyle='#ff7b72';ctx.lineWidth=2;ctx.beginPath();
-  h.forEach((p,i)=>{let x=i/(h.length-1)*1100,y=400-((p[1]-mn)/rng*400);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
-  ctx.stroke();
-}
-setInterval(async()=>{
-  try{const d=await(await fetch('/api/stats')).json();
-  document.getElementById('s').innerText=d.step.toLocaleString();
-  document.getElementById('l').innerText=d.loss.toFixed(4);
-  document.getElementById('r').innerText=d.lr.toExponential(2);
-  document.getElementById('t').innerText=Math.round(d.tps).toLocaleString();
-  document.getElementById('b').innerText=Math.round(d.batch_ms)+' ms';
-  let tk=d.total_tokens;
-  document.getElementById('k').innerText=tk>1e9?(tk/1e9).toFixed(2)+'B':tk>1e6?(tk/1e6).toFixed(2)+'M':tk.toLocaleString();
-  draw(d.history);}catch(e){}
-},1000);
-</script></body></html>"#;
+const DASHBOARD_HTML: &str = r#"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>EisenBoard | Live Training</title>
+    <style>
+        body { background-color: #0d1117; color: #c9d1d9; font-family: monospace; padding: 2rem; margin: 0; }
+        h1 { color: #58a6ff; border-bottom: 1px solid #30363d; padding-bottom: 10px; }
+        .stats-grid { display: flex; gap: 15px; margin-bottom: 20px; flex-wrap: wrap; max-width: 1000px; }
+        .stat-box { background: #161b22; border: 1px solid #30363d; padding: 15px; border-radius: 6px; flex: 1 1 150px; }
+        .stat-label { font-size: 12px; color: #8b949e; text-transform: uppercase; letter-spacing: 1px; }
+        .stat-value { font-size: 24px; color: #7ee787; font-weight: bold; margin-top: 5px; }
+        .stat-value.lr { color: #f78166; }
+        canvas { background: #161b22; border: 1px solid #30363d; border-radius: 6px; width: 100%; max-width: 1000px; height: 400px; }
+    </style>
+</head>
+<body>
+    <h1>EisenBoard 🚀</h1>
+    <div class="stats-grid">
+        <div class="stat-box"><div class="stat-label">STEP</div><div id="step" class="stat-value">0</div></div>
+        <div class="stat-box"><div class="stat-label">LOSS</div><div id="loss" class="stat-value">0.0000</div></div>
+        <div class="stat-box"><div class="stat-label">LR</div><div id="lr" class="stat-value lr">0.0000</div></div>
+        <div class="stat-box"><div class="stat-label">TOKENS / SEC</div><div id="tps" class="stat-value">0</div></div>
+        <div class="stat-box"><div class="stat-label">BATCH TIME</div><div id="batch_time" class="stat-value">0 ms</div></div>
+        <div class="stat-box"><div class="stat-label">TOTAL TOKENS</div><div id="total_tokens" class="stat-value">0</div></div>
+    </div>
+    <canvas id="lossChart" width="1000" height="400"></canvas>
+    <script>
+        const ctx = document.getElementById('lossChart').getContext('2d');
+        
+        function drawChart(history) {
+            ctx.clearRect(0, 0, 1000, 400);
+            if (!history || history.length < 2) return;
+            ctx.strokeStyle = '#30363d'; ctx.lineWidth = 1;
+            for(let i=0; i<=10; i++) { ctx.beginPath(); ctx.moveTo(0, i*40); ctx.lineTo(1000, i*40); ctx.stroke(); }
+            let minLoss = Math.min(...history.map(d => d.loss)) * 0.98;
+            let maxLoss = Math.max(...history.map(d => d.loss)) * 1.02;
+            let range = maxLoss - minLoss || 1;
+            ctx.strokeStyle = '#ff7b72'; ctx.lineWidth = 2; ctx.beginPath();
+            history.forEach((point, i) => {
+                let x = (i / Math.max(history.length - 1, 1)) * 1000;
+                let y = 400 - (((point.loss - minLoss) / range) * 400);
+                if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+            });
+            ctx.stroke();
+        }
+        setInterval(async () => {
+            try {
+                const res = await fetch('/api/stats');
+                const data = await res.json();
+                document.getElementById('step').innerText = data.step.toLocaleString();
+                document.getElementById('loss').innerText = data.loss.toFixed(4);
+                document.getElementById('lr').innerText = data.lr.toExponential(2);
+                document.getElementById('tps').innerText = Math.round(data.tps).toLocaleString();
+                document.getElementById('batch_time').innerText = Math.round(data.batch_time_ms) + " ms";
+                
+                let tk = data.total_tokens;
+                let tkStr = tk > 1000000000 ? (tk/1000000000).toFixed(2) + "B" : tk > 1000000 ? (tk/1000000).toFixed(2) + "M" : tk.toLocaleString();
+                document.getElementById('total_tokens').innerText = tkStr;
+
+                drawChart(data.history);
+            } catch (e) {}
+        }, 1000);
+    </script>
+</body>
+</html>
+"#;
 
 fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>) {
     thread::spawn(move || {
-        let listener = TcpListener::bind("0.0.0.0:8080")
-            .expect("EisenBoard: failed to bind port 8080");
-        println!("🌐  EisenBoard: http://localhost:8080\n");
+        let listener =
+            TcpListener::bind("0.0.0.0:8080").expect("Failed to bind EisenBoard to port 8080");
+        println!("\n🌐 EisenBoard Live! Open http://localhost:8080 in your browser\n");
         for stream in listener.incoming() {
-            if let Ok(mut s) = stream {
-                let _ = s.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                let mut buf = [0u8; 1024];
-                if s.read(&mut buf).unwrap_or(0) > 0 {
-                    let req = String::from_utf8_lossy(&buf);
-                    if req.starts_with("GET /api/stats") {
-                        let st = stats.read().unwrap();
-                        let hist: Vec<String> = st.history.iter()
-                            .map(|(step, loss)| format!("[{},{}]", step, loss))
+            if let Ok(mut stream) = stream {
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                let mut buffer = [0; 1024];
+                if stream.read(&mut buffer).unwrap_or(0) > 0 {
+                    let request = String::from_utf8_lossy(&buffer[..]);
+                    if request.starts_with("GET /api/stats") {
+                        let s = stats.read().unwrap();
+                        let history_json: Vec<String> = s
+                            .history
+                            .iter()
+                            .map(|r| format!(r#"{{"step":{},"loss":{:.6}}}"#, r.step, r.loss))
                             .collect();
                         let json = format!(
-                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.1},"batch_ms":{:.1},"total_tokens":{},"history":[{}]}}"#,
-                            st.step, st.loss, st.lr, st.tps, st.batch_time_ms,
-                            st.total_tokens, hist.join(",")
+                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2},"batch_time_ms":{:.2},"total_tokens":{},"history":[{}]}}"#,
+                            s.step,
+                            s.loss,
+                            s.lr,
+                            s.tps,
+                            s.batch_time_ms,
+                            s.total_tokens,
+                            history_json.join(",")
                         );
-                        let _ = s.write_all(
-                            format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}", json)
-                            .as_bytes()
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
+                            json
                         );
-                    } else if req.starts_with("GET / ") {
-                        let _ = s.write_all(
-                            format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}", DASHBOARD_HTML)
-                            .as_bytes()
+                        let _ = stream.write_all(response.as_bytes());
+                    } else if request.starts_with("GET / ") {
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n{}",
+                            DASHBOARD_HTML
                         );
+                        let _ = stream.write_all(response.as_bytes());
                     }
                 }
             }
         }
     });
-}
-
-// ─── Model ────────────────────────────────────────────────────────────────────
-
-struct TransformerLM {
-    token_emb: Embedding,
-    blocks:    Vec<TransformerBlock>,
-    norm_f:    RMSNorm,
-    lm_head:   Linear,
-}
-
-impl TransformerLM {
-    fn new(
-        g:          &mut Graph,
-        vocab_size: usize,
-        hidden_dim: usize,
-        num_heads:  usize,
-        ffn_dim:    usize,
-        num_layers: usize,
-    ) -> Self {
-        let token_emb = Embedding::new(g, vocab_size, hidden_dim);
-
-        // Build blocks one-by-one and immediately demote their parameters to
-        // CPU so model init does not require full-model VRAM residency.
-        let mut blocks = Vec::with_capacity(num_layers);
-        for _ in 0..num_layers {
-            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
-            for pid in block.params() {
-                // Keep tiny 1D norm scales resident; stream only matrix weights.
-                // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
-                if g.tensors[pid].shape.len() == 2 {
-                    g.demote_tensor_to_cpu(pid);
-                }
-            }
-            blocks.push(block);
-        }
-
-        let norm_f  = RMSNorm::new(g, hidden_dim, 1e-5);
-        let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
-        Self { token_emb, blocks, norm_f, lm_head }
-    }
-}
-
-impl Module for TransformerLM {
-    fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
-        let mut h = self.token_emb.forward(g, x_id);
-        for block in &self.blocks {
-            h = block.forward_with_mask(g, h, true);
-        }
-        h = self.norm_f.forward(g, h);
-        self.lm_head.forward(g, h)
-    }
-    fn params(&self) -> Vec<usize> {
-        let mut p = self.token_emb.params();
-        for b in &self.blocks { p.extend(b.params()); }
-        p.extend(self.norm_f.params());
-        p.extend(self.lm_head.params());
-        p
-    }
 }
 
 // ─── Checkpoint I/O ───────────────────────────────────────────────────────────
@@ -222,6 +199,38 @@ fn save_weights(g: &Graph, path: &str) {
     w.flush().unwrap();
     println!("Checkpoint saved ({} param tensors).", g.num_params);
 }
+fn save_hf_bundle(
+    g: &Graph,
+    model: &TransformerLM,
+    vocab_size: usize,
+    hidden_dim: usize,
+    ffn_dim: usize,
+    num_layers: usize,
+    num_heads: usize,
+    seq_len: usize,
+    dir: &str,
+) {
+    fs::create_dir_all(dir).expect("Failed to create HF output directory");
+    let safe_path = format!("{dir}/model.safetensors");
+    let cfg_path = format!("{dir}/config.json");
+    write_safetensors(g, &model.named_params(), &safe_path).expect("Failed to export safetensors");
+    write_llama_config(
+        &cfg_path,
+        &LlamaConfig {
+            vocab_size,
+            hidden_size: hidden_dim,
+            intermediate_size: ffn_dim,
+            num_hidden_layers: num_layers,
+            num_attention_heads: num_heads,
+            max_position_embeddings: seq_len,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+        },
+    )
+    .expect("Failed to write HF config");
+    println!("HF bundle exported: {}", dir);
+}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
@@ -236,8 +245,9 @@ fn main() {
 
     // ── Paths ────────────────────────────────────────────────────────────────
     let tokenizer_path = "data/tokenizer.model";
-    let bin_path       = "data/german_large_corpus.bin";
-    let ckpt_path      = "data/eisen_1b.bin";
+    let bin_path = "data/german_large_corpus.bin";
+    let output_path = "data/eisen_model.bin";
+    let hf_out_dir = "data/hf_export";
 
     // ── Tokenizer ────────────────────────────────────────────────────────────
     println!("\nLoading tokenizer…");
@@ -278,6 +288,7 @@ fn main() {
     let accum_steps      = env_usize("EISEN_ACCUM_STEPS", 8);
     let effective_batch  = micro_batch_size * accum_steps;
     let tokens_per_step  = effective_batch * seq_len;
+    let tokens_per_micro = micro_batch_size * seq_len;
 
     let total_steps  = 100_000_usize;
     let warmup_steps = 1_000_usize;
@@ -344,6 +355,8 @@ fn main() {
     let mut step         = 0_usize;
     let mut running_loss = 0.0_f32;
     let mut total_tokens = 0_usize;
+    let mut cumulative_tokens = 0_usize;
+
     let mut last_log     = Instant::now();
     let mut board_timer  = Instant::now();
 
@@ -416,31 +429,45 @@ fn main() {
 
         // ── EisenBoard telemetry ──────────────────────────────────────────────
         if step % 10 == 0 {
-            let elapsed       = board_timer.elapsed().as_secs_f32();
-            let tps           = (10 * tokens_per_step) as f32 / elapsed.max(1e-6);
-            let batch_time_ms = elapsed * 100.0;   // ms per step
+            let elapsed = board_timer.elapsed().as_secs_f32();
+            let tps = (10 * tokens_per_step) as f32 / elapsed.max(1e-6);
+            let batch_time_ms = (elapsed * 1000.0) / 10.0;
 
             if let Ok(mut s) = shared_stats.write() {
-                s.step          = step;
-                s.loss          = avg_loss;
-                s.lr            = current_lr;
-                s.tps           = tps;
+                s.step = step;
+                s.loss = avg_loss;
+                s.lr = current_lr;
+                s.tps = tps;
                 s.batch_time_ms = batch_time_ms;
-                s.total_tokens  = total_tokens;
-                if s.history.len() >= 300 { s.history.remove(0); }
-                s.history.push((step, avg_loss));
+                s.total_tokens = cumulative_tokens;
+
+                if s.history.len() >= 200 {
+                    s.history.remove(0);
+                }
+                s.history.push(StepRecord {
+                    step,
+                    loss: avg_loss,
+                });
             }
             board_timer = Instant::now();
         }
 
+
         // ── Checkpoint ────────────────────────────────────────────────────────
-        if step % save_interval == 0 {
-            save_weights(&g, ckpt_path);
+        if step % save_interval == 0 && step > 0 {
+            save_weights(&g, output_path);
+            save_hf_bundle(
+                &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len,
+                hf_out_dir,
+            );
         }
     }
 
     // Final save
-    save_weights(&g, ckpt_path);
+    save_weights(&g, output_path);
+    save_hf_bundle(
+        &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len, hf_out_dir,
+    );
 
     // ── Generation smoke test ─────────────────────────────────────────────────
     println!("\nSanity-check generation…");
@@ -470,5 +497,5 @@ fn main() {
         g.clear_activations();
     }
 
-    println!("\n\nRun complete. Weights at {}", ckpt_path);
+    println!("\n\nRun complete. Weights at {}", output_path);
 }
