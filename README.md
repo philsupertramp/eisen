@@ -73,6 +73,10 @@
 * \[ \] **Config Generator:** Script to output config.json compatible with Llama-style architectures.  
 * \[ \] **Milestone 7:** Load the custom Rust model natively in Python transformers for inference.
 
+Quick smoke workflow:
+1. `cargo run --example train_tiny_hf_smoke`
+2. `python scripts/validate_hf_export.py --export-dir data/hf_export_tiny_smoke`
+
 ## **Phase 8: Stability measures**
 
 *Focus: Training stability*

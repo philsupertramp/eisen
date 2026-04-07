@@ -1,3 +1,6 @@
+use cudarc::driver::CudaContext;
+use eisen::data::dataloader::BinaryDataLoader;
+use eisen::data::tokenizer::BPETokenizer;
 use eisen::graph::Graph;
 use eisen::nn::embedding::Embedding;
 use eisen::nn::linear::Linear;
@@ -6,23 +9,24 @@ use eisen::nn::rmsnorm::RMSNorm;
 use eisen::nn::scheduler::CosineScheduler;
 use eisen::nn::transformer::TransformerBlock;
 use eisen::nn::Module;
-use eisen::data::tokenizer::BPETokenizer;
-use eisen::data::dataloader::BinaryDataLoader;
 use eisen::tensor::Device;
-use cudarc::driver::CudaContext;
+use eisen::tools::huggingface::{write_llama_config, write_safetensors, LlamaConfig};
 
-use std::fs::File;
 use std::fs;
-use std::sync::{Arc, RwLock};
-use std::path::Path;
-use std::time::Instant;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
 use std::net::TcpListener;
-use std::io::{Read, Write, BufWriter};
+use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::thread;
+use std::time::Instant;
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
-        Ok(ctx) => { let stream = ctx.default_stream(); Some(Device::Gpu(ctx, stream)) }
+        Ok(ctx) => {
+            let stream = ctx.default_stream();
+            Some(Device::Gpu(ctx, stream))
+        }
         Err(_) => None,
     }
 }
@@ -119,7 +123,8 @@ const DASHBOARD_HTML: &str = r#"
 
 fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>) {
     thread::spawn(move || {
-        let listener = TcpListener::bind("0.0.0.0:8080").expect("Failed to bind EisenBoard to port 8080");
+        let listener =
+            TcpListener::bind("0.0.0.0:8080").expect("Failed to bind EisenBoard to port 8080");
         println!("\n🌐 EisenBoard Live! Open http://localhost:8080 in your browser\n");
         for stream in listener.incoming() {
             if let Ok(mut stream) = stream {
@@ -129,12 +134,20 @@ fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>) {
                     let request = String::from_utf8_lossy(&buffer[..]);
                     if request.starts_with("GET /api/stats") {
                         let s = stats.read().unwrap();
-                        let history_json: Vec<String> = s.history.iter()
+                        let history_json: Vec<String> = s
+                            .history
+                            .iter()
                             .map(|r| format!(r#"{{"step":{},"loss":{:.6}}}"#, r.step, r.loss))
                             .collect();
                         let json = format!(
                             r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2},"batch_time_ms":{:.2},"total_tokens":{},"history":[{}]}}"#,
-                            s.step, s.loss, s.lr, s.tps, s.batch_time_ms, s.total_tokens, history_json.join(",")
+                            s.step,
+                            s.loss,
+                            s.lr,
+                            s.tps,
+                            s.batch_time_ms,
+                            s.total_tokens,
+                            history_json.join(",")
                         );
                         let response = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}",
@@ -163,27 +176,90 @@ struct TransformerLM {
 }
 
 impl TransformerLM {
-    fn new(g: &mut Graph, vocab_size: usize, hidden_dim: usize, num_heads: usize, ffn_dim: usize, num_layers: usize) -> Self {
+    fn new(
+        g: &mut Graph,
+        vocab_size: usize,
+        hidden_dim: usize,
+        num_heads: usize,
+        ffn_dim: usize,
+        num_layers: usize,
+    ) -> Self {
         let token_emb = Embedding::new(g, vocab_size, hidden_dim);
         let mut blocks = Vec::new();
-        for _ in 0..num_layers { blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim)); }
+        for _ in 0..num_layers {
+            blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim));
+        }
         let norm_f = RMSNorm::new(g, hidden_dim, 1e-5);
         let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
-        Self { token_emb, blocks, norm_f, lm_head }
+        Self {
+            token_emb,
+            blocks,
+            norm_f,
+            lm_head,
+        }
+    }
+
+    fn named_params(&self) -> Vec<(String, usize)> {
+        let mut out = Vec::new();
+        out.push((
+            "model.embed_tokens.weight".to_string(),
+            self.token_emb.weight_id,
+        ));
+        for (i, b) in self.blocks.iter().enumerate() {
+            out.push((
+                format!("model.layers.{i}.input_layernorm.weight"),
+                b.norm1.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.q_proj.weight"),
+                b.attn.q_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.k_proj.weight"),
+                b.attn.k_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.v_proj.weight"),
+                b.attn.v_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.self_attn.o_proj.weight"),
+                b.attn.out_proj.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.post_attention_layernorm.weight"),
+                b.norm2.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.mlp.up_proj.weight"),
+                b.ffn1.weight_id,
+            ));
+            out.push((
+                format!("model.layers.{i}.mlp.down_proj.weight"),
+                b.ffn2.weight_id,
+            ));
+        }
+        out.push(("model.norm.weight".to_string(), self.norm_f.weight_id));
+        out.push(("lm_head.weight".to_string(), self.lm_head.weight_id));
+        out
     }
 }
 
 impl Module for TransformerLM {
     fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
         let mut h_id = self.token_emb.forward(g, x_id);
-        for block in &self.blocks { h_id = block.forward_with_mask(g, h_id, true); }
+        for block in &self.blocks {
+            h_id = block.forward_with_mask(g, h_id, true);
+        }
         h_id = self.norm_f.forward(g, h_id);
         self.lm_head.forward(g, h_id)
     }
     fn params(&self) -> Vec<usize> {
         let mut p = Vec::new();
         p.extend(self.token_emb.params());
-        for block in &self.blocks { p.extend(block.params()); }
+        for block in &self.blocks {
+            p.extend(block.params());
+        }
         p.extend(self.norm_f.params());
         p.extend(self.lm_head.params());
         p
@@ -196,10 +272,45 @@ fn save_weights(g: &Graph, path: &str) {
     let mut writer = BufWriter::new(file);
     for i in 0..g.num_params {
         let data = g.tensors[i].sync_to_cpu();
-        for &val in &data { writer.write_all(&val.to_le_bytes()).unwrap(); }
+        for &val in &data {
+            writer.write_all(&val.to_le_bytes()).unwrap();
+        }
     }
     writer.flush().unwrap();
     println!("Weights saved.");
+}
+
+fn save_hf_bundle(
+    g: &Graph,
+    model: &TransformerLM,
+    vocab_size: usize,
+    hidden_dim: usize,
+    ffn_dim: usize,
+    num_layers: usize,
+    num_heads: usize,
+    seq_len: usize,
+    dir: &str,
+) {
+    fs::create_dir_all(dir).expect("Failed to create HF output directory");
+    let safe_path = format!("{dir}/model.safetensors");
+    let cfg_path = format!("{dir}/config.json");
+    write_safetensors(g, &model.named_params(), &safe_path).expect("Failed to export safetensors");
+    write_llama_config(
+        &cfg_path,
+        &LlamaConfig {
+            vocab_size,
+            hidden_size: hidden_dim,
+            intermediate_size: ffn_dim,
+            num_hidden_layers: num_layers,
+            num_attention_heads: num_heads,
+            max_position_embeddings: seq_len,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            tie_word_embeddings: false,
+        },
+    )
+    .expect("Failed to write HF config");
+    println!("HF bundle exported: {}", dir);
 }
 
 fn main() {
@@ -214,13 +325,14 @@ fn main() {
     spawn_eisenboard(shared_stats.clone());
 
     let tokenizer_path = "data/tokenizer.model";
-    let bin_path       = "data/german_large_corpus.bin";
-    let output_path    = "data/eisen_model.bin";
+    let bin_path = "data/german_large_corpus.bin";
+    let output_path = "data/eisen_model.bin";
+    let hf_out_dir = "data/hf_export";
 
     println!("Loading tokenizer from {}...", tokenizer_path);
     let tokenizer = Arc::new(
         BPETokenizer::load(tokenizer_path)
-            .expect("Could not load tokenizer. Did you run tools/train_tokenizer.rs?")
+            .expect("Could not load tokenizer. Did you run tools/train_tokenizer.rs?"),
     );
     let vocab_size = tokenizer.vocab.len();
     println!("Vocab size: {}", vocab_size);
@@ -228,12 +340,12 @@ fn main() {
     // ---------------------------------------------------------------
     // Hyperparameters
     // ---------------------------------------------------------------
-    let seq_len    = 256;
+    let seq_len = 256;
     let hidden_dim = 384;
-    let num_heads  = 6;
-    let ffn_dim    = 1536;
+    let num_heads = 6;
+    let ffn_dim = 1536;
     let num_layers = 6;
-    let batch_size = 16;    // Micro-batch size (fits in VRAM)
+    let batch_size = 16; // Micro-batch size (fits in VRAM)
 
     // ---- Gradient Accumulation ------------------------------------
     // We accumulate gradients over `accum_steps` micro-batches before
@@ -245,42 +357,54 @@ fn main() {
 
     // ---- Cosine LR with Warmup ------------------------------------
     // Standard recipe: warm up for ~1% of total steps, then decay.
-    let total_steps   = 19850_usize; // One full run cap
-    let warmup_steps  = 500_usize;
-    let lr_max        = 3e-4_f32;
-    let lr_min        = 3e-5_f32;
-    let scheduler     = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
+    let total_steps = 19850_usize; // One full run cap
+    let warmup_steps = 500_usize;
+    let lr_max = 3e-4_f32;
+    let lr_min = 3e-5_f32;
+    let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
-    let tokens_per_micro  = batch_size * seq_len;
-    let tokens_per_step   = tokens_per_micro * accum_steps;
+    let tokens_per_micro = batch_size * seq_len;
+    let tokens_per_step = tokens_per_micro * accum_steps;
 
     println!("\nPhase 6 Architecture:");
-    println!("  Layers: {} | Hidden: {} | Heads: {} | FFN: {}", num_layers, hidden_dim, num_heads, ffn_dim);
-    println!("  Micro-batch: {} | Accum steps: {} | Effective batch: {}", batch_size, accum_steps, effective_batch);
+    println!(
+        "  Layers: {} | Hidden: {} | Heads: {} | FFN: {}",
+        num_layers, hidden_dim, num_heads, ffn_dim
+    );
+    println!(
+        "  Micro-batch: {} | Accum steps: {} | Effective batch: {}",
+        batch_size, accum_steps, effective_batch
+    );
     println!("  Tokens/optimizer step: {}", tokens_per_step);
-    println!("  Warmup: {} steps → cosine decay over {} steps", warmup_steps, total_steps);
+    println!(
+        "  Warmup: {} steps → cosine decay over {} steps",
+        warmup_steps, total_steps
+    );
     println!("  LR: {:.2e} → {:.2e}", lr_max, lr_min);
 
     // The call order matters. Exactly here:
 
-    let mut g     = Graph::new(device);
-    let model     = TransformerLM::new(&mut g, vocab_size, hidden_dim,
-                                       num_heads, ffn_dim, num_layers);
+    let mut g = Graph::new(device);
+    let model = TransformerLM::new(
+        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers,
+    );
 
     // ① Lock parameter watermark BEFORE planning
     g.mark_params();
 
     // ② Decide which params stream, convert overflow to CPU storage.
     //    pinned = always-VRAM: embedding + final_norm + lm_head
-    let pinned: Vec<usize> = model.token_emb.params()
-       .into_iter()
-       .chain(model.norm_f.params())
-       .chain(model.lm_head.params())
-       .collect();
+    let pinned: Vec<usize> = model
+        .token_emb
+        .params()
+        .into_iter()
+        .chain(model.norm_f.params())
+        .chain(model.lm_head.params())
+        .collect();
 
     let report = g.plan_streaming(
-        7 * 1024_usize.pow(3),   // 7 GB VRAM budget
-        500 * 1024 * 1024,       // 500 MB activation reserve
+        7 * 1024_usize.pow(3), // 7 GB VRAM budget
+        500 * 1024 * 1024,     // 500 MB activation reserve
         &pinned,
     );
     println!("{}", report);
@@ -293,18 +417,20 @@ fn main() {
     // Training Loop
     // ---------------------------------------------------------------
     println!("\nStarting training...");
-    let mut dataloader  = BinaryDataLoader::new(bin_path, seq_len, batch_size);
-    let mut step        = 0_usize;
+    let mut dataloader = BinaryDataLoader::new(bin_path, seq_len, batch_size);
+    let mut step = 0_usize;
     let mut running_loss = 0.0_f32;
     let mut cumulative_tokens = 0_usize;
-    let log_interval    = 50;   // Log every N optimizer steps
-    let save_interval   = 2500;
+    let log_interval = 50; // Log every N optimizer steps
+    let save_interval = 2500;
 
-    let mut timer        = Instant::now();
-    let mut last_log     = Instant::now();
+    let mut timer = Instant::now();
+    let mut last_log = Instant::now();
 
     'training: loop {
-        if step >= total_steps { break; }
+        if step >= total_steps {
+            break;
+        }
 
         // -----------------------------------------------------------
         // Gradient Accumulation Inner Loop
@@ -330,10 +456,10 @@ fn main() {
         for _ in 0..accum_steps {
             match dataloader.next_batch() {
                 Some((x_batch, y_batch)) => {
-                    let x_id        = g.alloc(vec![batch_size, seq_len], x_batch);
-                    let logits_id   = model.forward(&mut g, x_id);
+                    let x_id = g.alloc(vec![batch_size, seq_len], x_batch);
+                    let logits_id = model.forward(&mut g, x_id);
                     let flat_logits = g.reshape(logits_id, vec![tokens_per_micro, vocab_size]);
-                    let loss_id     = g.cross_entropy(flat_logits, &y_batch);
+                    let loss_id = g.cross_entropy(flat_logits, &y_batch);
 
                     // Sync loss scalar to CPU for logging (this is a small scalar — negligible overhead)
                     step_loss += g.tensors[loss_id].sync_to_cpu()[0];
@@ -386,17 +512,22 @@ fn main() {
             let elapsed = timer.elapsed().as_secs_f32();
             let tps = (10 * tokens_per_step) as f32 / elapsed.max(1e-6);
             let batch_time_ms = (elapsed * 1000.0) / 10.0;
-            
+
             if let Ok(mut s) = shared_stats.write() {
                 s.step = step;
                 s.loss = avg_loss;
-                s.lr   = current_lr;
-                s.tps  = tps;
+                s.lr = current_lr;
+                s.tps = tps;
                 s.batch_time_ms = batch_time_ms;
                 s.total_tokens = cumulative_tokens;
-                
-                if s.history.len() >= 200 { s.history.remove(0); }
-                s.history.push(StepRecord { step, loss: avg_loss });
+
+                if s.history.len() >= 200 {
+                    s.history.remove(0);
+                }
+                s.history.push(StepRecord {
+                    step,
+                    loss: avg_loss,
+                });
             }
             timer = Instant::now();
         }
@@ -406,10 +537,17 @@ fn main() {
         // -----------------------------------------------------------
         if step % save_interval == 0 && step > 0 {
             save_weights(&g, output_path);
+            save_hf_bundle(
+                &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len,
+                hf_out_dir,
+            );
         }
     }
 
     save_weights(&g, output_path);
+    save_hf_bundle(
+        &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len, hf_out_dir,
+    );
 
     // ---------------------------------------------------------------
     // Verification Generation
@@ -424,21 +562,30 @@ fn main() {
         let context = &input_tokens[start..];
         let current_seq_len = context.len();
 
-        let x_id      = g.alloc(vec![1, current_seq_len], context.iter().map(|&t| t as f32).collect());
+        let x_id = g.alloc(
+            vec![1, current_seq_len],
+            context.iter().map(|&t| t as f32).collect(),
+        );
         let logits_id = model.forward(&mut g, x_id);
 
         let logits_data = g.tensors[logits_id].sync_to_cpu();
-        let last_start  = (current_seq_len - 1) * vocab_size;
+        let last_start = (current_seq_len - 1) * vocab_size;
         let last_logits = &logits_data[last_start..last_start + vocab_size];
 
-        let predicted = last_logits.iter().enumerate()
+        let predicted = last_logits
+            .iter()
+            .enumerate()
             .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i).unwrap();
+            .map(|(i, _)| i)
+            .unwrap();
 
         print!("{}", tokenizer.decode(&[predicted]));
         input_tokens.push(predicted);
         g.clear_activations();
     }
 
-    println!("\n\nPhase 6 Run Complete! Weights stored at {}", output_path);
+    println!(
+        "\n\nPhase 6 Run Complete! Weights stored at {}",
+        output_path
+    );
 }
