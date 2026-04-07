@@ -19,9 +19,15 @@ export EISEN_ACCUM_STEPS="${EISEN_ACCUM_STEPS:-8}"
 export EISEN_VRAM_BUDGET_MB="${EISEN_VRAM_BUDGET_MB:-7000}"
 export EISEN_ACTIVATION_RESERVE_MB="${EISEN_ACTIVATION_RESERVE_MB:-700}"
 
-echo "Launching SMALL profile on RTX 4070 Laptop:"
+export EISEN_DTYPE="${EISEN_DTYPE:-''}"
+
+if [ "${EISEN_DTYPE}" = "bf16" ]; then
+  EISEN_DTYPE="--features bf16"
+fi
+
+echo "Launching SMALL profile on GPU:"
 echo "  HIDDEN=$EISEN_HIDDEN_DIM HEADS=$EISEN_NUM_HEADS FFN=$EISEN_FFN_DIM LAYERS=$EISEN_NUM_LAYERS"
 echo "  SEQ=$EISEN_SEQ_LEN MICRO_BATCH=$EISEN_MICRO_BATCH ACCUM=$EISEN_ACCUM_STEPS"
 echo "  VRAM_BUDGET_MB=$EISEN_VRAM_BUDGET_MB RESERVE_MB=$EISEN_ACTIVATION_RESERVE_MB"
 
-cargo run --release --example train_1b --features bf16
+cargo run --release --example train_1b ${EISEN_DTYPE}
