@@ -20,7 +20,11 @@ fn test_cpu_bmm_softmax_and_transpose_backward() {
 
     let weights_id = g.alloc(vec![1, 2, 2], vec![1.0, -0.5, 0.25, 2.0]);
     let weighted_probs = g.mul(probs_id, weights_id);
-    let probs_loss = g.sum(g.sum(g.sum(weighted_probs, 2), 1), 0);
+
+    let probs_sum_2 = g.sum(weighted_probs, 2);
+    let probs_sum_1 = g.sum(probs_sum_2, 1);
+    let probs_loss = g.sum(probs_sum_1, 0);
+
 
     let t_in = g.alloc(
         vec![1, 2, 2, 2],
@@ -29,7 +33,10 @@ fn test_cpu_bmm_softmax_and_transpose_backward() {
     let t_id = g.transpose_0213(t_in);
     assert_eq!(g.tensors[t_id].shape, vec![1, 2, 2, 2]);
 
-    let t_loss = g.sum(g.sum(g.sum(g.sum(t_id, 3), 2), 1), 0);
+    let t_sum_3 = g.sum(t_id, 3);
+    let t_sum_2 = g.sum(t_sum_3, 2);
+    let t_sum_1 = g.sum(t_sum_2, 1);
+    let t_loss = g.sum(t_sum_1, 0);
     let total_loss = g.add(probs_loss, t_loss);
     g.backward(total_loss);
 
