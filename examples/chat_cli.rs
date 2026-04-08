@@ -8,6 +8,7 @@ use eisen::data::tokenizer::BPETokenizer;
 use eisen::tensor::Device;
 use cudarc::driver::CudaContext;
 
+use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
@@ -162,9 +163,16 @@ fn load_weights(g: &mut Graph, params: &[usize], path: &str) {
 
 fn main() {
     println!("=== Eisen Interactive CLI ===");
+    let args: Vec<String> = env::args().collect();
+    let device_type = &args[1];
 
-    // let device = setup_gpu().expect("CUDA is required!");
-    let device = Device::Cpu;
+    let device: Device = if device_type == "gpu" {
+        println!("Using GPU");
+        setup_gpu().expect("CUDA is required!")
+    } else {
+        println!("Using CPU");
+        Device::Cpu
+    };
 
     let tokenizer = BPETokenizer::load("data/tokenizer.model").unwrap();
     let vocab_size = tokenizer.vocab.len();
