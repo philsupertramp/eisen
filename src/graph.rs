@@ -4,6 +4,7 @@ use crate::tensor::{Device, Storage, Tensor};
 use cudarc::driver::CudaSlice;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use std::collections::{HashMap, HashSet};
+use std::env;
 
 // ── StreamingReport ────────────────────────────────────────────────────────────
 
@@ -55,6 +56,13 @@ impl std::fmt::Display for StreamingReport {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrecisionMode {
+    Fp32,
+    #[cfg(feature = "bf16")]
+    Bf16Mixed,
+}
+
 pub struct Graph {
     pub tensors: Vec<Tensor>,
     pub tape: Tape,
@@ -64,6 +72,7 @@ pub struct Graph {
     pub vram_pool: HashMap<usize, Vec<Storage>>,
     pub num_params: usize,
     pub no_grad: bool,
+    pub precision_mode: PrecisionMode,
 }
 
 impl Default for Graph {
@@ -73,6 +82,71 @@ impl Default for Graph {
 }
 
 impl Graph {
+    #[cfg(feature = "bf16")]
+    fn bf16_requested_by_env() -> bool {
+        match env::var("EISEN_PRECISION") {
+            Ok(v) => {
+                let normalized = v.trim().to_ascii_lowercase();
+                normalized == "bf16" || normalized == "auto"
+            }
+            Err(_) => true,
+        }
+    }
+
+    #[cfg(feature = "bf16")]
+    fn force_fp32_by_env() -> bool {
+        match env::var("EISEN_FORCE_FP32") {
+            Ok(v) => {
+                let normalized = v.trim().to_ascii_lowercase();
+                normalized == "1" || normalized == "true" || normalized == "yes"
+            }
+            Err(_) => false,
+        }
+    }
+
+    #[cfg(feature = "bf16")]
+    fn probe_bf16_matmul_kernel(
+        device: &Device,
+        functions: &HashMap<String, CudaFunction>,
+    ) -> bool {
+        let f = match functions.get("matmul_f32_bf16accum_f32") {
+            Some(f) => f,
+            None => return false,
+        };
+        let stream = match device {
+            Device::Gpu(_, s) => s,
+            Device::Cpu => return false,
+        };
+
+        let a = match stream.alloc_zeros::<f32>(1) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let b = match stream.alloc_zeros::<f32>(1) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let out = match stream.alloc_zeros::<f32>(1) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        let m = 1u64;
+        let k = 1u64;
+        let n = 1u64;
+        let cfg = LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (16, 16, 1),
+            shared_mem_bytes: 0,
+        };
+        let mut builder = stream.launch_builder(f);
+        builder.arg(&a).arg(&b).arg(&out).arg(&m).arg(&k).arg(&n);
+        if unsafe { builder.launch(cfg) }.is_err() {
+            return false;
+        }
+        stream.synchronize().is_ok()
+    }
+
     pub fn new(device: Device) -> Self {
         let mut functions = HashMap::new();
 
@@ -139,6 +213,21 @@ impl Graph {
             }
         }
 
+        #[cfg(feature = "bf16")]
+        let precision_mode = {
+            let requested = Self::bf16_requested_by_env() && !Self::force_fp32_by_env();
+            if requested
+                && matches!(device, Device::Gpu(_, _))
+                && Self::probe_bf16_matmul_kernel(&device, &functions)
+            {
+                PrecisionMode::Bf16Mixed
+            } else {
+                PrecisionMode::Fp32
+            }
+        };
+        #[cfg(not(feature = "bf16"))]
+        let precision_mode = PrecisionMode::Fp32;
+
         Self {
             tensors: Vec::new(),
             tape: Tape::default(),
@@ -147,6 +236,22 @@ impl Graph {
             vram_pool: HashMap::new(),
             num_params: 0,
             no_grad: false,
+            precision_mode,
+        }
+    }
+
+    pub fn precision_mode(&self) -> PrecisionMode {
+        self.precision_mode
+    }
+
+    pub fn uses_bf16_mixed_precision(&self) -> bool {
+        #[cfg(feature = "bf16")]
+        {
+            self.precision_mode == PrecisionMode::Bf16Mixed
+        }
+        #[cfg(not(feature = "bf16"))]
+        {
+            false
         }
     }
 
@@ -351,8 +456,14 @@ impl Graph {
                     .expect("demote_tensor_to_cpu: dtoh data failed")
             }
             #[cfg(feature = "bf16")]
-            Storage::GpuBf16(_) => {
-                panic!("demote_tensor_to_cpu: BF16 tensor demotion not supported")
+            Storage::GpuBf16(s) => {
+                let st = stream.as_ref().expect("GPU storage without GPU stream");
+                let bf16 = st
+                    .clone_dtoh(s)
+                    .expect("demote_tensor_to_cpu: dtoh BF16 data failed");
+                bf16.into_iter()
+                    .map(|b| f32::from_bits((b as u32) << 16))
+                    .collect()
             }
         };
 
@@ -473,7 +584,14 @@ impl Graph {
                     .expect("plan_streaming: dtoh weight failed"),
                 Storage::Cpu(_) => continue, // already CPU — nothing to do
                 #[cfg(feature = "bf16")]
-                Storage::GpuBf16(_) => panic!("plan_streaming: BF16 streaming not yet supported"),
+                Storage::GpuBf16(s) => {
+                    let bf16 = stream
+                        .clone_dtoh(s)
+                        .expect("plan_streaming: dtoh BF16 weight failed");
+                    bf16.into_iter()
+                        .map(|b| f32::from_bits((b as u32) << 16))
+                        .collect()
+                }
             };
 
             // Replacing data/grad drops the old CudaSlices → cudaFree
@@ -1541,10 +1659,11 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
-                #[cfg(feature = "bf16")]
-                let f_fwd = self.functions.get("bmm_f32_bf16accum_f32").unwrap().clone();
-                #[cfg(not(feature = "bf16"))]
-                let f_fwd = self.functions.get("bmm_f32").unwrap().clone();
+                let f_fwd = if self.uses_bf16_mixed_precision() {
+                    self.functions.get("bmm_f32_bf16accum_f32").unwrap().clone()
+                } else {
+                    self.functions.get("bmm_f32").unwrap().clone()
+                };
                 let f_bwd_a = self
                     .functions
                     .get(if trans_b {
@@ -2144,10 +2263,7 @@ impl Graph {
 
     pub fn transpose_0213(&mut self, a_id: usize) -> usize {
         let shape = self.tensors[a_id].shape.clone();
-        assert!(
-            shape.len() >= 4,
-            "transpose_0213 requires at least 4 dims"
-        );
+        assert!(shape.len() >= 4, "transpose_0213 requires at least 4 dims");
 
         let ndim = shape.len();
 

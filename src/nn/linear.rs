@@ -47,11 +47,18 @@ impl Module for Linear {
         // Without the feature, plain FP32 matmul is used (identical to
         // the original behaviour).
         // ---------------------------------------------------------------
-        #[cfg(feature = "bf16")]
-        let out_id = g.matmul_bf16(x_id, self.weight_id);
-
-        #[cfg(not(feature = "bf16"))]
-        let out_id = g.matmul(x_id, self.weight_id);
+        let out_id = if g.uses_bf16_mixed_precision() {
+            #[cfg(feature = "bf16")]
+            {
+                g.matmul_bf16(x_id, self.weight_id)
+            }
+            #[cfg(not(feature = "bf16"))]
+            {
+                g.matmul(x_id, self.weight_id)
+            }
+        } else {
+            g.matmul(x_id, self.weight_id)
+        };
 
         let out_biased_id = if let Some(b_id) = self.bias_id {
             g.add(out_id, b_id)
