@@ -205,6 +205,9 @@ impl Graph {
                 "matmul_f32_bf16rhsaccum_f32",
                 "matmul_backward_a_bf16b_f32",
                 "bmm_f32_bf16accum_f32",
+                "gather_bf16_f32",
+                "rmsnorm_f32_bf16w",
+                "rmsnorm_backward_bf16w_f32",
                 "adamw_step_bf16mom_f32",
                 "adamw_step_bf16w_bf16mom_f32",
             ]);
@@ -2570,16 +2573,13 @@ impl Graph {
                 let mut out_shape = idx.shape.clone();
                 out_shape.push(hidden_dim);
 
-                let f_fwd = self.functions.get("gather_f32").unwrap().clone();
+                let f_fwd_f32 = self.functions.get("gather_f32").unwrap().clone();
+                let f_fwd_bf16 = self.functions.get("gather_bf16_f32").unwrap().clone();
                 let f_bwd = self.functions.get("gather_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(out_shape);
 
-                let w_s = match &self.tensors[weights_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
                 let idx_s = match &self.tensors[indices_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
@@ -2592,14 +2592,31 @@ impl Graph {
                 let hidden_u64 = hidden_dim as u64;
                 let out_size_u64 = out_size as u64;
 
-                let mut builder = stream.launch_builder(&f_fwd);
-                builder
-                    .arg(w_s)
-                    .arg(idx_s)
-                    .arg(o_s)
-                    .arg(&hidden_u64)
-                    .arg(&out_size_u64);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                match &self.tensors[weights_id].data {
+                    Storage::Gpu(w_s) => {
+                        let mut builder = stream.launch_builder(&f_fwd_f32);
+                        builder
+                            .arg(w_s)
+                            .arg(idx_s)
+                            .arg(o_s)
+                            .arg(&hidden_u64)
+                            .arg(&out_size_u64);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }
+                            .unwrap();
+                    }
+                    Storage::GpuBf16(w_s) => {
+                        let mut builder = stream.launch_builder(&f_fwd_bf16);
+                        builder
+                            .arg(w_s)
+                            .arg(idx_s)
+                            .arg(o_s)
+                            .arg(&hidden_u64)
+                            .arg(&out_size_u64);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let idx_data = match &tensors[indices_id].data {
@@ -2809,17 +2826,19 @@ impl Graph {
                 let dim = *x.shape.last().unwrap();
                 let num_vecs = x.data.len() / dim;
 
-                let f_fwd = self.functions.get("rmsnorm_f32").unwrap().clone();
-                let f_bwd = self.functions.get("rmsnorm_backward_f32").unwrap().clone();
+                let f_fwd_f32 = self.functions.get("rmsnorm_f32").unwrap().clone();
+                let f_fwd_bf16w = self.functions.get("rmsnorm_f32_bf16w").unwrap().clone();
+                let f_bwd_f32 = self.functions.get("rmsnorm_backward_f32").unwrap().clone();
+                let f_bwd_bf16w = self
+                    .functions
+                    .get("rmsnorm_backward_bf16w_f32")
+                    .unwrap()
+                    .clone();
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(x.shape.clone());
 
                 let x_s = match &self.tensors[x_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
-                let w_s = match &self.tensors[weight_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
@@ -2831,22 +2850,36 @@ impl Graph {
                 let dim_u64 = dim as u64;
                 let num_vecs_u64 = num_vecs as u64;
 
-                let mut builder = stream.launch_builder(&f_fwd);
-                builder
-                    .arg(x_s)
-                    .arg(w_s)
-                    .arg(o_s)
-                    .arg(&dim_u64)
-                    .arg(&eps)
-                    .arg(&num_vecs_u64);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
+                match &self.tensors[weight_id].data {
+                    Storage::Gpu(w_s) => {
+                        let mut builder = stream.launch_builder(&f_fwd_f32);
+                        builder
+                            .arg(x_s)
+                            .arg(w_s)
+                            .arg(o_s)
+                            .arg(&dim_u64)
+                            .arg(&eps)
+                            .arg(&num_vecs_u64);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                            .unwrap();
+                    }
+                    Storage::GpuBf16(w_s) => {
+                        let mut builder = stream.launch_builder(&f_fwd_bf16w);
+                        builder
+                            .arg(x_s)
+                            .arg(w_s)
+                            .arg(o_s)
+                            .arg(&dim_u64)
+                            .arg(&eps)
+                            .arg(&num_vecs_u64);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let x_data = match &tensors[x_id].data {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    let w_data = match &tensors[weight_id].data {
                         Storage::Gpu(s) => s,
                         _ => unreachable!(),
                     };
@@ -2863,16 +2896,35 @@ impl Graph {
                         _ => unreachable!(),
                     };
 
-                    let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(x_data)
-                        .arg(w_data)
-                        .arg(out_grad)
-                        .arg(x_grad)
-                        .arg(w_grad)
-                        .arg(&dim_u64)
-                        .arg(&eps)
-                        .arg(&num_vecs_u64);
-                    unsafe { b1.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
+                    match &tensors[weight_id].data {
+                        Storage::Gpu(w_data) => {
+                            let mut b1 = stream_clone.launch_builder(&f_bwd_f32);
+                            b1.arg(x_data)
+                                .arg(w_data)
+                                .arg(out_grad)
+                                .arg(x_grad)
+                                .arg(w_grad)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                                .unwrap();
+                        }
+                        Storage::GpuBf16(w_data) => {
+                            let mut b1 = stream_clone.launch_builder(&f_bwd_bf16w);
+                            b1.arg(x_data)
+                                .arg(w_data)
+                                .arg(out_grad)
+                                .arg(x_grad)
+                                .arg(w_grad)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
                 });
 
                 if !self.no_grad {

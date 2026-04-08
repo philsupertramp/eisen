@@ -437,6 +437,22 @@ extern "C" __global__ void gather_f32(
     }
 }
 
+extern "C" __global__ void gather_bf16_f32(
+    const __nv_bfloat16* weights,
+    const float* indices,
+    float* out,
+    const size_t hidden_dim,
+    const size_t out_size
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < out_size) {
+        size_t row = i / hidden_dim;
+        size_t col = i % hidden_dim;
+        size_t w_row = (size_t)indices[row];
+        out[i] = __bfloat162float(weights[w_row * hidden_dim + col]);
+    }
+}
+
 extern "C" __global__ void gather_backward_f32(
     const float* indices,
     const float* grad_out,
@@ -467,6 +483,22 @@ extern "C" __global__ void rmsnorm_f32(
     }
 }
 
+extern "C" __global__ void rmsnorm_f32_bf16w(
+    const float* x, const __nv_bfloat16* w, float* out,
+    const size_t dim, const float eps, const size_t num_vecs
+) {
+    size_t n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n < num_vecs) {
+        size_t offset = n * dim;
+        float sum_sq = 0.0f;
+        for (size_t d = 0; d < dim; ++d) { float val = bf16q(x[offset + d]); sum_sq += bf16q(val * val); }
+        float rrms = rsqrtf(sum_sq / (float)dim + eps);
+        for (size_t d = 0; d < dim; ++d) {
+            out[offset + d] = bf16q(bf16q(x[offset + d]) * bf16q(rrms) * __bfloat162float(w[d]));
+        }
+    }
+}
+
 extern "C" __global__ void rmsnorm_backward_f32(
     const float* x, const float* w, const float* grad_out,
     float* grad_x, float* grad_w,
@@ -486,6 +518,34 @@ extern "C" __global__ void rmsnorm_backward_f32(
         for (size_t d = 0; d < dim; ++d) {
             float val_x = bf16q(x[offset + d]);
             float val_w = bf16q(w[d]);
+            float go = bf16q(grad_out[offset + d]);
+            float dx = bf16q(rrms * bf16q(go * val_w) - bf16q(val_x * rrc_d * grad_dot_x_w));
+            grad_x[offset + d] += dx;
+            atomicAdd(&grad_w[d], bf16q(go * val_x * rrms));
+        }
+    }
+}
+
+extern "C" __global__ void rmsnorm_backward_bf16w_f32(
+    const float* x, const __nv_bfloat16* w, const float* grad_out,
+    float* grad_x, float* grad_w,
+    const size_t dim, const float eps, const size_t num_vecs
+) {
+    size_t n = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n < num_vecs) {
+        size_t offset = n * dim;
+        float sum_sq = 0.0f;
+        for (size_t d = 0; d < dim; ++d) { float val = bf16q(x[offset + d]); sum_sq += bf16q(val * val); }
+        float rrms = rsqrtf(sum_sq / (float)dim + eps);
+        float grad_dot_x_w = 0.0f;
+        for (size_t d = 0; d < dim; ++d) {
+            float wv = __bfloat162float(w[d]);
+            grad_dot_x_w += bf16q(grad_out[offset + d]) * bf16q(x[offset + d]) * bf16q(wv);
+        }
+        float rrc_d = (rrms * rrms * rrms) / (float)dim;
+        for (size_t d = 0; d < dim; ++d) {
+            float val_x = bf16q(x[offset + d]);
+            float val_w = __bfloat162float(w[d]);
             float go = bf16q(grad_out[offset + d]);
             float dx = bf16q(rrms * bf16q(go * val_w) - bf16q(val_x * rrc_d * grad_dot_x_w));
             grad_x[offset + d] += dx;
