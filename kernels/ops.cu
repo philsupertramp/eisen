@@ -1060,3 +1060,38 @@ extern "C" __global__ void adamw_step_f32(
         weights[i] = w - lr * m_hat / (sqrtf(v_hat) + eps);
     }
 }
+
+extern "C" __global__ void adamw_step_bf16mom_f32(
+    float* weights,
+    const float* grads,
+    __nv_bfloat16* m,
+    __nv_bfloat16* v,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float weight_decay,
+    const float bc1,
+    const float bc2,
+    const size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = grads[i];
+        float w = weights[i];
+
+        w *= (1.0f - lr * weight_decay);
+
+        float m_old = __bfloat162float(m[i]);
+        float v_old = __bfloat162float(v[i]);
+        float m_new = beta1 * m_old + (1.0f - beta1) * g;
+        float v_new = beta2 * v_old + (1.0f - beta2) * g * g;
+
+        m[i] = __float2bfloat16(m_new);
+        v[i] = __float2bfloat16(v_new);
+
+        float m_hat = m_new * bc1;
+        float v_hat = v_new * bc2;
+        weights[i] = w - lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}

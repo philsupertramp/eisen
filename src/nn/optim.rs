@@ -19,6 +19,10 @@ pub struct AdamW {
     // GPU moment storage — used for VRAM-resident params
     m_gpu: HashMap<usize, CudaSlice<f32>>,
     v_gpu: HashMap<usize, CudaSlice<f32>>,
+    #[cfg(feature = "bf16")]
+    m_gpu_bf16: HashMap<usize, CudaSlice<u16>>,
+    #[cfg(feature = "bf16")]
+    v_gpu_bf16: HashMap<usize, CudaSlice<u16>>,
     grad_clip_norm: Option<f32>,
     last_grad_norm: f32,
     last_grad_scale: f32,
@@ -38,6 +42,10 @@ impl AdamW {
             v_cpu: HashMap::new(),
             m_gpu: HashMap::new(),
             v_gpu: HashMap::new(),
+            #[cfg(feature = "bf16")]
+            m_gpu_bf16: HashMap::new(),
+            #[cfg(feature = "bf16")]
+            v_gpu_bf16: HashMap::new(),
             grad_clip_norm: None,
             last_grad_norm: 0.0,
             last_grad_scale: 1.0,
@@ -263,6 +271,14 @@ impl AdamW {
         let adamw_fn_opt = stream_opt
             .as_ref()
             .map(|_| g.functions.get("adamw_step_f32").unwrap().clone());
+        #[cfg(feature = "bf16")]
+        let adamw_bf16mom_fn_opt = if g.uses_bf16_mixed_precision() {
+            stream_opt
+                .as_ref()
+                .map(|_| g.functions.get("adamw_step_bf16mom_f32").unwrap().clone())
+        } else {
+            None
+        };
 
         for &p_id in &self.params {
             let size = g.tensors[p_id].shape.iter().product::<usize>();
@@ -271,23 +287,6 @@ impl AdamW {
             if is_gpu {
                 // ── Fused GPU kernel path ──────────────────────────────────────
                 let stream = stream_opt.as_ref().expect("GPU param but no GPU stream");
-                let f = adamw_fn_opt.as_ref().unwrap().clone();
-
-                // Lazy-init VRAM moment buffers
-                if !self.m_gpu.contains_key(&p_id) {
-                    self.m_gpu.insert(
-                        p_id,
-                        stream
-                            .alloc_zeros::<f32>(size)
-                            .expect("AdamW: failed to alloc m moment in VRAM"),
-                    );
-                    self.v_gpu.insert(
-                        p_id,
-                        stream
-                            .alloc_zeros::<f32>(size)
-                            .expect("AdamW: failed to alloc v moment in VRAM"),
-                    );
-                }
 
                 let weights = match &g.tensors[p_id].data {
                     Storage::Gpu(s) => s,
@@ -297,25 +296,114 @@ impl AdamW {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let m_s = self.m_gpu.get(&p_id).unwrap();
-                let v_s = self.v_gpu.get(&p_id).unwrap();
 
                 let n = size as u64;
-                let mut builder = stream.launch_builder(&f);
-                builder
-                    .arg(weights)
-                    .arg(grads)
-                    .arg(m_s)
-                    .arg(v_s)
-                    .arg(&self.lr)
-                    .arg(&self.beta1)
-                    .arg(&self.beta2)
-                    .arg(&self.eps)
-                    .arg(&self.weight_decay)
-                    .arg(&bc1)
-                    .arg(&bc2)
-                    .arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                #[cfg(feature = "bf16")]
+                if adamw_bf16mom_fn_opt.is_some() {
+                    // Lazy-init BF16 moment buffers
+                    if !self.m_gpu_bf16.contains_key(&p_id) {
+                        self.m_gpu_bf16.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<u16>(size)
+                                .expect("AdamW: failed to alloc BF16 m moment in VRAM"),
+                        );
+                        self.v_gpu_bf16.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<u16>(size)
+                                .expect("AdamW: failed to alloc BF16 v moment in VRAM"),
+                        );
+                    }
+                    let f = adamw_bf16mom_fn_opt.as_ref().unwrap().clone();
+                    let m_s = self.m_gpu_bf16.get(&p_id).unwrap();
+                    let v_s = self.v_gpu_bf16.get(&p_id).unwrap();
+                    let mut builder = stream.launch_builder(&f);
+                    builder
+                        .arg(weights)
+                        .arg(grads)
+                        .arg(m_s)
+                        .arg(v_s)
+                        .arg(&self.lr)
+                        .arg(&self.beta1)
+                        .arg(&self.beta2)
+                        .arg(&self.eps)
+                        .arg(&self.weight_decay)
+                        .arg(&bc1)
+                        .arg(&bc2)
+                        .arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                } else {
+                    // Lazy-init FP32 moment buffers
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc m moment in VRAM"),
+                        );
+                        self.v_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc v moment in VRAM"),
+                        );
+                    }
+                    let f = adamw_fn_opt.as_ref().unwrap().clone();
+                    let m_s = self.m_gpu.get(&p_id).unwrap();
+                    let v_s = self.v_gpu.get(&p_id).unwrap();
+                    let mut builder = stream.launch_builder(&f);
+                    builder
+                        .arg(weights)
+                        .arg(grads)
+                        .arg(m_s)
+                        .arg(v_s)
+                        .arg(&self.lr)
+                        .arg(&self.beta1)
+                        .arg(&self.beta2)
+                        .arg(&self.eps)
+                        .arg(&self.weight_decay)
+                        .arg(&bc1)
+                        .arg(&bc2)
+                        .arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                }
+                #[cfg(not(feature = "bf16"))]
+                {
+                    // Lazy-init FP32 moment buffers
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc m moment in VRAM"),
+                        );
+                        self.v_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc v moment in VRAM"),
+                        );
+                    }
+                    let f = adamw_fn_opt.as_ref().unwrap().clone();
+                    let m_s = self.m_gpu.get(&p_id).unwrap();
+                    let v_s = self.v_gpu.get(&p_id).unwrap();
+                    let mut builder = stream.launch_builder(&f);
+                    builder
+                        .arg(weights)
+                        .arg(grads)
+                        .arg(m_s)
+                        .arg(v_s)
+                        .arg(&self.lr)
+                        .arg(&self.beta1)
+                        .arg(&self.beta2)
+                        .arg(&self.eps)
+                        .arg(&self.weight_decay)
+                        .arg(&bc1)
+                        .arg(&bc2)
+                        .arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                }
             } else {
                 // ── CPU path (streaming weights, or pure CPU graph) ────────────
                 let m = self.m_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);

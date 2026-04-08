@@ -203,6 +203,7 @@ impl Graph {
                 "matmul_bf16_f32",
                 "matmul_f32_bf16accum_f32",
                 "bmm_f32_bf16accum_f32",
+                "adamw_step_bf16mom_f32",
             ]);
 
             for name in names {
