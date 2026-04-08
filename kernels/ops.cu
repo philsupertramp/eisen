@@ -643,68 +643,208 @@ extern "C" __global__ void bmm_f32_bf16accum_f32(
     }
 }
 
+
+// ---------------------------------------------
+// dA = grad_out * B^T
+// ---------------------------------------------
 extern "C" __global__ void bmm_backward_a_f32(
-    const float* grad_out, const float* b, float* grad_a,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ b,
+    float* __restrict__ grad_a,
     const size_t batch, const size_t m, const size_t k, const size_t n
 ) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t b_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    if (b_idx < batch && row < m && col < k) {
-        float sum = 0.0f;
-        const float* b_batch = b + b_idx * (k * n);
-        const float* go_batch = grad_out + b_idx * (m * n);
-        for (size_t i = 0; i < n; ++i) sum += go_batch[row * n + i] * b_batch[col * n + i];
-        atomicAdd(&grad_a[b_idx * (m * k) + row * k + col], sum);
+    __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float s_b [TILE_SIZE][TILE_SIZE + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const size_t b_idx = blockIdx.z;
+    const size_t row = blockIdx.y * TILE_SIZE + ty;
+    const size_t col = blockIdx.x * TILE_SIZE + tx;
+
+    const float* go_batch = grad_out + b_idx * (m * n);
+    const float* b_batch  = b        + b_idx * (k * n);
+    float* ga_batch       = grad_a   + b_idx * (m * k);
+
+    float acc = 0.0f;
+
+    for (size_t t0 = 0; t0 < n; t0 += TILE_SIZE) {
+        // load grad_out tile
+        if (row < m && (t0 + tx) < n)
+            s_go[ty][tx] = go_batch[row * n + (t0 + tx)];
+        else
+            s_go[ty][tx] = 0.0f;
+
+        // load B tile (transposed access)
+        if (col < k && (t0 + ty) < n)
+            s_b[ty][tx] = b_batch[col * n + (t0 + ty)];
+        else
+            s_b[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            acc += s_go[ty][i] * s_b[i][tx];
+
+        __syncthreads();
     }
+
+    if (row < m && col < k)
+        ga_batch[row * k + col] = acc;
 }
 
+
+// ---------------------------------------------
+// dB = A^T * grad_out
+// ---------------------------------------------
 extern "C" __global__ void bmm_backward_b_f32(
-    const float* a, const float* grad_out, float* grad_b,
+    const float* __restrict__ a,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_b,
     const size_t batch, const size_t m, const size_t k, const size_t n
 ) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t b_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    if (b_idx < batch && row < k && col < n) {
-        float sum = 0.0f;
-        const float* a_batch = a + b_idx * (m * k);
-        const float* go_batch = grad_out + b_idx * (m * n);
-        for (size_t i = 0; i < m; ++i) sum += a_batch[i * k + row] * go_batch[i * n + col];
-        atomicAdd(&grad_b[b_idx * (k * n) + row * n + col], sum);
+    __shared__ float s_a [TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const size_t b_idx = blockIdx.z;
+    const size_t row = blockIdx.y * TILE_SIZE + ty; // k
+    const size_t col = blockIdx.x * TILE_SIZE + tx; // n
+
+    const float* a_batch  = a        + b_idx * (m * k);
+    const float* go_batch = grad_out + b_idx * (m * n);
+    float* gb_batch       = grad_b   + b_idx * (k * n);
+
+    float acc = 0.0f;
+
+    for (size_t t0 = 0; t0 < m; t0 += TILE_SIZE) {
+        // load A^T tile
+        if (row < k && (t0 + tx) < m)
+            s_a[ty][tx] = a_batch[(t0 + tx) * k + row];
+        else
+            s_a[ty][tx] = 0.0f;
+
+        // load grad_out tile
+        if (col < n && (t0 + ty) < m)
+            s_go[ty][tx] = go_batch[(t0 + ty) * n + col];
+        else
+            s_go[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            acc += s_a[ty][i] * s_go[i][tx];
+
+        __syncthreads();
     }
+
+    if (row < k && col < n)
+        gb_batch[row * n + col] = acc;
 }
 
+
+// ---------------------------------------------
+// dA with B already transposed
+// ---------------------------------------------
 extern "C" __global__ void bmm_backward_a_transb_f32(
-    const float* grad_out, const float* b, float* grad_a,
+    const float* __restrict__ grad_out,
+    const float* __restrict__ b,
+    float* __restrict__ grad_a,
     const size_t batch, const size_t m, const size_t k, const size_t n
 ) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t b_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    if (b_idx < batch && row < m && col < k) {
-        float sum = 0.0f;
-        const float* b_batch = b + b_idx * (n * k);
-        const float* go_batch = grad_out + b_idx * (m * n);
-        for (size_t i = 0; i < n; ++i) sum += go_batch[row * n + i] * b_batch[i * k + col];
-        atomicAdd(&grad_a[b_idx * (m * k) + row * k + col], sum);
+    __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float s_b [TILE_SIZE][TILE_SIZE + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const size_t b_idx = blockIdx.z;
+    const size_t row = blockIdx.y * TILE_SIZE + ty;
+    const size_t col = blockIdx.x * TILE_SIZE + tx;
+
+    const float* go_batch = grad_out + b_idx * (m * n);
+    const float* b_batch  = b        + b_idx * (n * k);
+    float* ga_batch       = grad_a   + b_idx * (m * k);
+
+    float acc = 0.0f;
+
+    for (size_t t0 = 0; t0 < n; t0 += TILE_SIZE) {
+        if (row < m && (t0 + tx) < n)
+            s_go[ty][tx] = go_batch[row * n + (t0 + tx)];
+        else
+            s_go[ty][tx] = 0.0f;
+
+        if (col < k && (t0 + ty) < n)
+            s_b[ty][tx] = b_batch[(t0 + ty) * k + col];
+        else
+            s_b[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            acc += s_go[ty][i] * s_b[i][tx];
+
+        __syncthreads();
     }
+
+    if (row < m && col < k)
+        ga_batch[row * k + col] = acc;
 }
 
+
+// ---------------------------------------------
+// dB with output transposed layout
+// ---------------------------------------------
 extern "C" __global__ void bmm_backward_b_transb_f32(
-    const float* a, const float* grad_out, float* grad_b,
+    const float* __restrict__ a,
+    const float* __restrict__ grad_out,
+    float* __restrict__ grad_b,
     const size_t batch, const size_t m, const size_t k, const size_t n
 ) {
-    size_t col = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t row = blockIdx.y * blockDim.y + threadIdx.y;
-    size_t b_idx = blockIdx.z * blockDim.z + threadIdx.z;
-    if (b_idx < batch && row < n && col < k) {
-        float sum = 0.0f;
-        const float* a_batch = a + b_idx * (m * k);
-        const float* go_batch = grad_out + b_idx * (m * n);
-        for (size_t i = 0; i < m; ++i) sum += go_batch[i * n + row] * a_batch[i * k + col];
-        atomicAdd(&grad_b[b_idx * (n * k) + row * k + col], sum);
+    __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
+    __shared__ float s_a [TILE_SIZE][TILE_SIZE + 1];
+
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+
+    const size_t b_idx = blockIdx.z;
+    const size_t row = blockIdx.y * TILE_SIZE + ty; // n
+    const size_t col = blockIdx.x * TILE_SIZE + tx; // k
+
+    const float* a_batch  = a        + b_idx * (m * k);
+    const float* go_batch = grad_out + b_idx * (m * n);
+    float* gb_batch       = grad_b   + b_idx * (n * k);
+
+    float acc = 0.0f;
+
+    for (size_t t0 = 0; t0 < m; t0 += TILE_SIZE) {
+        if (row < n && (t0 + tx) < m)
+            s_go[ty][tx] = go_batch[(t0 + tx) * n + row];
+        else
+            s_go[ty][tx] = 0.0f;
+
+        if (col < k && (t0 + ty) < m)
+            s_a[ty][tx] = a_batch[(t0 + ty) * k + col];
+        else
+            s_a[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            acc += s_go[ty][i] * s_a[i][tx];
+
+        __syncthreads();
     }
+
+    if (row < n && col < k)
+        gb_batch[row * k + col] = acc;
 }
 
 extern "C" __global__ void softmax_f32(const float* x, float* out, const size_t B, const size_t N) {

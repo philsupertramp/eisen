@@ -2144,11 +2144,27 @@ impl Graph {
 
     pub fn transpose_0213(&mut self, a_id: usize) -> usize {
         let shape = self.tensors[a_id].shape.clone();
-        let b = shape[0];
-        let s = shape[1];
-        let h = shape[2];
-        let d = shape[3];
-        let out_shape = vec![b, h, s, d];
+        assert!(
+            shape.len() >= 4,
+            "transpose_0213 requires at least 4 dims"
+        );
+
+        let ndim = shape.len();
+
+        // Last 3 dims are (S, H, D)
+        let s = shape[ndim - 3];
+        let h = shape[ndim - 2];
+        let d = shape[ndim - 1];
+
+        // Flatten all leading dims into B'
+        let b: usize = shape[..ndim - 3].iter().product();
+
+        // Output shape: [..., H, S, D]
+        let mut out_shape = shape[..ndim - 3].to_vec();
+        out_shape.push(h);
+        out_shape.push(s);
+        out_shape.push(d);
+
         let size = b * s * h * d;
         let device = self.device.clone();
 
@@ -2186,6 +2202,7 @@ impl Graph {
                     .arg(&s_u64)
                     .arg(&h_u64)
                     .arg(&d_u64);
+
                 unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
@@ -2197,6 +2214,7 @@ impl Graph {
                         Storage::Gpu(s) => s,
                         _ => unreachable!(),
                     };
+
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
                     b1.arg(out_grad)
                         .arg(a_grad)
@@ -2204,6 +2222,7 @@ impl Graph {
                         .arg(&s_u64)
                         .arg(&h_u64)
                         .arg(&d_u64);
+
                     unsafe { b1.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
                 });
 
@@ -2214,8 +2233,10 @@ impl Graph {
                         backward_fn,
                     });
                 }
+
                 out_id
             }
+
             Device::Cpu => {
                 let a_data = self.tensors[a_id].data.as_cpu().clone();
                 let mut out_data = vec![0.0; size];
@@ -2233,9 +2254,11 @@ impl Graph {
                 }
 
                 let out_id = self.alloc(out_shape, out_data);
+
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();
+
                     for bb in 0..b {
                         for ss in 0..s {
                             for hh in 0..h {
@@ -2256,6 +2279,7 @@ impl Graph {
                         backward_fn,
                     });
                 }
+
                 out_id
             }
         }

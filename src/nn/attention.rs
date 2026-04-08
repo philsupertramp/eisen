@@ -161,16 +161,18 @@ impl MultiHeadAttention {
 
         // 4. Flatten Batch and Heads to use BMM -> [Batch * Heads, Seq, HeadDim]
         let bh = batch * self.num_heads;
-        let q_flat = g.reshape(q_t, vec![bh, seq_len, self.head_dim]);
-        let k_flat = g.reshape(k_t, vec![bh, seq_len, self.head_dim]);
-        let v_flat = g.reshape(v_t, vec![bh, seq_len, self.head_dim]);
+
+        // ZERO-COPY reinterpret
+        g.reinterpret_shape(q_t, vec![bh, seq_len, self.head_dim]);
+        g.reinterpret_shape(k_t, vec![bh, seq_len, self.head_dim]);
+        g.reinterpret_shape(v_t, vec![bh, seq_len, self.head_dim]);
 
         let scale = 1.0 / (self.head_dim as f32).sqrt();
         let context_flat = if g.no_grad {
-            g.flash_attention(q_flat, k_flat, v_flat, scale, causal)
+            g.flash_attention(q_t, k_t, v_t, scale, causal)
         } else {
             // 5. Q @ K.T -> Scores [Batch * Heads, Seq, Seq]
-            let scores_id = g.bmm(q_flat, k_flat, true);
+            let scores_id = g.bmm(q_t, k_t, true);
 
             // 6. Scale by 1 / sqrt(d_k)
             let scale_id = g.alloc(
@@ -199,17 +201,17 @@ impl MultiHeadAttention {
             let probs_id = g.softmax(masked_scores_id);
 
             // 9. Probs @ V -> Context [Batch * Heads, Seq, HeadDim]
-            g.bmm(probs_id, v_flat, false)
+            g.bmm(probs_id, v_t, false)
         };
 
         // 10. Reshape -> [Batch, Heads, Seq, HeadDim]
-        let context_4d = g.reshape(
+        g.reinterpret_shape(
             context_flat,
             vec![batch, self.num_heads, seq_len, self.head_dim],
         );
 
         // 11. Transpose back -> [Batch, Seq, Heads, HeadDim]
-        let context_t = g.transpose_0213(context_4d);
+        let context_t = g.transpose_0213(context_flat);
 
         // 12. Flatten heads -> [Batch, Seq, HiddenDim]
         let context_id = g.reshape(context_t, vec![batch, seq_len, self.hidden_dim]);
