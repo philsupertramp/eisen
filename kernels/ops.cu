@@ -155,7 +155,7 @@ extern "C" __global__ void accumulate_f32(
         if (rank > 2) { size_t c = temp % s2; temp /= s2; idx_t += c * t2; }
         if (rank > 1) { size_t c = temp % s1; temp /= s1; idx_t += c * t1; }
         if (rank > 0) { size_t c = temp % s0; temp /= s0; idx_t += c * t0; }
-        atomicAdd(&grad_target[idx_t], grad_out[i]);
+        atomicAdd(&grad_target[idx_t], bf16q(grad_out[i]));
     }
 }
 
@@ -174,7 +174,7 @@ extern "C" __global__ void scale_f32(
     const size_t n
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { data[i] *= scale; }
+    if (i < n) { data[i] = bf16q(bf16q(data[i]) * bf16q(scale)); }
 }
 extern "C" __global__ void mul_f32(
     const float* a, const float* b, float* out, const size_t n
@@ -230,13 +230,13 @@ extern "C" __global__ void matmul_f32(
 
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            sum += tile_A[threadIdx.y][i] * tile_B[i][threadIdx.x];
+            sum += bf16q(tile_A[threadIdx.y][i]) * bf16q(tile_B[i][threadIdx.x]);
 
         __syncthreads(); // Ensure no thread starts overwriting the tile before others finish
     }
 
     if (row < (int)m && col < (int)n)
-        out[row * n + col] = sum;
+        out[row * n + col] = bf16q(sum);
 }
 
 // ============================================================
@@ -274,13 +274,13 @@ extern "C" __global__ void matmul_backward_a_f32(
         // tileBT[i][tx] = B[col][t*T + i]
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            sum += tileGO[threadIdx.y][i] * tileBT[i][threadIdx.x];
+            sum += bf16q(tileGO[threadIdx.y][i]) * bf16q(tileBT[i][threadIdx.x]);
 
         __syncthreads();
     }
 
     if (row < (int)m && col < (int)k)
-        grad_a[row * k + col] += sum;
+        grad_a[row * k + col] += bf16q(sum);
 }
 
 // ============================================================
@@ -318,13 +318,13 @@ extern "C" __global__ void matmul_backward_b_f32(
         // tileGO[i][tx] = grad_out[t*T + i][col]
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            sum += tileAT[threadIdx.y][i] * tileGO[i][threadIdx.x];
+            sum += bf16q(tileAT[threadIdx.y][i]) * bf16q(tileGO[i][threadIdx.x]);
 
         __syncthreads();
     }
 
     if (row < (int)k && col < (int)n)
-        grad_b[row * n + col] += sum;
+        grad_b[row * n + col] += bf16q(sum);
 }
 
 extern "C" __global__ void silu_f32(
@@ -427,7 +427,7 @@ extern "C" __global__ void copy_f32(
     const float* src, float* dst, const size_t n
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { dst[i] = src[i]; }
+    if (i < n) { dst[i] = bf16q(src[i]); }
 }
 
 // --- CROSS ENTROPY LOSS ---
@@ -496,8 +496,8 @@ extern "C" __global__ void sum_f32(
         if (out_rank > 1) { size_t c = temp % os1; temp /= os1; base_idx += c * is1; }
         if (out_rank > 0) { size_t c = temp % os0; temp /= os0; base_idx += c * is0; }
         float sum = 0.0f;
-        for (size_t k = 0; k < reduced_dim_size; ++k) sum += a[base_idx + k * reduced_dim_stride];
-        out[i] = sum;
+        for (size_t k = 0; k < reduced_dim_size; ++k) sum += bf16q(a[base_idx + k * reduced_dim_stride]);
+        out[i] = bf16q(sum);
     }
 }
 
@@ -513,9 +513,9 @@ extern "C" __global__ void sum_backward_f32(
         if (out_rank > 2) { size_t c = temp % os2; temp /= os2; base_idx += c * is2; }
         if (out_rank > 1) { size_t c = temp % os1; temp /= os1; base_idx += c * is1; }
         if (out_rank > 0) { size_t c = temp % os0; temp /= os0; base_idx += c * is0; }
-        float go = grad_out[i];
+        float go = bf16q(grad_out[i]);
         for (size_t k = 0; k < reduced_dim_size; ++k)
-            grad_a[base_idx + k * reduced_dim_stride] += go;
+            grad_a[base_idx + k * reduced_dim_stride] += bf16q(go);
     }
 }
 
@@ -533,10 +533,10 @@ extern "C" __global__ void max_f32(
         if (out_rank > 0) { size_t c = temp % os0; temp /= os0; base_idx += c * is0; }
         float max_val = -1e20f;
         for (size_t k = 0; k < reduced_dim_size; ++k) {
-            float val = a[base_idx + k * reduced_dim_stride];
+            float val = bf16q(a[base_idx + k * reduced_dim_stride]);
             if (val > max_val) max_val = val;
         }
-        out[i] = max_val;
+        out[i] = bf16q(max_val);
     }
 }
 
@@ -554,10 +554,10 @@ extern "C" __global__ void max_backward_f32(
         if (out_rank > 0) { size_t c = temp % os0; temp /= os0; base_idx += c * is0; }
         float max_val = -1e20f; size_t best_k = 0;
         for (size_t k = 0; k < reduced_dim_size; ++k) {
-            float val = a[base_idx + k * reduced_dim_stride];
+            float val = bf16q(a[base_idx + k * reduced_dim_stride]);
             if (val > max_val) { max_val = val; best_k = k; }
         }
-        grad_a[base_idx + best_k * reduced_dim_stride] += grad_out[i];
+        grad_a[base_idx + best_k * reduced_dim_stride] += bf16q(grad_out[i]);
     }
 }
 
@@ -583,25 +583,25 @@ extern "C" __global__ void bmm_f32(
         int k_idx = t * TILE_SIZE + threadIdx.y;
 
         tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
-            ? a_batch[row * k + a_col]
+            ? bf16q(a_batch[row * k + a_col])
             : 0.0f;
 
         tile_B[threadIdx.y][threadIdx.x] = (col < (int)n && k_idx < (int)k)
-            ? (trans_b ? b_batch[col * k + k_idx] : b_batch[k_idx * n + col])
+            ? bf16q(trans_b ? b_batch[col * k + k_idx] : b_batch[k_idx * n + col])
             : 0.0f;
 
         __syncthreads();
 
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i) {
-            sum += tile_A[threadIdx.y][i] * tile_B[i][threadIdx.x];
+            sum += bf16q(tile_A[threadIdx.y][i]) * bf16q(tile_B[i][threadIdx.x]);
         }
 
         __syncthreads();
     }
 
     if (row < (int)m && col < (int)n) {
-        out[b_idx * (m * n) + row * n + col] = sum;
+        out[b_idx * (m * n) + row * n + col] = bf16q(sum);
     }
 }
 
@@ -680,13 +680,13 @@ extern "C" __global__ void bmm_backward_a_f32(
     for (size_t t0 = 0; t0 < n; t0 += TILE_SIZE) {
         // load grad_out tile
         if (row < m && (t0 + tx) < n)
-            s_go[ty][tx] = go_batch[row * n + (t0 + tx)];
+            s_go[ty][tx] = bf16q(go_batch[row * n + (t0 + tx)]);
         else
             s_go[ty][tx] = 0.0f;
 
         // load B tile (transposed access)
         if (col < k && (t0 + ty) < n)
-            s_b[ty][tx] = b_batch[col * n + (t0 + ty)];
+            s_b[ty][tx] = bf16q(b_batch[col * n + (t0 + ty)]);
         else
             s_b[ty][tx] = 0.0f;
 
@@ -694,13 +694,13 @@ extern "C" __global__ void bmm_backward_a_f32(
 
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            acc += s_go[ty][i] * s_b[i][tx];
+            acc += bf16q(s_go[ty][i]) * bf16q(s_b[i][tx]);
 
         __syncthreads();
     }
 
     if (row < m && col < k)
-        ga_batch[row * k + col] = acc;
+        ga_batch[row * k + col] = bf16q(acc);
 }
 
 
@@ -732,13 +732,13 @@ extern "C" __global__ void bmm_backward_b_f32(
     for (size_t t0 = 0; t0 < m; t0 += TILE_SIZE) {
         // load A^T tile
         if (row < k && (t0 + tx) < m)
-            s_a[ty][tx] = a_batch[(t0 + tx) * k + row];
+            s_a[ty][tx] = bf16q(a_batch[(t0 + tx) * k + row]);
         else
             s_a[ty][tx] = 0.0f;
 
         // load grad_out tile
         if (col < n && (t0 + ty) < m)
-            s_go[ty][tx] = go_batch[(t0 + ty) * n + col];
+            s_go[ty][tx] = bf16q(go_batch[(t0 + ty) * n + col]);
         else
             s_go[ty][tx] = 0.0f;
 
@@ -746,13 +746,13 @@ extern "C" __global__ void bmm_backward_b_f32(
 
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            acc += s_a[ty][i] * s_go[i][tx];
+            acc += bf16q(s_a[ty][i]) * bf16q(s_go[i][tx]);
 
         __syncthreads();
     }
 
     if (row < k && col < n)
-        gb_batch[row * n + col] = acc;
+        gb_batch[row * n + col] = bf16q(acc);
 }
 
 
@@ -783,12 +783,12 @@ extern "C" __global__ void bmm_backward_a_transb_f32(
 
     for (size_t t0 = 0; t0 < n; t0 += TILE_SIZE) {
         if (row < m && (t0 + tx) < n)
-            s_go[ty][tx] = go_batch[row * n + (t0 + tx)];
+            s_go[ty][tx] = bf16q(go_batch[row * n + (t0 + tx)]);
         else
             s_go[ty][tx] = 0.0f;
 
         if (col < k && (t0 + ty) < n)
-            s_b[ty][tx] = b_batch[(t0 + ty) * k + col];
+            s_b[ty][tx] = bf16q(b_batch[(t0 + ty) * k + col]);
         else
             s_b[ty][tx] = 0.0f;
 
@@ -796,13 +796,13 @@ extern "C" __global__ void bmm_backward_a_transb_f32(
 
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            acc += s_go[ty][i] * s_b[i][tx];
+            acc += bf16q(s_go[ty][i]) * bf16q(s_b[i][tx]);
 
         __syncthreads();
     }
 
     if (row < m && col < k)
-        ga_batch[row * k + col] = acc;
+        ga_batch[row * k + col] = bf16q(acc);
 }
 
 
@@ -833,12 +833,12 @@ extern "C" __global__ void bmm_backward_b_transb_f32(
 
     for (size_t t0 = 0; t0 < m; t0 += TILE_SIZE) {
         if (row < n && (t0 + tx) < m)
-            s_go[ty][tx] = go_batch[(t0 + tx) * n + row];
+            s_go[ty][tx] = bf16q(go_batch[(t0 + tx) * n + row]);
         else
             s_go[ty][tx] = 0.0f;
 
         if (col < k && (t0 + ty) < m)
-            s_a[ty][tx] = a_batch[(t0 + ty) * k + col];
+            s_a[ty][tx] = bf16q(a_batch[(t0 + ty) * k + col]);
         else
             s_a[ty][tx] = 0.0f;
 
@@ -846,13 +846,13 @@ extern "C" __global__ void bmm_backward_b_transb_f32(
 
         #pragma unroll
         for (int i = 0; i < TILE_SIZE; ++i)
-            acc += s_go[ty][i] * s_a[i][tx];
+            acc += bf16q(s_go[ty][i]) * bf16q(s_a[i][tx]);
 
         __syncthreads();
     }
 
     if (row < n && col < k)
-        gb_batch[row * k + col] = acc;
+        gb_batch[row * k + col] = bf16q(acc);
 }
 
 extern "C" __global__ void softmax_f32(const float* x, float* out, const size_t B, const size_t N) {
@@ -951,7 +951,7 @@ extern "C" __global__ void transpose_0213_f32(
         size_t h = temp % H; temp /= H;
         size_t s = temp % S; size_t b = temp / S;
         size_t dst_idx = b * (H * S * D) + h * (S * D) + s * D + d;
-        dst[dst_idx] = src[i];
+        dst[dst_idx] = bf16q(src[i]);
     }
 }
 
@@ -966,7 +966,7 @@ extern "C" __global__ void transpose_0213_backward_f32(
         size_t h = temp % H; temp /= H;
         size_t s = temp % S; size_t b = temp / S;
         size_t dst_idx = b * (H * S * D) + h * (S * D) + s * D + d;
-        grad_src[i] += grad_out[dst_idx];
+        grad_src[i] += bf16q(grad_out[dst_idx]);
     }
 }
 
@@ -983,9 +983,9 @@ extern "C" __global__ void rope_f32(
         float freq = powf(10000.0f, -2.0f * (float)d_head_pair / (float)head_dim);
         float angle = (float)seq_idx * freq;
         float cos_a = cosf(angle); float sin_a = sinf(angle);
-        float x1 = x[idx1]; float x2 = x[idx2];
-        out[idx1] = x1 * cos_a - x2 * sin_a;
-        out[idx2] = x2 * cos_a + x1 * sin_a;
+        float x1 = bf16q(x[idx1]); float x2 = bf16q(x[idx2]);
+        out[idx1] = bf16q(x1 * cos_a - x2 * sin_a);
+        out[idx2] = bf16q(x2 * cos_a + x1 * sin_a);
     }
 }
 
@@ -1002,9 +1002,9 @@ extern "C" __global__ void rope_backward_f32(
         float freq = powf(10000.0f, -2.0f * (float)d_head_pair / (float)head_dim);
         float angle = (float)seq_idx * freq;
         float cos_a = cosf(angle); float sin_a = sinf(angle);
-        float g1 = grad_out[idx1]; float g2 = grad_out[idx2];
-        grad_x[idx1] += g1 * cos_a + g2 * sin_a;
-        grad_x[idx2] += g2 * cos_a - g1 * sin_a;
+        float g1 = bf16q(grad_out[idx1]); float g2 = bf16q(grad_out[idx2]);
+        grad_x[idx1] += bf16q(g1 * cos_a + g2 * sin_a);
+        grad_x[idx2] += bf16q(g2 * cos_a - g1 * sin_a);
     }
 }
 
