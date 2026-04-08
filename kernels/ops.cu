@@ -116,6 +116,43 @@ extern "C" __global__ void matmul_f32_bf16accum_f32(
         out[row * n + col] = sum;
     }
 }
+
+extern "C" __global__ void matmul_f32_bf16rhsaccum_f32(
+    const float* a, const __nv_bfloat16* b, float* out,
+    const size_t m, const size_t k, const size_t n
+) {
+    __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int b_row = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+            ? __float2bfloat16(a[row * k + a_col])
+            : __float2bfloat16(0.0f);
+        tile_B[threadIdx.y][threadIdx.x] = (b_row < (int)k && col < (int)n)
+            ? b[b_row * n + col]
+            : __float2bfloat16(0.0f);
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i) {
+            sum += __bfloat162float(tile_A[threadIdx.y][i]) * __bfloat162float(tile_B[i][threadIdx.x]);
+        }
+
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)n) {
+        out[row * n + col] = sum;
+    }
+}
 // --- BROADCAST-AWARE ADDITION ---
 extern "C" __global__ void add_f32(
     const float* a,
@@ -281,6 +318,40 @@ extern "C" __global__ void matmul_backward_a_f32(
 
     if (row < (int)m && col < (int)k)
         grad_a[row * k + col] += bf16q(sum);
+}
+
+extern "C" __global__ void matmul_backward_a_bf16b_f32(
+    const float* grad_out, const __nv_bfloat16* b, float* grad_a,
+    const size_t m, const size_t k, const size_t n
+) {
+    __shared__ float tileGO[TILE_SIZE][TILE_SIZE];
+    __shared__ float tileBT[TILE_SIZE][TILE_SIZE];
+
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)n + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int go_col = t * TILE_SIZE + threadIdx.x;
+        int bt_n   = t * TILE_SIZE + threadIdx.y;
+
+        tileGO[threadIdx.y][threadIdx.x] = (row < (int)m && go_col < (int)n)
+            ? grad_out[row * n + go_col] : 0.0f;
+
+        tileBT[threadIdx.y][threadIdx.x] = (col < (int)k && bt_n < (int)n)
+            ? __bfloat162float(b[col * n + bt_n]) : 0.0f;
+
+        __syncthreads();
+
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            sum += tileGO[threadIdx.y][i] * tileBT[i][threadIdx.x];
+
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)k)
+        grad_a[row * k + col] += sum;
 }
 
 // ============================================================
@@ -1093,5 +1164,41 @@ extern "C" __global__ void adamw_step_bf16mom_f32(
         float m_hat = m_new * bc1;
         float v_hat = v_new * bc2;
         weights[i] = w - lr * m_hat / (sqrtf(v_hat) + eps);
+    }
+}
+
+extern "C" __global__ void adamw_step_bf16w_bf16mom_f32(
+    __nv_bfloat16* weights,
+    const float* grads,
+    __nv_bfloat16* m,
+    __nv_bfloat16* v,
+    const float lr,
+    const float beta1,
+    const float beta2,
+    const float eps,
+    const float weight_decay,
+    const float bc1,
+    const float bc2,
+    const size_t n
+) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = grads[i];
+        float w = __bfloat162float(weights[i]);
+
+        w *= (1.0f - lr * weight_decay);
+
+        float m_old = __bfloat162float(m[i]);
+        float v_old = __bfloat162float(v[i]);
+        float m_new = beta1 * m_old + (1.0f - beta1) * g;
+        float v_new = beta2 * v_old + (1.0f - beta2) * g * g;
+
+        m[i] = __float2bfloat16(m_new);
+        v[i] = __float2bfloat16(v_new);
+
+        float m_hat = m_new * bc1;
+        float v_hat = v_new * bc2;
+        float w_new = w - lr * m_hat / (sqrtf(v_hat) + eps);
+        weights[i] = __float2bfloat16(w_new);
     }
 }

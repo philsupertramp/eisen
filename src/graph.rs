@@ -202,8 +202,11 @@ impl Graph {
                 "cast_bf16_to_f32_accumulate",
                 "matmul_bf16_f32",
                 "matmul_f32_bf16accum_f32",
+                "matmul_f32_bf16rhsaccum_f32",
+                "matmul_backward_a_bf16b_f32",
                 "bmm_f32_bf16accum_f32",
                 "adamw_step_bf16mom_f32",
+                "adamw_step_bf16w_bf16mom_f32",
             ]);
 
             for name in names {
@@ -407,6 +410,41 @@ impl Graph {
         self.tensors
             .push(Tensor::new(id, shape, data, self.device.clone()));
         id
+    }
+
+    #[cfg(feature = "bf16")]
+    pub fn alloc_param_bf16(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
+        let id = self.tensors.len();
+        let size = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product::<usize>()
+        };
+        let strides = Tensor::compute_strides(&shape);
+
+        match &self.device {
+            Device::Gpu(_, stream) => {
+                let u16_data: Vec<u16> = data.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+                let d_data = stream
+                    .clone_htod(u16_data.as_slice())
+                    .expect("alloc_param_bf16: htod failed");
+                let d_grad = stream
+                    .alloc_zeros::<f32>(size)
+                    .expect("alloc_param_bf16: grad alloc failed");
+                self.tensors.push(Tensor {
+                    id,
+                    shape,
+                    strides,
+                    data: Storage::GpuBf16(d_data),
+                    grad: Storage::Gpu(d_grad),
+                    device: self.device.clone(),
+                    name: None,
+                    is_pooled: false,
+                });
+                id
+            }
+            Device::Cpu => self.alloc(shape, data),
+        }
     }
 
     /// Allocate a tensor that permanently lives in CPU RAM, even when the
@@ -1339,13 +1377,23 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
-                let f_matmul = self
+                let f_matmul_fp32rhs = self
                     .functions
                     .get("matmul_f32_bf16accum_f32")
                     .unwrap()
                     .clone();
+                let f_matmul_bf16rhs = self
+                    .functions
+                    .get("matmul_f32_bf16rhsaccum_f32")
+                    .unwrap()
+                    .clone();
                 // Backward uses the existing tiled FP32 kernels — no new kernel needed.
-                let f_bwd_a = self.functions.get("matmul_backward_a_f32").unwrap().clone();
+                let f_bwd_a_f32 = self.functions.get("matmul_backward_a_f32").unwrap().clone();
+                let f_bwd_a_bf16 = self
+                    .functions
+                    .get("matmul_backward_a_bf16b_f32")
+                    .unwrap()
+                    .clone();
                 let f_bwd_b = self.functions.get("matmul_backward_b_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
@@ -1354,10 +1402,6 @@ impl Graph {
                 let out_id = self.alloc_pooled(vec![m, n]);
 
                 let a_fp32 = match &self.tensors[a_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
-                let b_fp32 = match &self.tensors[b_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
@@ -1374,15 +1418,31 @@ impl Graph {
                     block_dim: (16, 16, 1),
                     shared_mem_bytes: 0,
                 };
-                let mut builder = stream.launch_builder(&f_matmul);
-                builder
-                    .arg(a_fp32)
-                    .arg(b_fp32)
-                    .arg(o_fp32)
-                    .arg(&m_u64)
-                    .arg(&k_u64)
-                    .arg(&n_u64);
-                unsafe { builder.launch(cfg_fwd) }.unwrap();
+                match &self.tensors[b_id].data {
+                    Storage::Gpu(b_fp32) => {
+                        let mut builder = stream.launch_builder(&f_matmul_fp32rhs);
+                        builder
+                            .arg(a_fp32)
+                            .arg(b_fp32)
+                            .arg(o_fp32)
+                            .arg(&m_u64)
+                            .arg(&k_u64)
+                            .arg(&n_u64);
+                        unsafe { builder.launch(cfg_fwd) }.unwrap();
+                    }
+                    Storage::GpuBf16(b_bf16) => {
+                        let mut builder = stream.launch_builder(&f_matmul_bf16rhs);
+                        builder
+                            .arg(a_fp32)
+                            .arg(b_bf16)
+                            .arg(o_fp32)
+                            .arg(&m_u64)
+                            .arg(&k_u64)
+                            .arg(&n_u64);
+                        unsafe { builder.launch(cfg_fwd) }.unwrap();
+                    }
+                    _ => unreachable!(),
+                }
 
                 // ── Backward closure ─────────────────────────────────────────────────
                 //
@@ -1407,25 +1467,35 @@ impl Graph {
                         Storage::Gpu(s) => s,
                         _ => unreachable!(),
                     };
-                    let b_data = match &tensors[b_id].data {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-
                     // grad_a = grad_out @ B^T
                     let cfg_a = LaunchConfig {
                         grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                         block_dim: (16, 16, 1),
                         shared_mem_bytes: 0,
                     };
-                    let mut b1 = stream_clone.launch_builder(&f_bwd_a);
-                    b1.arg(out_grad)
-                        .arg(b_data)
-                        .arg(a_grad)
-                        .arg(&m_u64)
-                        .arg(&k_u64)
-                        .arg(&n_u64);
-                    unsafe { b1.launch(cfg_a) }.unwrap();
+                    match &tensors[b_id].data {
+                        Storage::Gpu(b_data) => {
+                            let mut b1 = stream_clone.launch_builder(&f_bwd_a_f32);
+                            b1.arg(out_grad)
+                                .arg(b_data)
+                                .arg(a_grad)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                            unsafe { b1.launch(cfg_a) }.unwrap();
+                        }
+                        Storage::GpuBf16(b_data) => {
+                            let mut b1 = stream_clone.launch_builder(&f_bwd_a_bf16);
+                            b1.arg(out_grad)
+                                .arg(b_data)
+                                .arg(a_grad)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                            unsafe { b1.launch(cfg_a) }.unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
 
                     // grad_b = A^T @ grad_out
                     let cfg_b = LaunchConfig {

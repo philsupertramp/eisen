@@ -19,6 +19,13 @@ impl Linear {
             weight_data[i] = rand_val * limit;
         }
 
+        #[cfg(feature = "bf16")]
+        let weight_id = if g.uses_bf16_mixed_precision() {
+            g.alloc_param_bf16(vec![in_features, out_features], weight_data)
+        } else {
+            g.alloc(vec![in_features, out_features], weight_data)
+        };
+        #[cfg(not(feature = "bf16"))]
         let weight_id = g.alloc(vec![in_features, out_features], weight_data);
 
         let bias_id = if use_bias {
