@@ -2,7 +2,7 @@ use eisen::graph::Graph;
 use eisen::nn::embedding::Embedding;
 use eisen::nn::linear::Linear;
 use eisen::nn::rmsnorm::RMSNorm;
-use eisen::nn::transformer::TransformerBlock;
+use eisen::nn::transformer::{TransformerBlock, TransformerLM};
 use eisen::nn::Module;
 use eisen::data::tokenizer::BPETokenizer;
 use eisen::tensor::Device;
@@ -11,48 +11,128 @@ use cudarc::driver::CudaContext;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
+use rand::Rng; // Requires `rand` crate in Cargo.toml
+
+// --- Advanced Sampling Configuration & Logic ---
+
+#[derive(Clone, Debug)]
+pub struct SamplerConfig {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+    pub repetition_penalty: f32,
+}
+
+impl Default for SamplerConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.9,
+            repetition_penalty: 1.1,
+        }
+    }
+}
+
+pub fn sample_logits(logits: &mut [f32], context: &[usize], config: &SamplerConfig) -> usize {
+    // 1. Repetition Penalty
+    if config.repetition_penalty != 1.0 {
+        for &token_id in context {
+            let score = logits[token_id];
+            // If score is negative, multiply to penalize (make more negative). 
+            // If positive, divide to penalize (make closer to 0).
+            logits[token_id] = if score < 0.0 {
+                score * config.repetition_penalty
+            } else {
+                score / config.repetition_penalty
+            };
+        }
+    }
+
+    // 2. Greedy fallback if temperature is effectively 0
+    if config.temperature < 1e-4 {
+        return logits.iter().enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .map(|(i, _)| i).unwrap();
+    }
+
+    // 3. Temperature Scaling
+    for logit in logits.iter_mut() {
+        *logit /= config.temperature;
+    }
+
+    // Create a vector of (index, logit) so we can sort and truncate
+    let mut pairs: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+
+    // Sort descending by logit
+    pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 4. Top-K Sampling
+    if config.top_k > 0 && config.top_k < pairs.len() {
+        pairs.truncate(config.top_k);
+    }
+
+    // Softmax over the remaining Top-K logits
+    let max_logit = pairs.first().unwrap().1;
+    let mut probs: Vec<f32> = Vec::with_capacity(pairs.len());
+    let mut exp_sum = 0.0;
+    
+    for &(_, logit) in &pairs {
+        let exp = (logit - max_logit).exp();
+        probs.push(exp);
+        exp_sum += exp;
+    }
+    
+    for prob in probs.iter_mut() {
+        *prob /= exp_sum;
+    }
+
+    // 5. Top-P (Nucleus) Sampling
+    if config.top_p < 1.0 {
+        let mut cumsum = 0.0;
+        let mut cutoff_idx = probs.len();
+        
+        for (i, &prob) in probs.iter().enumerate() {
+            cumsum += prob;
+            if cumsum > config.top_p {
+                cutoff_idx = i + 1;
+                break;
+            }
+        }
+        
+        pairs.truncate(cutoff_idx);
+        probs.truncate(cutoff_idx);
+
+        // Re-normalize probabilities after truncation
+        let p_sum: f32 = probs.iter().sum();
+        for prob in probs.iter_mut() {
+            *prob /= p_sum;
+        }
+    }
+
+    // 6. Sample from the resulting distribution
+    let mut rng = rand::thread_rng();
+    let r: f32 = rng.r#gen();
+    let mut cumsum = 0.0;
+    
+    for (i, &prob) in probs.iter().enumerate() {
+        cumsum += prob;
+        if r <= cumsum {
+            return pairs[i].0;
+        }
+    }
+
+    // Fallback to the last valid token just in case of precision issues
+    pairs.last().unwrap().0
+}
+
+
+// --- Framework Helpers ---
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {
         Ok(ctx) => { let stream = ctx.default_stream(); Some(Device::Gpu(ctx, stream)) }
         Err(_) => None,
-    }
-}
-
-
-// Ensure this matches your 13.8M parameter architecture exactly
-struct TransformerLM {
-    token_emb: Embedding,
-    blocks: Vec<TransformerBlock>,
-    norm_f: RMSNorm,
-    lm_head: Linear,
-}
-
-impl TransformerLM {
-    fn new(g: &mut Graph, vocab_size: usize, hidden_dim: usize, num_heads: usize, ffn_dim: usize, num_layers: usize) -> Self {
-        let token_emb = Embedding::new(g, vocab_size, hidden_dim);
-        let mut blocks = Vec::new();
-        for _ in 0..num_layers { blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim)); }
-        let norm_f = RMSNorm::new(g, hidden_dim, 1e-5);
-        let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
-        Self { token_emb, blocks, norm_f, lm_head }
-    }
-}
-
-impl Module for TransformerLM {
-    fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
-        let mut h_id = self.token_emb.forward(g, x_id);
-        for block in &self.blocks { h_id = block.forward_with_mask(g, h_id, true); }
-        h_id = self.norm_f.forward(g, h_id);
-        self.lm_head.forward(g, h_id)
-    }
-    fn params(&self) -> Vec<usize> {
-        let mut p = Vec::new();
-        p.extend(self.token_emb.params());
-        for block in &self.blocks { p.extend(block.params()); }
-        p.extend(self.norm_f.params());
-        p.extend(self.lm_head.params());
-        p
     }
 }
 
@@ -82,17 +162,19 @@ fn load_weights(g: &mut Graph, params: &[usize], path: &str) {
 
 fn main() {
     println!("=== Eisen Interactive CLI ===");
-    let device = setup_gpu().expect("CUDA is required!");
+
+    // let device = setup_gpu().expect("CUDA is required!");
+    let device = Device::Cpu;
 
     let tokenizer = BPETokenizer::load("data/tokenizer.model").unwrap();
     let vocab_size = tokenizer.vocab.len();
 
     // 13.8M Param Architecture
     let seq_len = 256;
-    let hidden_dim = 384;
-    let num_heads = 6;
-    let ffn_dim = 1536;
-    let num_layers = 6;
+    let hidden_dim = 768;
+    let num_heads = 12;
+    let num_layers = 12;
+    let ffn_dim = 2048;
 
     let mut g = Graph::new(device);
     let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers);
@@ -104,9 +186,19 @@ fn main() {
     g.no_grad = true;
     
     println!("Loading weights from checkpoint...");
-    load_weights(&mut g, &model.params(), "data/eisen_model.bin");
+    load_weights(&mut g, &model.params(), "data/eisen_model_70m.bin");
+
+    // Initialize our advanced sampler config
+    let sampler_config = SamplerConfig {
+        temperature: 0.5,
+        top_k: 50,
+        top_p: 0.9,
+        repetition_penalty: 1.05,
+    };
 
     println!("\nModel ready! Type your prompt below. Type 'exit' to quit.");
+    println!("Sampler Settings: Temp={:.2}, TopK={}, TopP={:.2}, RepPen={:.2}", 
+             sampler_config.temperature, sampler_config.top_k, sampler_config.top_p, sampler_config.repetition_penalty);
     println!("---------------------------------------------------------");
 
     let mut input = String::new();
@@ -116,11 +208,13 @@ fn main() {
         input.clear();
         io::stdin().read_line(&mut input).unwrap();
         
-        let prompt = input.trim();
+        let mut prompt = input.trim().to_owned();
         if prompt == "exit" { break; }
         if prompt.is_empty() { continue; }
 
-        let mut tokens = tokenizer.encode(prompt);
+        prompt.push_str(" ");
+
+        let mut tokens = tokenizer.encode(&prompt);
         print!("Eisen: {}", prompt);
         io::stdout().flush().unwrap();
 
@@ -131,14 +225,15 @@ fn main() {
 
             let x_id = g.alloc(vec![1, current_seq_len], context.iter().map(|&t| t as f32).collect());
             let logits_id = model.forward(&mut g, x_id);
-            
+
             let logits_data = g.tensors[logits_id].sync_to_cpu();
             let last_token_start = (current_seq_len - 1) * vocab_size;
-            let last_logits = &logits_data[last_token_start..last_token_start + vocab_size];
             
-            let predicted_id = last_logits.iter().enumerate()
-                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-                .map(|(i, _)| i).unwrap();
+            // We clone the logits locally so we can mutate them for temperature & penalties
+            let mut last_logits = logits_data[last_token_start..last_token_start + vocab_size].to_vec();
+
+            // Use the advanced sampler rather than basic argmax
+            let predicted_id = sample_logits(&mut last_logits, context, &sampler_config);
             
             print!("{}", tokenizer.decode(&[predicted_id]));
             io::stdout().flush().unwrap();
