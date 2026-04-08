@@ -8,6 +8,14 @@
 #define TILE_SIZE 16
 #include <cuda_bf16.h>
 
+#ifdef USE_BF16_ARITH
+__device__ __forceinline__ float bf16q(float x) {
+    return __bfloat162float(__float2bfloat16(x));
+}
+#else
+__device__ __forceinline__ float bf16q(float x) { return x; }
+#endif
+
 extern "C" __global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst, const size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -127,7 +135,7 @@ extern "C" __global__ void add_f32(
         if (rank > 2) { size_t c = temp % s2; temp /= s2; idx_a += c * a2; idx_b += c * b2; }
         if (rank > 1) { size_t c = temp % s1; temp /= s1; idx_a += c * a1; idx_b += c * b1; }
         if (rank > 0) { size_t c = temp % s0; temp /= s0; idx_a += c * a0; idx_b += c * b0; }
-        out[i] = a[idx_a] + b[idx_b];
+        out[i] = bf16q(bf16q(a[idx_a]) + bf16q(b[idx_b]));
     }
 }
 
@@ -172,7 +180,7 @@ extern "C" __global__ void mul_f32(
     const float* a, const float* b, float* out, const size_t n
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) { out[i] = a[i] * b[i]; }
+    if (i < n) { out[i] = bf16q(bf16q(a[i]) * bf16q(b[i])); }
 }
 
 extern "C" __global__ void mul_backward_f32(
@@ -181,8 +189,8 @@ extern "C" __global__ void mul_backward_f32(
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        grad_a[i] += b[i] * grad_out[i];
-        grad_b[i] += a[i] * grad_out[i];
+        grad_a[i] += bf16q(bf16q(b[i]) * bf16q(grad_out[i]));
+        grad_b[i] += bf16q(bf16q(a[i]) * bf16q(grad_out[i]));
     }
 }
 
@@ -324,8 +332,8 @@ extern "C" __global__ void silu_f32(
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float val = x[i];
-        out[i] = val / (1.0f + expf(-val));
+        float val = bf16q(x[i]);
+        out[i] = bf16q(val / (1.0f + expf(-val)));
     }
 }
 
@@ -334,11 +342,11 @@ extern "C" __global__ void silu_backward_f32(
 ) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
-        float val = x[i];
-        float sig = 1.0f / (1.0f + expf(-val));
-        float silu = val * sig;
-        float d_silu = silu + sig * (1.0f - silu);
-        grad_x[i] += grad_out[i] * d_silu;
+        float val = bf16q(x[i]);
+        float sig = bf16q(1.0f / (1.0f + expf(-val)));
+        float silu = bf16q(val * sig);
+        float d_silu = bf16q(silu + sig * (1.0f - silu));
+        grad_x[i] += bf16q(bf16q(grad_out[i]) * d_silu);
     }
 }
 
@@ -382,9 +390,9 @@ extern "C" __global__ void rmsnorm_f32(
     if (n < num_vecs) {
         size_t offset = n * dim;
         float sum_sq = 0.0f;
-        for (size_t d = 0; d < dim; ++d) { float val = x[offset + d]; sum_sq += val * val; }
+        for (size_t d = 0; d < dim; ++d) { float val = bf16q(x[offset + d]); sum_sq += bf16q(val * val); }
         float rrms = rsqrtf(sum_sq / (float)dim + eps);
-        for (size_t d = 0; d < dim; ++d) { out[offset + d] = x[offset + d] * rrms * w[d]; }
+        for (size_t d = 0; d < dim; ++d) { out[offset + d] = bf16q(bf16q(x[offset + d]) * bf16q(rrms) * bf16q(w[d])); }
     }
 }
 
@@ -397,20 +405,20 @@ extern "C" __global__ void rmsnorm_backward_f32(
     if (n < num_vecs) {
         size_t offset = n * dim;
         float sum_sq = 0.0f;
-        for (size_t d = 0; d < dim; ++d) { float val = x[offset + d]; sum_sq += val * val; }
+        for (size_t d = 0; d < dim; ++d) { float val = bf16q(x[offset + d]); sum_sq += bf16q(val * val); }
         float rrms = rsqrtf(sum_sq / (float)dim + eps);
         float grad_dot_x_w = 0.0f;
         for (size_t d = 0; d < dim; ++d) {
-            grad_dot_x_w += grad_out[offset + d] * x[offset + d] * w[d];
+            grad_dot_x_w += bf16q(grad_out[offset + d]) * bf16q(x[offset + d]) * bf16q(w[d]);
         }
         float rrc_d = (rrms * rrms * rrms) / (float)dim;
         for (size_t d = 0; d < dim; ++d) {
-            float val_x = x[offset + d];
-            float val_w = w[d];
-            float go = grad_out[offset + d];
-            float dx = rrms * (go * val_w) - val_x * rrc_d * grad_dot_x_w;
+            float val_x = bf16q(x[offset + d]);
+            float val_w = bf16q(w[d]);
+            float go = bf16q(grad_out[offset + d]);
+            float dx = bf16q(rrms * bf16q(go * val_w) - bf16q(val_x * rrc_d * grad_dot_x_w));
             grad_x[offset + d] += dx;
-            atomicAdd(&grad_w[d], go * val_x * rrms);
+            atomicAdd(&grad_w[d], bf16q(go * val_x * rrms));
         }
     }
 }
@@ -434,14 +442,14 @@ extern "C" __global__ void cross_entropy_f32(
     if (b < batch_size) {
         float max_val = -1e20f;
         for (size_t c = 0; c < num_classes; ++c) {
-            float val = logits[b * num_classes + c];
+            float val = bf16q(logits[b * num_classes + c]);
             if (val > max_val) max_val = val;
         }
         float sum_exp = 0.0f;
         for (size_t c = 0; c < num_classes; ++c)
-            sum_exp += expf(logits[b * num_classes + c] - max_val);
+            sum_exp += expf(bf16q(logits[b * num_classes + c]) - max_val);
         size_t target_class = (size_t)targets[b];
-        float prob = expf(logits[b * num_classes + target_class] - max_val) / sum_exp;
+        float prob = expf(bf16q(logits[b * num_classes + target_class]) - max_val) / sum_exp;
         atomicAdd(out_loss, -logf(prob + 1e-8f) / (float)batch_size);
     }
 }
@@ -458,19 +466,19 @@ extern "C" __global__ void cross_entropy_backward_f32(
     if (b < batch_size) {
         float max_val = -1e20f;
         for (size_t c = 0; c < num_classes; ++c) {
-            float val = logits[b * num_classes + c];
+            float val = bf16q(logits[b * num_classes + c]);
             if (val > max_val) max_val = val;
         }
         float sum_exp = 0.0f;
         for (size_t c = 0; c < num_classes; ++c)
-            sum_exp += expf(logits[b * num_classes + c] - max_val);
+            sum_exp += expf(bf16q(logits[b * num_classes + c]) - max_val);
         size_t target_class = (size_t)targets[b];
-        float go = grad_out[0] / (float)batch_size;
+        float go = bf16q(grad_out[0]) / (float)batch_size;
         for (size_t c = 0; c < num_classes; ++c) {
-            float prob = expf(logits[b * num_classes + c] - max_val) / sum_exp;
+            float prob = expf(bf16q(logits[b * num_classes + c]) - max_val) / sum_exp;
             float g = prob;
             if (c == target_class) g -= 1.0f;
-            atomicAdd(&grad_logits[b * num_classes + c], g * go);
+            atomicAdd(&grad_logits[b * num_classes + c], bf16q(g * go));
         }
     }
 }
@@ -851,10 +859,10 @@ extern "C" __global__ void softmax_f32(const float* x, float* out, const size_t 
     size_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < B) {
         float max_val = -1e20f;
-        for (size_t i = 0; i < N; ++i) if (x[b * N + i] > max_val) max_val = x[b * N + i];
+        for (size_t i = 0; i < N; ++i) if (bf16q(x[b * N + i]) > max_val) max_val = bf16q(x[b * N + i]);
         float sum = 0.0f;
-        for (size_t i = 0; i < N; ++i) { float e = expf(x[b * N + i] - max_val); out[b * N + i] = e; sum += e; }
-        for (size_t i = 0; i < N; ++i) out[b * N + i] /= sum;
+        for (size_t i = 0; i < N; ++i) { float e = expf(bf16q(x[b * N + i]) - max_val); out[b * N + i] = bf16q(e); sum += e; }
+        for (size_t i = 0; i < N; ++i) out[b * N + i] = bf16q(out[b * N + i] / sum);
     }
 }
 
@@ -862,9 +870,9 @@ extern "C" __global__ void softmax_backward_f32(const float* out, const float* g
     size_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < B) {
         float sum_go = 0.0f;
-        for (size_t i = 0; i < N; ++i) sum_go += out[b * N + i] * grad_out[b * N + i];
+        for (size_t i = 0; i < N; ++i) sum_go += bf16q(out[b * N + i]) * bf16q(grad_out[b * N + i]);
         for (size_t i = 0; i < N; ++i) {
-            float g = out[b * N + i] * (grad_out[b * N + i] - sum_go);
+            float g = bf16q(bf16q(out[b * N + i]) * bf16q(bf16q(grad_out[b * N + i]) - sum_go));
             atomicAdd(&grad_x[b * N + i], g);
         }
     }
@@ -912,8 +920,8 @@ extern "C" __global__ void flash_attention_f32(
     for (size_t j = 0; j < n; ++j) {
         float score = 0.0f;
         const float* k_row = k_batch + j * d;
-        for (size_t x = 0; x < d; ++x) score += q_row[x] * k_row[x];
-        score *= scale;
+        for (size_t x = 0; x < d; ++x) score += bf16q(q_row[x]) * bf16q(k_row[x]);
+        score = bf16q(score * bf16q(scale));
         if (causal && j > i) score = -1e20f;
 
         float new_max = fmaxf(running_max, score);
@@ -922,14 +930,14 @@ extern "C" __global__ void flash_attention_f32(
         float new_l = running_l * alpha + p;
 
         const float* v_row = v_batch + j * d;
-        for (size_t x = 0; x < d; ++x) acc[x] = acc[x] * alpha + p * v_row[x];
+        for (size_t x = 0; x < d; ++x) acc[x] = bf16q(acc[x] * alpha + p * bf16q(v_row[x]));
 
         running_max = new_max;
         running_l = new_l;
     }
 
     float inv_l = 1.0f / fmaxf(running_l, 1e-9f);
-    for (size_t x = 0; x < d; ++x) out_row[x] = acc[x] * inv_l;
+    for (size_t x = 0; x < d; ++x) out_row[x] = bf16q(acc[x] * inv_l);
 }
 
 extern "C" __global__ void transpose_0213_f32(
