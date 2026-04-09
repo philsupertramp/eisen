@@ -203,8 +203,8 @@ fn main() {
 
     let total_steps = dataloader.total_batches();
     let warmup_steps = total_steps / 20;
-    let lr_max = 3e-4_f32;
-    let lr_min = 3e-5_f32;
+    let lr_max = 4e-4_f32;
+    let lr_min = 4e-5_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
@@ -249,6 +249,9 @@ fn main() {
     // plan_streaming already converted overflow params to Storage::Cpu,
     // so AdamW will correctly allocate CPU moments for those params.
     let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
+    optim.weight_decay = 0.1;
+    optim.beta1 = 0.9;
+    optim.beta2 = 0.95;
     optim.set_grad_clip_norm(grad_clip_norm);
 
     let total_params: usize = model
@@ -281,9 +284,11 @@ fn main() {
     );
 
     #[cfg(feature = "bf16")]
-    println!("  Precision: BF16 forward + FP32 accumulation (streaming-aware)");
-    #[cfg(not(feature = "bf16"))]
-    println!("  Precision: FP32");
+    if g.uses_bf16_mixed_precision() {
+        println!("  Precision: BF16 forward + FP32 accumulation (streaming-aware)");
+    } else {
+        println!("  Precision: FP32");
+    }
     if let Ok(mut s) = shared_stats.write() {
         s.vocab_size = vocab_size;
         s.hidden_dim = hidden_dim;

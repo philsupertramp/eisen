@@ -306,6 +306,12 @@ impl AdamW {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
+                let weights = match &g.tensors[p_id].data {
+                    Storage::Gpu(s) => s,
+                    _ => {
+                        panic!("FP32 AdamW kernel requires FP32 GPU weights")
+                    }
+                };
 
                 let n = size as u64;
                 #[cfg(feature = "bf16")]
@@ -384,12 +390,6 @@ impl AdamW {
                                 .expect("AdamW: failed to alloc v moment in VRAM"),
                         );
                     }
-                    let weights = match &g.tensors[p_id].data {
-                        Storage::Gpu(s) => s,
-                        _ => {
-                            panic!("FP32 AdamW kernel requires FP32 GPU weights")
-                        }
-                    };
                     let f = adamw_fn_opt.as_ref().unwrap().clone();
                     let m_s = self.m_gpu.get(&p_id).unwrap();
                     let v_s = self.v_gpu.get(&p_id).unwrap();
