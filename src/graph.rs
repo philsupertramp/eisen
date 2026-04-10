@@ -14,6 +14,28 @@ fn is_bf16(s: &crate::tensor::Storage) -> bool {
 #[inline]
 fn is_bf16(_s: &crate::tensor::Storage) -> bool { false }
 
+
+macro_rules! safe_bf16_temp {
+    ($self:ident, $id:expr, $size:expr, $stream:expr, $cast_fn:expr) => {{
+        // 1. Check if it's BF16 (short immutable borrow, drops immediately)
+        if is_bf16(&$self.tensors[$id].data) {
+            
+            // 2. Safely allocate the temp buffer (mutable borrow of self)
+            let tmp = $self.safe_alloc_zeros::<f32>($stream, $size);
+            
+            // 3. Borrow the tensor again to run the cast
+            if let Storage::GpuBf16(s) = &$self.tensors[$id].data {
+                let n = $size as u64;
+                let mut b = $stream.launch_builder($cast_fn);
+                b.arg(s).arg(&tmp).arg(&n);
+                unsafe { b.launch(LaunchConfig::for_num_elems($size as u32)) }.unwrap();
+            }
+            Some(tmp)
+        } else {
+            None
+        }
+    }};
+}
 // ── StreamingReport ────────────────────────────────────────────────────────────
 
 /// Returned by `Graph::plan_streaming`. Describes what ended up where.
@@ -88,6 +110,9 @@ pub struct Graph {
 
     pub no_grad: bool,
     pub precision_mode: PrecisionMode,
+
+    /// Protects active node tensors from being evicted
+    pub active_node_tensors: Vec<usize>,
 }
 
 impl Default for Graph {
@@ -282,6 +307,8 @@ impl Graph {
             num_params: 0,
             no_grad: false,
             precision_mode,
+
+            active_node_tensors: Vec::new(),
         }
     }
 
@@ -398,10 +425,14 @@ impl Graph {
         let data_storage: Storage = if self.uses_bf16_mixed_precision() {
             match &device {
                 Device::Gpu(_, stream) => {
-                    let slice = self.vram_pool_bf16
-                        .get_mut(&size)
-                        .and_then(|v| v.pop())
-                        .unwrap_or_else(|| stream.alloc_zeros::<u16>(size).unwrap());
+                    // 1. Try to pop from the cache (borrows self.vram_pool mutably, then drops)
+                    let mut cached_slice = None;
+                    if let Some(blocks) = self.vram_pool_bf16.get_mut(&size) {
+                        cached_slice = blocks.pop();
+                    }
+
+                    // 2. Allocate if nothing was found (borrows self mutably, totally safe now!)
+                    let slice = cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
                     Storage::GpuBf16(slice)
                 }
                 Device::Cpu => Storage::Cpu(vec![0.0; size]), // CPU always FP32
@@ -414,13 +445,13 @@ impl Graph {
                 } else {
                     match &device {
                         Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                        Device::Gpu(_, stream) => Storage::Gpu(stream.alloc_zeros::<f32>(size).unwrap()),
+                        Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
                     }
                 }
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(stream.alloc_zeros::<f32>(size).unwrap()),
+                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
                 }
             }
         };
@@ -432,13 +463,13 @@ impl Graph {
                 else {
                     match &device {
                         Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                        Device::Gpu(_, stream) => Storage::Gpu(stream.alloc_zeros::<f32>(size).unwrap()),
+                        Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
                     }
                 }
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(stream.alloc_zeros::<f32>(size).unwrap()),
+                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
                 }
             }
         };
@@ -461,7 +492,7 @@ impl Graph {
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(stream.alloc_zeros::<f32>(size).unwrap_or_else(|_|panic!("Tried allocating {}MB on GPU.", size as f64 / 1024f64.powi(2)))),
+                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
                 }
             }
         };
@@ -530,7 +561,7 @@ impl Graph {
                     .expect("alloc_param_bf16: htod failed");
                 let d_grad = stream
                     .alloc_zeros::<f32>(size)
-                    .expect("alloc_param_bf16: grad alloc failed");
+                    .expect("OOM in alloc_param_bf16");
                 self.tensors.push(Tensor {
                     id,
                     shape,
@@ -575,6 +606,100 @@ impl Graph {
         id
     }
 
+    /// Helper to safely allocate with an emergency pool flush
+    pub fn safe_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+        &mut self, 
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>, 
+        size: usize
+    ) -> cudarc::driver::CudaSlice<T> {
+        // 1. Try standard allocation
+        if let Ok(slice) = stream.alloc_zeros::<T>(size) {
+            return slice;
+        }
+
+        // 2. Try flushing caches
+        self.vram_pool.clear();
+        #[cfg(feature = "bf16")]
+        self.vram_pool_bf16.clear();
+        stream.synchronize().unwrap();
+
+        if let Ok(slice) = stream.alloc_zeros::<T>(size) {
+            return slice;
+        }
+
+        // 3. EMERGENCY EVICTION: Offload activations to CPU RAM
+        // We collect the IDs first to avoid borrowing `self` during the loop
+        // We will not evict tensors that are currently used.
+        let candidate_ids: Vec<usize> = self.tensors.iter()
+            .filter(|t| {
+                t.is_pooled && (
+                    matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)) || 
+                    matches!(t.grad, Storage::Gpu(_)) // 🚨 NEW: Catch stranded gradients!
+                )
+            })
+            .filter(|t| !self.active_node_tensors.contains(&t.id))
+            .map(|t| t.id)
+            .collect();
+
+        for id in candidate_ids {
+            self.demote_tensor_to_cpu(id); // Use your existing demote logic
+            stream.synchronize().unwrap(); // Ensure the memory is actually freed
+
+            if let Ok(slice) = stream.alloc_zeros::<T>(size) {
+                return slice;
+            }
+        }
+
+        panic!("FATAL OOM: Exhausted VRAM even after full activation eviction!");
+    }
+
+    /// Ensures a tensor is on the GPU device
+    pub fn ensure_on_gpu(&mut self, tensor_id: usize) {
+        if !self.tensors[tensor_id].is_pooled {
+            return; 
+        }
+
+        let (is_gpu, stream) = match &self.device {
+            Device::Gpu(_, s) => (true, Some(s.clone())),
+            _ => (false, None),
+        };
+        if !is_gpu { return; }
+        let stream = stream.unwrap();
+
+        // 1. Restore Data
+        if let Storage::Cpu(cpu_data) = &self.tensors[tensor_id].data {
+            let cpu_data_clone = cpu_data.clone();
+            
+            #[cfg(feature = "bf16")]
+            if self.uses_bf16_mixed_precision() && self.tensors[tensor_id].is_pooled {
+                // Restore as BF16
+                let u16_data: Vec<u16> = cpu_data_clone.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+                let mut gpu_slice = self.safe_alloc_zeros::<u16>(&stream, u16_data.len());
+                stream.memcpy_htod(&u16_data, &mut gpu_slice).unwrap();
+                self.tensors[tensor_id].data = Storage::GpuBf16(gpu_slice);
+            } else {
+                // Restore as FP32
+                let mut gpu_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_data_clone.len());
+                stream.memcpy_htod(&cpu_data_clone, &mut gpu_slice).unwrap();
+                self.tensors[tensor_id].data = Storage::Gpu(gpu_slice);
+            }
+            
+            #[cfg(not(feature = "bf16"))]
+            {
+                let mut gpu_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_data_clone.len());
+                stream.memcpy_htod(&cpu_data_clone, &mut gpu_slice).unwrap();
+                self.tensors[tensor_id].data = Storage::Gpu(gpu_slice);
+            }
+        }
+
+        // 2. Restore Gradients (Always FP32)
+        if let Storage::Cpu(cpu_grad) = &self.tensors[tensor_id].grad {
+            let cpu_grad_clone = cpu_grad.clone();
+            let mut gpu_grad_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_grad_clone.len());
+            stream.memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice).unwrap();
+            self.tensors[tensor_id].grad = Storage::Gpu(gpu_grad_slice);
+        }
+    }
     /// Move an existing tensor's data+grad storage to CPU RAM.
     ///
     /// Useful when building very large models on GPU without first holding all
@@ -841,13 +966,14 @@ impl Graph {
 
         #[cfg(feature = "bf16")]
         let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-            let f32_slice = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
             let tmp_id = self.tensors.len();
+            let grad_tensor = self.safe_alloc_zeros::<f32>(&stream, 1);
             self.tensors.push(Tensor {
                 id: tmp_id, shape: vec![m, n],
                 strides: Tensor::compute_strides(&[m, n]),
                 data: Storage::Gpu(f32_slice),
-                grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()), // unused
+                grad: Storage::Gpu(grad_tensor), // unused
                 device: self.device.clone(), name: None, is_pooled: false,
             });
             (tmp_id, true)
@@ -864,7 +990,7 @@ impl Graph {
         let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
         #[cfg(feature = "bf16")]
-        let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, m * k, &stream, &f_cast_to_f32);
+        let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
         #[cfg(not(feature = "bf16"))]
         let a_temp_fwd: Option<()> = None;
 
@@ -950,9 +1076,8 @@ impl Graph {
             unsafe { b1.launch(cfg_a) }.unwrap();
 
             // grad_b = a^T @ grad_out  (FP32, into a fresh GPU temp)
-            let grad_b_temp: CudaSlice<f32> = stream_bwd
-                .alloc_zeros::<f32>(k * n)
-                .expect("bf16_streamed: grad_b_temp alloc failed");
+            let grad_b_temp: CudaSlice<f32> = stream_bwd.alloc_zeros::<f32>(k * n)
+                .expect("OOM in backward pass");
             let cfg_b = LaunchConfig {
                 grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
                 block_dim: (16, 16, 1),
@@ -1405,13 +1530,14 @@ impl Graph {
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     // allocate a ephemeral FP32 compute buffer (not pooled, owned by this scope)
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(m * n).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: vec![m, n],
                         strides: Tensor::compute_strides(&[m, n]),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()), // unused
+                        grad: Storage::Gpu(grad_slice), // unused
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -1428,12 +1554,12 @@ impl Graph {
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, m * k, &stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
                 #[cfg(feature = "bf16")]
-                let b_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[b_id].data, k * n, &stream, &f_cast_to_f32);
+                let b_temp_fwd = safe_bf16_temp!(self, b_id, k * n, &stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let b_temp_fwd: Option<()> = None;
 
@@ -1673,13 +1799,14 @@ impl Graph {
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(m * n).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: vec![m, n],
                         strides: Tensor::compute_strides(&[m, n]),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()),
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -1696,7 +1823,7 @@ impl Graph {
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, m * k, stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
@@ -1911,13 +2038,14 @@ impl Graph {
 
         #[cfg(feature = "bf16")]
         let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-            let f32_slice = stream.alloc_zeros::<f32>(m * n).unwrap();
+            let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
             let tmp_id = self.tensors.len();
+            let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
             self.tensors.push(Tensor {
                 id: tmp_id, shape: vec![m, n],
                 strides: Tensor::compute_strides(&[m, n]),
                 data: Storage::Gpu(f32_slice),
-                grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()), // unused
+                grad: Storage::Gpu(grad_slice),
                 device: self.device.clone(), name: None, is_pooled: false,
             });
             (tmp_id, true)
@@ -1934,7 +2062,7 @@ impl Graph {
         let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
         #[cfg(feature = "bf16")]
-        let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, m * k, &stream, &f_cast_to_f32);
+        let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
         #[cfg(not(feature = "bf16"))]
         let a_temp_fwd: Option<()> = None;
 
@@ -2032,7 +2160,7 @@ impl Graph {
             // so grad_b_temp is the exact gradient for this micro-batch.
             let grad_b_temp = stream_bwd
                 .alloc_zeros::<f32>(k * n)
-                .expect("matmul_streamed: grad_b_temp alloc failed");
+                .expect("OOM in backward.");
 
             let cfg_b = LaunchConfig {
                 grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
@@ -2137,13 +2265,14 @@ impl Graph {
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     // allocate a ephemeral FP32 compute buffer (not pooled, owned by this scope)
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(batch * m * n).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, batch * m * n);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: vec![batch, m, n],
                         strides: Tensor::compute_strides(&[batch, m, n]),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()), // unused
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -2160,12 +2289,12 @@ impl Graph {
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, batch * m * k, &stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, batch * m * k, &stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
                 #[cfg(feature = "bf16")]
-                let b_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[b_id].data, batch * k * n, &stream, &f_cast_to_f32);
+                let b_temp_fwd = safe_bf16_temp!(self, b_id, batch * k * n, &stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let b_temp_fwd: Option<()> = None;
 
@@ -2565,13 +2694,14 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let f32_slice = stream.alloc_zeros::<f32>(batch * m * d).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, batch * m * d);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: vec![batch, m, d],
                         strides: Tensor::compute_strides(&[batch, m, d]),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()), // unused
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -2586,17 +2716,17 @@ impl Graph {
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
 
                 #[cfg(feature = "bf16")]
-                let q_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[q_id].data, batch * m * d, stream, &f_cast_to_f32);
+                let q_temp_fwd = safe_bf16_temp!(self, q_id, batch * m * d, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let q_temp_fwd: Option<()> = None;
 
                 #[cfg(feature = "bf16")]
-                let k_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[k_id].data, batch * n * d, stream, &f_cast_to_f32);
+                let k_temp_fwd = safe_bf16_temp!(self, k_id, batch * n * d, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let k_temp_fwd: Option<()> = None;
 
                 #[cfg(feature = "bf16")]
-                let v_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[v_id].data, batch * n * d, stream, &f_cast_to_f32);
+                let v_temp_fwd = safe_bf16_temp!(self, v_id, batch * n * d, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let v_temp_fwd: Option<()> = None;
 
@@ -3134,13 +3264,14 @@ impl Graph {
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() && !is_bf16(&self.tensors[weights_id].data) {
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(out_size).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, out_size);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: out_shape.clone(),
                         strides: Tensor::compute_strides(&out_shape),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()), // unused
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -3157,7 +3288,7 @@ impl Graph {
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 #[cfg(feature = "bf16")]
-                let idx_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[indices_id].data, num_indices, stream, &f_cast_to_f32);
+                let idx_temp_fwd = safe_bf16_temp!(self, indices_id, num_indices, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let idx_temp_fwd: Option<()> = None;
 
@@ -3316,13 +3447,14 @@ impl Graph {
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(1).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: vec![],
                         strides: vec![],
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()),
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -3350,7 +3482,7 @@ impl Graph {
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 #[cfg(feature = "bf16")]
-                let l_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[logits_id].data, batch_size * num_classes, stream, &f_cast_to_f32);
+                let l_temp_fwd = safe_bf16_temp!(self, logits_id, batch_size * num_classes, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let l_temp_fwd: Option<()> = None;
 
@@ -3834,13 +3966,14 @@ impl Graph {
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(out_size).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, out_size);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: out_shape.clone(),
                         strides: Tensor::compute_strides(&out_shape),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()),
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -3855,7 +3988,7 @@ impl Graph {
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
 
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, a_size, stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, a_size, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
@@ -4021,13 +4154,14 @@ impl Graph {
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = stream.alloc_zeros::<f32>(out_size).unwrap();
+                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, out_size);
                     let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: out_shape.clone(),
                         strides: Tensor::compute_strides(&out_shape),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(stream.alloc_zeros::<f32>(1).unwrap()),
+                        grad: Storage::Gpu(grad_slice),
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -4044,7 +4178,7 @@ impl Graph {
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = crate::bf16_util::bf16_to_f32_temp(&self.tensors[a_id].data, a_size, stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, a_size, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
@@ -4184,28 +4318,131 @@ impl Graph {
     }
 
     pub fn backward(&mut self, loss_id: usize) {
+        if self.no_grad {
+            return;
+        }
+
+        // --- 1. INITIALIZE LOSS GRADIENT TO 1.0 ---
         match &self.device {
             Device::Cpu => {
-                let loss_grad = self.tensors[loss_id].grad.as_cpu_mut();
-                for g in loss_grad.iter_mut() {
-                    *g = 1.0;
+                if let Storage::Cpu(g) = &mut self.tensors[loss_id].grad {
+                    g.iter_mut().for_each(|x| *x = 1.0);
                 }
             }
             Device::Gpu(_, stream) => {
-                let grad_slice = match &self.tensors[loss_id].grad {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
-                let f = self.functions.get("fill_f32").unwrap().clone();
-                let n = grad_slice.len() as u64;
-                let val = 1.0f32;
-                let mut builder = stream.launch_builder(&f);
-                builder.arg(grad_slice).arg(&val).arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(n as u32)) }.unwrap();
+                if let Storage::Gpu(g) = &mut self.tensors[loss_id].grad {
+                    let host_ones = vec![1.0f32; g.len()];
+                    stream.memcpy_htod(&host_ones, g).unwrap();
+                }
             }
         }
-        for node in self.tape.nodes.iter().rev() {
+        
+        let (ctx, stream_opt) = match &self.device {
+            Device::Gpu(ctx, s) => (Some(ctx.clone()), Some(s.clone())),
+            _ => (None, None),
+        };
+
+        // --- 2. PREPARE VRAM FOR RAW CLOSURE ALLOCATIONS ---
+        // The closures use raw `stream.alloc_zeros` and cannot access the pool.
+        // We MUST flush the forward-pass pool back to the driver so the driver 
+        // has space to fulfill those raw allocations.
+        if let Some(stream) = &stream_opt {
+            self.vram_pool.clear();
+            #[cfg(feature = "bf16")]
+            self.vram_pool_bf16.clear();
+            stream.synchronize().unwrap();
+        }
+
+        // --- 3. EXECUTE THE TAPE ---
+        let nodes = std::mem::take(&mut self.tape.nodes);
+
+        for node in nodes.iter().rev() {
+            // 🛡️ SHIELD: Protect the active tensors from being cannibalized
+            self.active_node_tensors.clear();
+            self.active_node_tensors.extend_from_slice(&node.inputs);
+            self.active_node_tensors.push(node.output);
+
+            // JIT Page-In
+            for &input_id in &node.inputs {
+                self.ensure_on_gpu(input_id);
+            }
+            self.ensure_on_gpu(node.output);
+
+            // 🚀 PROACTIVE SCRATCH SPACE GENERATION
+            // Ensure the CUDA driver has enough raw free memory for bf16_to_f32_temp
+            if let Some(stream) = &stream_opt {
+                let (free_vram, _) = ctx.clone().expect("Was not able to acquire context").mem_get_info().unwrap();
+                let mut current_free = free_vram;
+                let scratch_budget = 1024 * 1024 * 1024; // 128 MB safety buffer for temporaries
+
+                if current_free < scratch_budget {
+                    // Evict tensors (that are not shielded) until we reach the budget
+                    let candidate_ids: Vec<usize> = self.tensors.iter()
+                        .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)))
+                        .filter(|t| !self.active_node_tensors.contains(&t.id))
+                        .map(|t| t.id)
+                        .collect();
+
+                    for id in candidate_ids {
+                        self.demote_tensor_to_cpu(id);
+                        stream.synchronize().unwrap();
+                        
+                        let (new_free, _) = ctx.clone().expect("Could not acquire context!").mem_get_info().unwrap();
+                        current_free = new_free;
+                        if current_free >= scratch_budget {
+                            break; // We have enough scratch space!
+                        }
+                    }
+
+                    if current_free < scratch_budget {
+                        println!("Did not manage to clear enough space!!!");
+                        self.print_vram_state("backward pass error");
+                    }
+                } 
+                //else {
+                //    println!("Currently available: {}, attempting to reclaim: {}", current_free, scratch_budget);
+                //    self.print_vram_state("backward pass");
+                //}
+            }
+
+            // Execute the backward closure safely
             (node.backward_fn)(&mut self.tensors);
+        }
+
+        // --- 4. CLEANUP ---
+        self.active_node_tensors.clear();
+        self.tape.nodes = nodes;
+    }
+    pub fn print_vram_state(&self, context: &str) {
+        if let Device::Gpu(ctx, stream) = &self.device {
+            let (free, total) = ctx.mem_get_info().unwrap();
+            let used = total - free;
+            
+            let mut active_data_mb = 0;
+            let mut active_grad_mb = 0;
+            let mut offloaded_mb = 0;
+
+            for t in &self.tensors {
+                match &t.data {
+                    Storage::Gpu(s) => active_data_mb += (s.len() * 4) / 1024 / 1024,
+                    #[cfg(feature = "bf16")]
+                    Storage::GpuBf16(s) => active_data_mb += (s.len() * 2) / 1024 / 1024,
+                    Storage::Cpu(s) => offloaded_mb += (s.len() * 4) / 1024 / 1024,
+                }
+                match &t.grad {
+                    Storage::Gpu(s) => active_grad_mb += (s.len() * 4) / 1024 / 1024,
+                    #[cfg(feature = "bf16")]
+                    Storage::GpuBf16(s) => active_grad_mb += (s.len() * 2) / 1024 / 1024,
+                    Storage::Cpu(s) => offloaded_mb += (s.len() * 4) / 1024 / 1024,
+                }
+            }
+
+            println!("--- VRAM STATE [{}] ---", context);
+            println!("Driver Used:   {:>5} MB / {} MB", used / 1024 / 1024, total / 1024 / 1024);
+            println!("Data on GPU:   {:>5} MB", active_data_mb);
+            println!("Grads on GPU:  {:>5} MB", active_grad_mb);
+            println!("CPU Offloaded: {:>5} MB", offloaded_mb);
+            println!("---------------------------------");
         }
     }
 }

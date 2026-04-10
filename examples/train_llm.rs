@@ -246,6 +246,8 @@ fn main() {
     );
     println!("{}", report);
 
+    g.print_vram_state("Model init.");
+
     // ── Optimizer (AFTER plan_streaming) ─────────────────────────────────────
     // We pre-allocate moment buffers here rather than lazily on the first step.
     // plan_streaming already converted overflow params to Storage::Cpu,
@@ -363,6 +365,7 @@ fn main() {
     let mut last_grad_norm = 0.0_f32;
     let mut last_clip_coef = 1.0_f32;
 
+    g.print_vram_state("Optimizer init");
 
     'training: loop {
         if step >= total_steps {
@@ -421,7 +424,9 @@ fn main() {
         last_grad_norm = grad_norm;
         last_clip_coef = grad_clip_coef;
 
+        g.print_vram_state("PRE step");
         optim.step(&mut g);
+        g.print_vram_state("POST step");
         step += 1;
         cumulative_tokens += micro_count * tokens_per_micro;
 
@@ -444,7 +449,7 @@ fn main() {
         }
 
         // ── EisenBoard telemetry ──────────────────────────────────────────────
-        if step % 10 == 0 {
+        if step % 1 == 0 {
             let elapsed = board_timer.elapsed().as_secs_f32();
             let tps = (10 * tokens_per_step) as f32 / elapsed.max(1e-6);
             let batch_time_ms = (elapsed * 1000.0) / 10.0;

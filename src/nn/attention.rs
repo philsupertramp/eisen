@@ -192,10 +192,11 @@ impl MultiHeadAttention {
             let scores_id = g.bmm(q_t, k_t, true);
 
             // 6. Scale by 1 / sqrt(d_k)
-            let scale_id = g.alloc(
+            let scale_id = g.alloc_pooled(
                 vec![bh, seq_len, seq_len],
-                vec![scale; bh * seq_len * seq_len],
             );
+            let scale_m = vec![scale; bh * seq_len * seq_len];
+            g.load_tensor_data(scale_id, &scale_m);
             let scaled_scores_id = g.mul(scores_id, scale_id);
 
             // 7. Causal Masking
