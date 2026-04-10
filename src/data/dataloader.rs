@@ -95,12 +95,19 @@ pub struct BinaryDataLoader {
     seq_len: usize,
     batch_size: usize,
     buffer: Vec<usize>,
+    total_batches: usize,
 }
 
 impl BinaryDataLoader {
     pub fn new(file_path: &str, seq_len: usize, batch_size: usize) -> Self {
         let file = File::open(file_path).expect("Binary file not found");
         
+        // Calculate the total number of batches we can yield in one pass
+        let file_size = file.metadata().expect("Failed to read file metadata").len() as usize;
+        let total_tokens = file_size / 2; // 2 bytes per u16 token
+        let tokens_per_batch = batch_size * (seq_len + 1);
+        let total_batches = total_tokens / tokens_per_batch;
+
         // Wrap the file in a massive 4MB BufReader for maximum sequential I/O
         let reader = BufReader::with_capacity(4 * 1024 * 1024, file);
 
@@ -109,7 +116,13 @@ impl BinaryDataLoader {
             seq_len,
             batch_size,
             buffer: Vec::new(),
+            total_batches,
         }
+    }
+
+    /// Returns the exact number of full batches available in a single pass
+    pub fn total_batches(&self) -> usize {
+        self.total_batches
     }
 
     pub fn next_batch(&mut self) -> Option<(Vec<f32>, Vec<usize>)> {

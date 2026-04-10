@@ -199,8 +199,10 @@ fn main() {
     let tokens_per_step = effective_batch * seq_len;
     let tokens_per_micro = micro_batch_size * seq_len;
 
-    let total_steps = 100_000_usize;
-    let warmup_steps = 1_000_usize;
+    let mut dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
+
+    let total_steps = dataloader.total_batches();
+    let warmup_steps = total_steps / 20;
     let lr_max = 3e-4_f32;
     let lr_min = 3e-5_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
@@ -341,7 +343,6 @@ fn main() {
 
     // ── Training loop ─────────────────────────────────────────────────────────
     println!("\nStarting training…");
-    let mut dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
     let mut step = 0_usize;
     let mut running_loss = 0.0_f32;
     let mut cumulative_tokens = 0_usize;
