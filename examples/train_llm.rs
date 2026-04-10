@@ -190,11 +190,11 @@ fn main() {
     //   Warmup 1,000 steps → cosine decay to lr_min over 100,000 steps
     //   Peak lr 3e-4 is standard for models in this range with AdamW
     //
-    let seq_len = env_usize("EISEN_SEQ_LEN", 128);
+    let seq_len = env_usize("EISEN_SEQ_LEN", 512);
     // Keep this conservative by default: attention transpose/bmm activations
     // can still OOM at 4 on smaller consumer GPUs even with streaming.
     let micro_batch_size = env_usize("EISEN_MICRO_BATCH", 2);
-    let accum_steps = env_usize("EISEN_ACCUM_STEPS", 8);
+    let accum_steps = env_usize("EISEN_ACCUM_STEPS", 32);
     let effective_batch = micro_batch_size * accum_steps;
     let tokens_per_step = effective_batch * seq_len;
     let tokens_per_micro = micro_batch_size * seq_len;
@@ -214,7 +214,7 @@ fn main() {
     println!("\nBuilding model…");
     let mut g = Graph::new(device);
     let model = TransformerLM::new(
-        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers,
+        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers, seq_len
     );
 
     // Lock the parameter watermark before plan_streaming inspects it
@@ -235,8 +235,10 @@ fn main() {
         .collect();
 
     println!("Planing memory streaming...");
-    let vram_budget_mb = env_usize("EISEN_VRAM_BUDGET_MB", 5120);
-    let reserve_mb = env_usize("EISEN_ACTIVATION_RESERVE_MB", 500);
+    // For 512 seq_len, activations take ~3-4GB of VRAM. We increase the reserve
+    // and adjust the budget assuming a standard 8GB GPU to force weight streaming.
+    let vram_budget_mb = env_usize("EISEN_VRAM_BUDGET_MB", 6144);
+    let reserve_mb = env_usize("EISEN_ACTIVATION_RESERVE_MB", 4096);
     let report = g.plan_streaming(
         vram_budget_mb * 1024 * 1024,
         reserve_mb * 1024 * 1024,
@@ -245,7 +247,7 @@ fn main() {
     println!("{}", report);
 
     // ── Optimizer (AFTER plan_streaming) ─────────────────────────────────────
-    // Moment buffers are lazily initialised on first step.
+    // We pre-allocate moment buffers here rather than lazily on the first step.
     // plan_streaming already converted overflow params to Storage::Cpu,
     // so AdamW will correctly allocate CPU moments for those params.
     let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
@@ -253,6 +255,9 @@ fn main() {
     optim.beta1 = 0.9;
     optim.beta2 = 0.95;
     optim.set_grad_clip_norm(grad_clip_norm);
+
+    println!("Pre-allocating optimizer moment buffers...");
+    optim.init_moments(&g);
 
     let total_params: usize = model
         .params()
@@ -394,7 +399,9 @@ fn main() {
             let (x_batch, y_batch) = batch;
             let tokens_this_micro = micro_batch_size * seq_len;
 
-            let x_id = g.alloc(vec![micro_batch_size, seq_len], x_batch);
+            let x_id = g.alloc_pooled(vec![micro_batch_size, seq_len]);
+            g.load_tensor_data(x_id, &x_batch);
+            
             let logits_id = model.forward(&mut g, x_id);
             let flat_logits = g.reshape(logits_id, vec![tokens_this_micro, vocab_size]);
             let loss_id = g.cross_entropy(flat_logits, &y_batch);
@@ -496,7 +503,10 @@ fn main() {
         let context = &tokens[start..];
         let csl = context.len();
 
-        let x_id = g.alloc(vec![1, csl], context.iter().map(|&t| t as f32).collect());
+        let context_f32: Vec<f32> = context.iter().map(|&t| t as f32).collect();
+        let x_id = g.alloc_pooled(vec![1, csl]);
+        g.load_tensor_data(x_id, &context_f32);
+        
         let logits_id = model.forward(&mut g, x_id);
         let logits = g.tensors[logits_id].sync_to_cpu();
 
