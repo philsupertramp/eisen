@@ -15,10 +15,10 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize, ffn_dim: usize) -> Self {
+    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize, ffn_dim: usize, seq_len: usize) -> Self {
         Self {
             norm1: RMSNorm::new(g, hidden_dim, 1e-5),
-            attn: MultiHeadAttention::new(g, hidden_dim, num_heads),
+            attn: MultiHeadAttention::new(g, hidden_dim, num_heads, seq_len),
             norm2: RMSNorm::new(g, hidden_dim, 1e-5),
             // No biases in modern LLM FFN layers
             ffn1: Linear::new(g, hidden_dim, ffn_dim, false), 
@@ -76,6 +76,7 @@ impl TransformerLM {
         num_heads:  usize,
         ffn_dim:    usize,
         num_layers: usize,
+        seq_len: usize,
     ) -> Self {
         let token_emb = Embedding::new(g, vocab_size, hidden_dim);
 
@@ -83,7 +84,7 @@ impl TransformerLM {
         // CPU so model init does not require full-model VRAM residency.
         let mut blocks = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
+            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim, seq_len);
             for pid in block.params() {
                 // Keep tiny 1D norm scales resident; stream only matrix weights.
                 // This avoids hitting GPU-only RMSNorm kernels with CPU weights.

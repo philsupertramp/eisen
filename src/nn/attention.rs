@@ -107,15 +107,31 @@ pub struct MultiHeadAttention {
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub out_proj: Linear,
+    pub mask_id: usize,
 }
 
 impl MultiHeadAttention {
-    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize) -> Self {
+    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize, seq_len: usize) -> Self {
         assert!(
             hidden_dim % num_heads == 0,
             "hidden_dim must be cleanly divisible by num_heads"
         );
         let head_dim = hidden_dim / num_heads;
+        let mut mask_data = vec![0.0; seq_len * seq_len];
+        for r in 0..seq_len {
+            for c in 0..seq_len {
+                if c > r {
+                    mask_data[r * seq_len + c] = -1e20;
+                }
+            }
+        }
+
+        #[cfg(feature = "bf16")]
+        let mask_id = if g.uses_bf16_mixed_precision() {
+            g.alloc_param_bf16(vec![1, seq_len, seq_len], mask_data)
+        } else {
+            g.alloc(vec![1, seq_len, seq_len], mask_data)
+        };
 
         Self {
             num_heads,
@@ -125,6 +141,7 @@ impl MultiHeadAttention {
             k_proj: Linear::new(g, hidden_dim, hidden_dim, false),
             v_proj: Linear::new(g, hidden_dim, hidden_dim, false),
             out_proj: Linear::new(g, hidden_dim, hidden_dim, false),
+            mask_id: mask_id,
         }
     }
 
@@ -175,24 +192,16 @@ impl MultiHeadAttention {
             let scores_id = g.bmm(q_t, k_t, true);
 
             // 6. Scale by 1 / sqrt(d_k)
-            let scale_id = g.alloc(
+            let scale_id = g.alloc_pooled(
                 vec![bh, seq_len, seq_len],
-                vec![scale; bh * seq_len * seq_len],
             );
+            let scale_m = vec![scale; bh * seq_len * seq_len];
+            g.load_tensor_data(scale_id, &scale_m);
             let scaled_scores_id = g.mul(scores_id, scale_id);
 
             // 7. Causal Masking
             let masked_scores_id = if causal {
-                let mut mask_data = vec![0.0; seq_len * seq_len];
-                for r in 0..seq_len {
-                    for c in 0..seq_len {
-                        if c > r {
-                            mask_data[r * seq_len + c] = -1e20;
-                        }
-                    }
-                }
-                let mask_id = g.alloc(vec![1, seq_len, seq_len], mask_data);
-                g.add(scaled_scores_id, mask_id) // Add broadcasts across Batch*Heads
+                g.add(scaled_scores_id, self.mask_id) // Add broadcasts across Batch*Heads
             } else {
                 scaled_scores_id
             };

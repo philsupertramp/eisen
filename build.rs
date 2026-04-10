@@ -1,11 +1,11 @@
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=./kernels/ops.cu");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    
+
     // Compile the CUDA kernel to PTX
     // Ensure nvcc is in your PATH
     let mut command = Command::new("nvcc");
@@ -16,6 +16,7 @@ fn main() {
         .arg(out_dir.join("ops.ptx"));
     if std::env::var("CARGO_FEATURE_BF16").is_ok() {
         command.arg("-arch=sm_89");
+        command.arg("-DUSE_BF16_ARITH");
     }
     let status = command
         .status()

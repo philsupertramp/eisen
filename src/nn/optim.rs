@@ -19,6 +19,10 @@ pub struct AdamW {
     // GPU moment storage — used for VRAM-resident params
     m_gpu: HashMap<usize, CudaSlice<f32>>,
     v_gpu: HashMap<usize, CudaSlice<f32>>,
+    #[cfg(feature = "bf16")]
+    m_gpu_bf16: HashMap<usize, CudaSlice<u16>>,
+    #[cfg(feature = "bf16")]
+    v_gpu_bf16: HashMap<usize, CudaSlice<u16>>,
     grad_clip_norm: Option<f32>,
     last_grad_norm: f32,
     last_grad_scale: f32,
@@ -38,6 +42,10 @@ impl AdamW {
             v_cpu: HashMap::new(),
             m_gpu: HashMap::new(),
             v_gpu: HashMap::new(),
+            #[cfg(feature = "bf16")]
+            m_gpu_bf16: HashMap::new(),
+            #[cfg(feature = "bf16")]
+            v_gpu_bf16: HashMap::new(),
             grad_clip_norm: None,
             last_grad_norm: 0.0,
             last_grad_scale: 1.0,
@@ -58,6 +66,51 @@ impl AdamW {
         self.last_grad_scale
     }
 
+    /// Pre-allocates moment buffers in VRAM. Call this before the training loop
+    /// to prevent VRAM fragmentation and out-of-memory errors during the first step.
+    pub fn init_moments(&mut self, g: &Graph) {
+        let stream_opt = match &g.device {
+            Device::Gpu(_, s) => Some(s.clone()),
+            Device::Cpu => None,
+        };
+
+        for &p_id in &self.params {
+            let size = g.tensors[p_id].shape.iter().product::<usize>();
+
+            #[cfg(feature = "bf16")]
+            let is_gpu = matches!(&g.tensors[p_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
+            #[cfg(not(feature = "bf16"))]
+            let is_gpu = matches!(&g.tensors[p_id].data, Storage::Gpu(_));
+
+            if is_gpu {
+                let stream = stream_opt.as_ref().unwrap();
+
+                #[cfg(feature = "bf16")]
+                if g.uses_bf16_mixed_precision() {
+                    if !self.m_gpu_bf16.contains_key(&p_id) {
+                        self.m_gpu_bf16.insert(p_id, stream.alloc_zeros::<u16>(size).unwrap());
+                        self.v_gpu_bf16.insert(p_id, stream.alloc_zeros::<u16>(size).unwrap());
+                    }
+                } else {
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                        self.v_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                    }
+                }
+                #[cfg(not(feature = "bf16"))]
+                {
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                        self.v_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                    }
+                }
+            } else {
+                self.m_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
+                self.v_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
+            }
+        }
+    }
+
     fn maybe_clip_gradients(&mut self, g: &mut Graph) {
         let Some(max_norm) = self.grad_clip_norm else {
             self.last_grad_norm = 0.0;
@@ -74,14 +127,20 @@ impl AdamW {
         for &p_id in &self.params {
             match &g.tensors[p_id].grad {
                 Storage::Cpu(v) => {
-                    total_sq += v.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>();
+                    for &x in v {
+                        let xf = x as f64;
+                        total_sq += xf * xf;
+                    }
                 }
                 Storage::Gpu(s) => {
                     let stream = stream_opt
                         .as_ref()
                         .expect("GPU grad but graph has no GPU stream");
                     let host = stream.clone_dtoh(s).expect("AdamW clip: dtoh failed");
-                    total_sq += host.iter().map(|x| (*x as f64) * (*x as f64)).sum::<f64>();
+                    for &x in &host {
+                        let xf = x as f64;
+                        total_sq += xf * xf;
+                    }
                 }
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
@@ -102,7 +161,12 @@ impl AdamW {
             return;
         }
 
+        let scale_fn_opt = stream_opt
+            .as_ref()
+            .map(|_| g.functions.get("scale_f32").unwrap().clone());
+
         for &p_id in &self.params {
+            let size = g.tensors[p_id].shape.iter().product::<usize>();
             match &mut g.tensors[p_id].grad {
                 Storage::Cpu(v) => {
                     for x in v.iter_mut() {
@@ -113,13 +177,12 @@ impl AdamW {
                     let stream = stream_opt
                         .as_ref()
                         .expect("GPU grad but graph has no GPU stream");
-                    let mut host = stream.clone_dtoh(s).expect("AdamW clip: dtoh failed");
-                    for x in host.iter_mut() {
-                        *x *= scale;
-                    }
-                    stream
-                        .memcpy_htod(host.as_slice(), s)
-                        .expect("AdamW clip: htod failed");
+                    let f = scale_fn_opt.as_ref().unwrap().clone();
+                    let mut builder = stream.launch_builder(&f);
+                    let n = size as u64;
+                    builder.arg(&*s).arg(&scale).arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                        .unwrap();
                 }
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
@@ -163,8 +226,11 @@ impl AdamW {
                 unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
             } else {
                 // CPU-homed param (streaming) — fill directly
-                let grad = g.tensors[p_id].grad.as_cpu_mut();
-                grad.fill(0.0);
+                let tensor = &mut g.tensors[p_id];
+                match &mut tensor.grad {
+                    Storage::Cpu(v) => v.fill(0.0),
+                    _ => unreachable!(),
+                }
             }
         }
     }
@@ -175,26 +241,32 @@ impl AdamW {
     pub fn clip_grad_norm(&self, g: &mut Graph, max_norm: f32) -> (f32, f32) {
         let mut sum_sq = 0.0_f64;
 
+        let stream_opt = match &g.device {
+            Device::Gpu(_, s) => Some(s.clone()),
+            Device::Cpu => None,
+        };
+
         for &p_id in &self.params {
-            let grad_cpu: Vec<f32> = match &g.tensors[p_id].grad {
-                Storage::Cpu(v) => v.clone(),
+            match &g.tensors[p_id].grad {
+                Storage::Cpu(v) => {
+                    for &x in v {
+                        let xf = x as f64;
+                        sum_sq += xf * xf;
+                    }
+                }
                 Storage::Gpu(s) => {
-                    let stream = match &g.tensors[p_id].device {
-                        Device::Gpu(_, stream) => stream,
-                        Device::Cpu => unreachable!("GPU grad must belong to GPU tensor"),
-                    };
-                    stream
+                    let stream = stream_opt.as_ref().expect("GPU grad but no GPU stream");
+                    let host = stream
                         .clone_dtoh(s)
-                        .expect("Failed to copy gradient from VRAM")
+                        .expect("Failed to copy gradient from VRAM");
+                    for &x in &host {
+                        let xf = x as f64;
+                        sum_sq += xf * xf;
+                    }
                 }
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
             };
-
-            for &x in &grad_cpu {
-                let xf = x as f64;
-                sum_sq += xf * xf;
-            }
         }
 
         let grad_norm = (sum_sq.sqrt()) as f32;
@@ -205,10 +277,6 @@ impl AdamW {
         };
 
         if clip_coef < 1.0 {
-            let stream_opt = match &g.device {
-                Device::Gpu(_, s) => Some(s.clone()),
-                Device::Cpu => None,
-            };
             let scale_fn_opt = stream_opt
                 .as_ref()
                 .map(|_| g.functions.get("scale_f32").unwrap().clone());
@@ -263,67 +331,199 @@ impl AdamW {
         let adamw_fn_opt = stream_opt
             .as_ref()
             .map(|_| g.functions.get("adamw_step_f32").unwrap().clone());
+        #[cfg(feature = "bf16")]
+        let adamw_bf16mom_fn_opt = if g.uses_bf16_mixed_precision() {
+            stream_opt
+                .as_ref()
+                .map(|_| g.functions.get("adamw_step_bf16mom_f32").unwrap().clone())
+        } else {
+            None
+        };
+        #[cfg(feature = "bf16")]
+        let adamw_bf16w_fn_opt = if g.uses_bf16_mixed_precision() {
+            stream_opt.as_ref().map(|_| {
+                g.functions
+                    .get("adamw_step_bf16w_bf16mom_f32")
+                    .unwrap()
+                    .clone()
+            })
+        } else {
+            None
+        };
 
         for &p_id in &self.params {
             let size = g.tensors[p_id].shape.iter().product::<usize>();
+            #[cfg(feature = "bf16")]
+            let is_gpu = matches!(&g.tensors[p_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
+            #[cfg(not(feature = "bf16"))]
             let is_gpu = matches!(&g.tensors[p_id].data, Storage::Gpu(_));
 
             if is_gpu {
                 // ── Fused GPU kernel path ──────────────────────────────────────
                 let stream = stream_opt.as_ref().expect("GPU param but no GPU stream");
-                let f = adamw_fn_opt.as_ref().unwrap().clone();
 
-                // Lazy-init VRAM moment buffers
-                if !self.m_gpu.contains_key(&p_id) {
-                    self.m_gpu.insert(
-                        p_id,
-                        stream
-                            .alloc_zeros::<f32>(size)
-                            .expect("AdamW: failed to alloc m moment in VRAM"),
-                    );
-                    self.v_gpu.insert(
-                        p_id,
-                        stream
-                            .alloc_zeros::<f32>(size)
-                            .expect("AdamW: failed to alloc v moment in VRAM"),
-                    );
-                }
-
-                let weights = match &g.tensors[p_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
                 let grads = match &g.tensors[p_id].grad {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
-                let m_s = self.m_gpu.get(&p_id).unwrap();
-                let v_s = self.v_gpu.get(&p_id).unwrap();
 
                 let n = size as u64;
-                let mut builder = stream.launch_builder(&f);
-                builder
-                    .arg(weights)
-                    .arg(grads)
-                    .arg(m_s)
-                    .arg(v_s)
-                    .arg(&self.lr)
-                    .arg(&self.beta1)
-                    .arg(&self.beta2)
-                    .arg(&self.eps)
-                    .arg(&self.weight_decay)
-                    .arg(&bc1)
-                    .arg(&bc2)
-                    .arg(&n);
-                unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                #[cfg(feature = "bf16")]
+                if adamw_bf16mom_fn_opt.is_some() {
+                    // Lazy-init BF16 moment buffers (if init_moments wasn't called)
+                    if !self.m_gpu_bf16.contains_key(&p_id) {
+                        self.m_gpu_bf16.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<u16>(size)
+                                .expect("AdamW: failed to alloc BF16 m moment in VRAM"),
+                        );
+                        self.v_gpu_bf16.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<u16>(size)
+                                .expect("AdamW: failed to alloc BF16 v moment in VRAM"),
+                        );
+                    }
+                    let m_s = self.m_gpu_bf16.get(&p_id).unwrap();
+                    let v_s = self.v_gpu_bf16.get(&p_id).unwrap();
+                    match &g.tensors[p_id].data {
+                        Storage::Gpu(weights) => {
+                            let f = adamw_bf16mom_fn_opt.as_ref().unwrap().clone();
+                            let mut builder = stream.launch_builder(&f);
+                            builder
+                                .arg(weights)
+                                .arg(grads)
+                                .arg(m_s)
+                                .arg(v_s)
+                                .arg(&self.lr)
+                                .arg(&self.beta1)
+                                .arg(&self.beta2)
+                                .arg(&self.eps)
+                                .arg(&self.weight_decay)
+                                .arg(&bc1)
+                                .arg(&bc2)
+                                .arg(&n);
+                            unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                                .unwrap();
+                        }
+                        Storage::GpuBf16(weights) => {
+                            let f = adamw_bf16w_fn_opt.as_ref().unwrap().clone();
+                            let mut builder = stream.launch_builder(&f);
+                            builder
+                                .arg(weights)
+                                .arg(grads)
+                                .arg(m_s)
+                                .arg(v_s)
+                                .arg(&self.lr)
+                                .arg(&self.beta1)
+                                .arg(&self.beta2)
+                                .arg(&self.eps)
+                                .arg(&self.weight_decay)
+                                .arg(&bc1)
+                                .arg(&bc2)
+                                .arg(&n);
+                            unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                                .unwrap();
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    // Lazy-init FP32 moment buffers (if init_moments wasn't called)
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc m moment in VRAM"),
+                        );
+                        self.v_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc v moment in VRAM"),
+                        );
+                    }
+                    let weights = match &g.tensors[p_id].data {
+                        Storage::Gpu(s) => s,
+                        _ => panic!("FP32 AdamW kernel requires FP32 GPU weights"),
+                    };
+                    let f = adamw_fn_opt.as_ref().unwrap().clone();
+                    let m_s = self.m_gpu.get(&p_id).unwrap();
+                    let v_s = self.v_gpu.get(&p_id).unwrap();
+                    let mut builder = stream.launch_builder(&f);
+                    builder
+                        .arg(weights)
+                        .arg(grads)
+                        .arg(m_s)
+                        .arg(v_s)
+                        .arg(&self.lr)
+                        .arg(&self.beta1)
+                        .arg(&self.beta2)
+                        .arg(&self.eps)
+                        .arg(&self.weight_decay)
+                        .arg(&bc1)
+                        .arg(&bc2)
+                        .arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                }
+                #[cfg(not(feature = "bf16"))]
+                {
+                    // Lazy-init FP32 moment buffers
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc m moment in VRAM"),
+                        );
+                        self.v_gpu.insert(
+                            p_id,
+                            stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW: failed to alloc v moment in VRAM"),
+                        );
+                    }
+                    let weights = match &g.tensors[p_id].data {
+                        Storage::Gpu(s) => s,
+                        _ => panic!("FP32 AdamW kernel requires FP32 GPU weights"),
+                    };
+                    let f = adamw_fn_opt.as_ref().unwrap().clone();
+                    let m_s = self.m_gpu.get(&p_id).unwrap();
+                    let v_s = self.v_gpu.get(&p_id).unwrap();
+                    let mut builder = stream.launch_builder(&f);
+                    builder
+                        .arg(weights)
+                        .arg(grads)
+                        .arg(m_s)
+                        .arg(v_s)
+                        .arg(&self.lr)
+                        .arg(&self.beta1)
+                        .arg(&self.beta2)
+                        .arg(&self.eps)
+                        .arg(&self.weight_decay)
+                        .arg(&bc1)
+                        .arg(&bc2)
+                        .arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                }
             } else {
                 // ── CPU path (streaming weights, or pure CPU graph) ────────────
                 let m = self.m_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
                 let v = self.v_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
 
-                // Borrow grad first (immutable clone), then weight (mutable)
-                let grad_data = g.tensors[p_id].grad.as_cpu().clone();
-                let weight_data = g.tensors[p_id].data.as_cpu_mut();
+                let tensor = &mut g.tensors[p_id];
+                
+                // Borrow grad and weight robustly via field splitting 
+                let (data_storage, grad_storage) = (&mut tensor.data, &tensor.grad);
+                let weight_data = match data_storage {
+                    Storage::Cpu(vec) => vec,
+                    _ => unreachable!(),
+                };
+                let grad_data = match grad_storage {
+                    Storage::Cpu(vec) => vec,
+                    _ => unreachable!(),
+                };
 
                 for i in 0..size {
                     let grad = grad_data[i];

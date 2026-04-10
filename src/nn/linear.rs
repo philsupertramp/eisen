@@ -19,6 +19,13 @@ impl Linear {
             weight_data[i] = rand_val * limit;
         }
 
+        #[cfg(feature = "bf16")]
+        let weight_id = if g.uses_bf16_mixed_precision() {
+            g.alloc_param_bf16(vec![in_features, out_features], weight_data)
+        } else {
+            g.alloc(vec![in_features, out_features], weight_data)
+        };
+        #[cfg(not(feature = "bf16"))]
         let weight_id = g.alloc(vec![in_features, out_features], weight_data);
 
         let bias_id = if use_bias {
@@ -47,11 +54,18 @@ impl Module for Linear {
         // Without the feature, plain FP32 matmul is used (identical to
         // the original behaviour).
         // ---------------------------------------------------------------
-        #[cfg(feature = "bf16")]
-        let out_id = g.matmul_bf16(x_id, self.weight_id);
-
-        #[cfg(not(feature = "bf16"))]
-        let out_id = g.matmul(x_id, self.weight_id);
+        let out_id = if g.uses_bf16_mixed_precision() {
+            #[cfg(feature = "bf16")]
+            {
+                g.matmul_bf16(x_id, self.weight_id)
+            }
+            #[cfg(not(feature = "bf16"))]
+            {
+                g.matmul(x_id, self.weight_id)
+            }
+        } else {
+            g.matmul(x_id, self.weight_id)
+        };
 
         let out_biased_id = if let Some(b_id) = self.bias_id {
             g.add(out_id, b_id)

@@ -8,11 +8,28 @@ use eisen::data::tokenizer::BPETokenizer;
 use eisen::tensor::Device;
 use cudarc::driver::CudaContext;
 
+use serde::Deserialize;
 use std::env;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 use rand::Rng; // Requires `rand` crate in Cargo.toml
+
+// --- Configuration Structs ---
+
+#[derive(Deserialize, Debug)]
+struct RunManifest {
+    hyperparams: Hyperparams,
+}
+
+#[derive(Deserialize, Debug)]
+struct Hyperparams {
+    hidden_dim: usize,
+    num_heads: usize,
+    ffn_dim: usize,
+    num_layers: usize,
+    seq_len: usize,
+}
 
 // --- Advanced Sampling Configuration & Logic ---
 
@@ -164,6 +181,10 @@ fn load_weights(g: &mut Graph, params: &[usize], path: &str) {
 fn main() {
     println!("=== Eisen Interactive CLI ===");
     let args: Vec<String> = env::args().collect();
+    if args.len() < 2 {
+        eprintln!("Usage: {} <cpu|gpu>", args[0]);
+        std::process::exit(1);
+    }
     let device_type = &args[1];
 
     let device: Device = if device_type == "gpu" {
@@ -174,15 +195,24 @@ fn main() {
         Device::Cpu
     };
 
+    println!("Loading tokenizer...");
     let tokenizer = BPETokenizer::load("data/tokenizer.model").unwrap();
     let vocab_size = tokenizer.vocab.len();
 
-    // 13.8M Param Architecture
-    let seq_len = 256;
-    let hidden_dim = 768;
-    let num_heads = 12;
-    let num_layers = 12;
-    let ffn_dim = 2048;
+    // Dynamically load architecture parameters from the run manifest
+    println!("Reading model configuration from run manifest...");
+    let manifest_path = "data/run_manifest.json";
+    let manifest_file = File::open(manifest_path).expect("Could not find data/run_manifest.json! Please ensure training has completed.");
+    let manifest: RunManifest = serde_json::from_reader(manifest_file).expect("Failed to parse run_manifest.json");
+
+    let seq_len = manifest.hyperparams.seq_len;
+    let hidden_dim = manifest.hyperparams.hidden_dim;
+    let num_heads = manifest.hyperparams.num_heads;
+    let num_layers = manifest.hyperparams.num_layers;
+    let ffn_dim = manifest.hyperparams.ffn_dim;
+
+    println!("Loaded Architecture: Layers={}, Hidden={}, Heads={}, FFN={}, SeqLen={}", 
+             num_layers, hidden_dim, num_heads, ffn_dim, seq_len);
 
     let mut g = Graph::new(device);
     let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers);
@@ -194,7 +224,7 @@ fn main() {
     g.no_grad = true;
     
     println!("Loading weights from checkpoint...");
-    load_weights(&mut g, &model.params(), "data/eisen_model_70m.bin");
+    load_weights(&mut g, &model.params(), "data/eisen_model.bin"); // Swapped to default output name from training script
 
     // Initialize our advanced sampler config
     let sampler_config = SamplerConfig {
