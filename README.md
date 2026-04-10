@@ -69,9 +69,9 @@
 
 *Focus: Ecosystem interoperability.*
 
-* \[ \] **Weight Exporter:** Write a .safetensors binary writer to export Eisen parameters.  
-* \[ \] **Config Generator:** Script to output config.json compatible with Llama-style architectures.  
-* \[ \] **Milestone 7:** Load the custom Rust model natively in Python transformers for inference.
+* \[x\] **Weight Exporter:** Write a .safetensors binary writer to export Eisen parameters.  
+* \[x\] **Config Generator:** Script to output config.json compatible with Llama-style architectures.  
+* \[x\] **Milestone 7:** Load the custom Rust model natively in Python transformers for inference.
 
 Quick smoke workflow:
 1. `cargo run --example train_tiny_hf_smoke`
@@ -81,9 +81,9 @@ Quick smoke workflow:
 
 *Focus: Training stability*
 
-* \[ \] **Improved EisenBoard:** Make the Eisenboard a dedicated crate. Add more metrics and information to EisenBoard.
-* \[ \] **Gradient Clipping:** To protect against occasional exploding gradients
-* \[ \] **Determinism/Reproducibility:** Add reproducibility controls and run manifest logging (rng seed, determinism, run manifests)
+* \[x\] **Improved EisenBoard:** Make the Eisenboard a dedicated crate. Add more metrics and information to EisenBoard.
+* \[x\] **Gradient Clipping:** To protect against occasional exploding gradients
+* \[x\] **Determinism/Reproducibility:** Add reproducibility controls and run manifest logging (rng seed, determinism, run manifests)
 * \[ \] **Fuse OPs:** Fuse attention scale and masking operations to remove per-step large tensor allocations
 * \[ \] **Improved Checkpointing:** Expand checkpoints to include optimizer, and training progress state
 
