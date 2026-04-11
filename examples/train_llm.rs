@@ -364,6 +364,7 @@ fn main() {
 
     let mut last_grad_norm = 0.0_f32;
     let mut last_clip_coef = 1.0_f32;
+    let mut best_loss = f32::MAX;
 
     g.print_vram_state("Optimizer init");
 
@@ -481,7 +482,10 @@ fn main() {
         }
 
         // ── Checkpoint ────────────────────────────────────────────────────────
-        if step % save_interval == 0 && step > 0 {
+        // We ensure step_loss is strictly lower AND ignore any random NaN spikes
+        if step_loss < best_loss && !step_loss.is_nan() {
+            println!("🚀 NEW BEST LOSS: {:.4} (previous was {:.4})", step_loss, best_loss);
+            best_loss = step_loss;
             save_weights(&g, output_path);
             save_hf_bundle(
                 &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len,
