@@ -85,8 +85,6 @@ fn write_run_manifest(path: &str, content: &str) {
     println!("Run manifest written to {}", path);
 }
 
-// ─── EisenBoard (dedicated crate: `eisenboard`) ─────────────────────────────
-
 // ─── Checkpoint I/O ───────────────────────────────────────────────────────────
 
 fn save_weights(g: &Graph, path: &str) {
@@ -102,6 +100,7 @@ fn save_weights(g: &Graph, path: &str) {
     w.flush().unwrap();
     println!("Checkpoint saved ({} param tensors).", g.num_params);
 }
+
 fn save_hf_bundle(
     g: &Graph,
     model: &TransformerLM,
@@ -148,10 +147,10 @@ fn main() {
     spawn_eisenboard(shared_stats.clone(), &board_bind);
 
     // ── Paths ────────────────────────────────────────────────────────────────
-    let tokenizer_path = "data/tokenizer.model";
-    let bin_path = "data/german_large_corpus.bin";
-    let output_path = "data/eisen_model.bin";
-    let hf_out_dir = "data/hf_export";
+    let tokenizer_path = "data/tinystory_tokenizer.model";
+    let bin_path = "data/german_tinystory_corpus.bin";
+    let output_path = "data/eisen_model_tinystory.bin";
+    let hf_out_dir = "data/hf_export_tinystory";
 
     let grad_clip_norm = env_f32("EISEN_GRAD_CLIP_NORM", 1.0);
     let seed = env_u64("EISEN_SEED", 1337);
@@ -168,43 +167,29 @@ fn main() {
     println!("Vocab size: {}", vocab_size);
 
     // ── Architecture ─────────────────────────────────────────────────────────
-    //
-    // 1.07B parameters:
-    //   Transformer blocks : 48 × (4×1536² + 2×1536×4096 + 2×1536) = 1.057B
-    //   Embedding + head   : 2 × 4096 × 1536                        = 12.6M
-    //   Final norm         : 1536                                    = ~0
-    //   ──────────────────────────────────────────────────────────────────────
-    //   Total              : ~1.07B
-    //
     let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 1536);
-    let num_heads = env_usize("EISEN_NUM_HEADS", 12); // head_dim = hidden/heads
+    let num_heads = env_usize("EISEN_NUM_HEADS", 12);
     let ffn_dim = env_usize("EISEN_FFN_DIM", 4096);
     let num_layers = env_usize("EISEN_NUM_LAYERS", 48);
 
     // ── Training hyperparameters ─────────────────────────────────────────────
-    //
-    // Effective batch = micro_batch × accum_steps = 2 × 8 = 16 sequences
-    // Effective tokens per step = 16 × 128 = 2,048
-    //
-    // LR recipe (Chinchilla-style):
-    //   Warmup 1,000 steps → cosine decay to lr_min over 100,000 steps
-    //   Peak lr 3e-4 is standard for models in this range with AdamW
-    //
     let seq_len = env_usize("EISEN_SEQ_LEN", 512);
-    // Keep this conservative by default: attention transpose/bmm activations
-    // can still OOM at 4 on smaller consumer GPUs even with streaming.
     let micro_batch_size = env_usize("EISEN_MICRO_BATCH", 2);
     let accum_steps = env_usize("EISEN_ACCUM_STEPS", 32);
     let effective_batch = micro_batch_size * accum_steps;
     let tokens_per_step = effective_batch * seq_len;
     let tokens_per_micro = micro_batch_size * seq_len;
 
+    let epochs = env_usize("EISEN_EPOCHS", 1);
+    let mut current_epoch = 1;
+
     let mut dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
 
-    let total_steps = dataloader.total_batches();
-    let warmup_steps = total_steps / 20;
-    let lr_max = 4e-4_f32;
-    let lr_min = 4e-5_f32;
+    // Scale the total steps based on the number of epochs requested
+    let total_steps = dataloader.total_batches() * epochs;
+    let warmup_steps = 0usize;
+    let lr_max = 1e-3_f32;
+    let lr_min = 1e-4_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
@@ -214,18 +199,12 @@ fn main() {
     println!("\nBuilding model…");
     let mut g = Graph::new(device);
     let model = TransformerLM::new(
-        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers, seq_len
+        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers
     );
 
-    // Lock the parameter watermark before plan_streaming inspects it
     g.mark_params();
 
     println!("Pinning model...");
-    // Pinned params: always stay in VRAM.
-    // - token_emb: looked up every forward pass, very cheap to keep resident
-    // - norm_f:    tiny (1536 floats), used in final layer
-    // - lm_head:   large but accessed every step; streaming it would add
-    //              vocab×hidden×3 PCIe traffic every micro-batch
     let pinned: Vec<usize> = model
         .token_emb
         .params()
@@ -235,8 +214,6 @@ fn main() {
         .collect();
 
     println!("Planing memory streaming...");
-    // For 512 seq_len, activations take ~3-4GB of VRAM. We increase the reserve
-    // and adjust the budget assuming a standard 8GB GPU to force weight streaming.
     let vram_budget_mb = env_usize("EISEN_VRAM_BUDGET_MB", 6144);
     let reserve_mb = env_usize("EISEN_ACTIVATION_RESERVE_MB", 4096);
     let report = g.plan_streaming(
@@ -248,14 +225,12 @@ fn main() {
 
     g.print_vram_state("Model init.");
 
-    // ── Optimizer (AFTER plan_streaming) ─────────────────────────────────────
-    // We pre-allocate moment buffers here rather than lazily on the first step.
-    // plan_streaming already converted overflow params to Storage::Cpu,
-    // so AdamW will correctly allocate CPU moments for those params.
+    // ── Optimizer ────────────────────────────────────────────────────────────
     let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
     optim.weight_decay = 0.1;
     optim.beta1 = 0.9;
     optim.beta2 = 0.95;
+    optim.eps = 1e-8;
     optim.set_grad_clip_norm(grad_clip_norm);
 
     println!("Pre-allocating optimizer moment buffers...");
@@ -266,6 +241,7 @@ fn main() {
         .iter()
         .map(|&id| g.tensors[id].shape.iter().product::<usize>())
         .sum();
+        
     println!("\nArchitecture summary:");
     println!("Trainable parameters: {}", total_params);
     println!(
@@ -277,8 +253,8 @@ fn main() {
         micro_batch_size, accum_steps, effective_batch
     );
     println!(
-        "  Tokens/step: {} | Total steps: {}",
-        tokens_per_step, total_steps
+        "  Tokens/step: {} | Total steps: {} ({} Epochs)",
+        tokens_per_step, total_steps, epochs
     );
     println!(
         "  LR: {:.1e} → {:.1e} over {} steps ({} warmup)",
@@ -333,11 +309,12 @@ fn main() {
     }
 
     let run_manifest = format!(
-        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
         started_unix,
         run_seed,
         deterministic,
         grad_clip_max_norm,
+        epochs,
         hidden_dim,
         num_heads,
         ffn_dim,
@@ -354,7 +331,7 @@ fn main() {
     write_run_manifest(&manifest_path, &run_manifest);
 
     // ── Training loop ─────────────────────────────────────────────────────────
-    println!("\nStarting training…");
+    println!("\nStarting training (Epoch 1/{})...", epochs);
     let mut step = 0_usize;
     let mut running_loss = 0.0_f32;
     let mut cumulative_tokens = 0_usize;
@@ -380,26 +357,32 @@ fn main() {
         let mut step_loss = 0.0_f32;
         let mut micro_count = 0_usize;
 
-        // ── Gradient accumulation inner loop ──────────────────────────────────
-        //
-        // zero_grad is called ONCE per optimizer step, before this loop.
-        // Each micro-batch backward accumulates into the same grad buffers:
-        //   - GPU-resident params: atomicAdd in VRAM
-        //   - CPU-streamed params: Vec += in matmul_streamed backward closure
-        //
-        // With checkpointing: no_grad forward → restore_save_point → recompute
-        // is NOT used here because the streaming temp itself is sync-freed
-        // immediately, so the VRAM overhead without checkpointing is acceptable
-        // for this micro_batch_size. Add gradient checkpointing if you scale
-        // to micro_batch_size > 4 or seq_len > 512.
         for _ in 0..accum_steps {
             let batch = match dataloader.next_batch() {
                 Some(b) => b,
                 None => {
-                    println!("\nDataset exhausted at step {}.", step);
-                    break 'training;
+                    if current_epoch < epochs {
+                        current_epoch += 1;
+                        println!("\nDataset exhausted. Starting Epoch {}/{} at step {}...", current_epoch, epochs, step);
+                        
+                        // Re-instantiate dataloader for the new epoch
+                        dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
+                        
+                        // Grab the first batch of the new epoch
+                        match dataloader.next_batch() {
+                            Some(b) => b,
+                            None => {
+                                println!("\nDataset is completely empty.");
+                                break 'training;
+                            }
+                        }
+                    } else {
+                        println!("\nDataset exhausted at step {}. Target epochs ({}) reached.", step, epochs);
+                        break 'training;
+                    }
                 }
             };
+            
             let (x_batch, y_batch) = batch;
             let tokens_this_micro = micro_batch_size * seq_len;
 
@@ -441,8 +424,8 @@ fn main() {
             let avg = running_loss / log_interval as f32;
 
             println!(
-                "Step {:06} | Loss {:.4} | LR {:.2e} | {:.0} tok/s",
-                step, avg, current_lr, throughput
+                "Epoch {} | Step {:06} | Loss {:.4} | LR {:.2e} | {:.0} tok/s",
+                current_epoch, step, avg, current_lr, throughput
             );
 
             running_loss = 0.0;
@@ -482,10 +465,9 @@ fn main() {
         }
 
         // ── Checkpoint ────────────────────────────────────────────────────────
-        // We ensure step_loss is strictly lower AND ignore any random NaN spikes
-        if step_loss < best_loss && !step_loss.is_nan() {
-            println!("🚀 NEW BEST LOSS: {:.4} (previous was {:.4})", step_loss, best_loss);
-            best_loss = step_loss;
+        if avg_loss < best_loss && !avg_loss.is_nan() {
+            println!("🚀 NEW BEST LOSS: {:.4} (previous was {:.4})", avg_loss, best_loss);
+            best_loss = avg_loss;
             save_weights(&g, output_path);
             save_hf_bundle(
                 &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len,
@@ -536,15 +518,24 @@ fn main() {
         .unwrap()
         .as_secs();
     let completed_manifest = format!(
-        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"finished_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"steps_completed\": {},\n  \"tokens_processed\": {},\n  \"last_grad_norm\": {:.6},\n  \"last_clip_coef\": {:.6}\n}}",
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
         started_unix,
-        finished_unix,
         run_seed,
         deterministic,
-        step,
-        cumulative_tokens,
-        last_grad_norm,
-        last_clip_coef,
+        grad_clip_max_norm,
+        epochs,
+        hidden_dim,
+        num_heads,
+        ffn_dim,
+        num_layers,
+        seq_len,
+        micro_batch_size,
+        accum_steps,
+        effective_batch,
+        lr_max,
+        lr_min,
+        warmup_steps,
+        total_steps,
     );
     write_run_manifest(&manifest_path, &completed_manifest);
 

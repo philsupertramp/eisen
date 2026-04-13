@@ -187,6 +187,18 @@ fn main() {
     }
     let device_type = &args[1];
 
+    let mut tokenizer_file = "./data/tokenizer.model";
+    let mut model_file = "data/eisen_model.bin";
+
+    if args.len() > 2 {
+        if args.len() < 4 {
+            eprintln!("Usage: {} <cpu|gpu> <tokenizer_file> <model_file>", args[0]);
+            std::process::exit(1);
+        }
+        tokenizer_file = &args[2];
+        model_file = &args[3];
+    }
+
     let device: Device = if device_type == "gpu" {
         println!("Using GPU");
         setup_gpu().expect("CUDA is required!")
@@ -224,14 +236,14 @@ fn main() {
     g.no_grad = true;
     
     println!("Loading weights from checkpoint...");
-    load_weights(&mut g, &model.params(), "data/eisen_model.bin"); // Swapped to default output name from training script
+    load_weights(&mut g, &model.params(), model_file);
 
     // Initialize our advanced sampler config
     let sampler_config = SamplerConfig {
-        temperature: 0.5,
-        top_k: 50,
-        top_p: 0.9,
-        repetition_penalty: 1.05,
+        temperature: 0.2,
+        top_k: 40,
+        top_p: 0.85,
+        repetition_penalty: 1.2,
     };
 
     println!("\nModel ready! Type your prompt below. Type 'exit' to quit.");
@@ -246,7 +258,8 @@ fn main() {
         input.clear();
         io::stdin().read_line(&mut input).unwrap();
         
-        let mut prompt = input.trim().to_owned();
+        let mut prompt: String = "<story>\n".to_string();
+        prompt.push_str(input.trim());
         if prompt == "exit" { break; }
         if prompt.is_empty() { continue; }
 

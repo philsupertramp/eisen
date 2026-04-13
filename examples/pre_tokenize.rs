@@ -161,13 +161,13 @@ pub fn pre_tokenize_multithreaded(txt_input_path: &str, bin_output_path: &str, s
 
 fn main() {
     let tokenizer = Arc::new(
-        BPETokenizer::load("data/tokenizer.model")
-            .expect("Train the tokenizer first with tools/train_tokenizer.rs!")
+        BPETokenizer::load("data/tinystory_tokenizer.model")
+            .expect("Train the tokenizer first with examples/train_tokenizer.rs!")
     );
 
     pre_tokenize_multithreaded(
-        "data/german_large_corpus.txt", 
-        "data/german_large_corpus.bin", 
+        "data/german_tiny_story_corpus.txt", 
+        "data/german_tinystory_corpus.bin", 
         "data/preprocess_state.txt",
         tokenizer
     );

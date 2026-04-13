@@ -7,11 +7,11 @@ use rand::Rng;
 /// The entry point for training our German BPE model on large datasets.
 fn main() {
     // --- CONFIGURATION ---
-    let input_path = "data/german_large_corpus.txt"; // The output from your Python script
-    let output_tokenizer_path = "data/tokenizer.model";
-    let cache_path = "data/sampled_training_text.txt"; // State recovery cache
-    let target_vocab_size = 4096; // Larger vocab for complex German compounds
-    let sample_size_mb = 50;     // Statistical sample size (50MB is plenty for BPE)
+    let input_path = "data/german_tiny_story_corpus.txt"; // The output from your Python script
+    let output_tokenizer_path = "data/tinystory_tokenizer.model";
+    let cache_path = "data/tinystory_sampled_training_text.txt"; // State recovery cache
+    let target_vocab_size = 16384; // Larger vocab for complex German compounds
+    let sample_size_mb = 50 * 1024 * 1024;     // Statistical sample size (50MB is plenty for BPE)
 
     println!("=== Eisen Tokenizer Trainer ===");
     
@@ -25,7 +25,7 @@ fn main() {
         let mut file = File::open(input_path).expect("Could not open data file. Did you run the Python extractor?");
         let file_size = file.metadata().expect("Could not get file metadata").len();
         
-        let sample_bytes = sample_size_mb * 1024 * 1024;
+        let sample_bytes = sample_size_mb;
         let mut text = String::with_capacity(sample_bytes);
         
         println!("Dataset: {} ({:.2} GB)", input_path, file_size as f64 / 1e9);

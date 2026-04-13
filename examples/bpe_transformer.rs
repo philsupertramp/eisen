@@ -135,60 +135,49 @@ impl BPETokenizer {
     fn decode(&self, ids: &[usize]) -> String {
         ids.iter().map(|&id| self.vocab.get(id).cloned().unwrap_or_default()).collect()
     }
-}
 
-/// True GPT-Style Causal Language Model
-struct TransformerLM {
-    token_emb: Embedding,
-    blocks: Vec<TransformerBlock>,
-    norm_f: RMSNorm,
-    lm_head: Linear,
-}
-
-impl TransformerLM {
-    fn new(g: &mut Graph, vocab_size: usize, hidden_dim: usize, num_heads: usize, ffn_dim: usize, num_layers: usize) -> Self {
-        let token_emb = Embedding::new(g, vocab_size, hidden_dim);
-        
-        let mut blocks = Vec::new();
-        for _ in 0..num_layers {
-            blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim));
+    /// Exports the tokenizer to a Hugging Face compatible tokenizer.json file
+    fn export_huggingface(&self, file_path: &str) {
+        // 1. Build the vocabulary mapping
+        let mut hf_vocab = std::collections::HashMap::new();
+        for (id, token) in self.vocab.iter().enumerate() {
+            hf_vocab.insert(token.clone(), id);
         }
-        
-        let norm_f = RMSNorm::new(g, hidden_dim, 1e-5);
-        let lm_head = Linear::new(g, hidden_dim, vocab_size, false); // No bias in modern LM heads
 
-        Self { token_emb, blocks, norm_f, lm_head }
-    }
-}
+        // 2. Recover merge order by sorting by the newly created token ID
+        let mut ordered_merges: Vec<(&(usize, usize), &usize)> = self.merges.iter().collect();
+        ordered_merges.sort_by_key(|&(_, &id)| id);
 
-impl Module for TransformerLM {
-    fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
-        // 1. Embed Tokens: [Batch, Seq] -> [Batch, Seq, HiddenDim]
-        let mut h_id = self.token_emb.forward(g, x_id);
-        
-        // 2. Pass through Transformer Blocks (with RoPE and Causal Masking applied internally!)
-        for block in &self.blocks {
-            h_id = block.forward_with_mask(g, h_id, true);
+        // 3. Format merges as space-separated strings
+        let mut hf_merges = Vec::new();
+        for (&(left_id, right_id), _) in ordered_merges {
+            let left_token = &self.vocab[left_id];
+            let right_token = &self.vocab[right_id];
+            hf_merges.push(format!("{} {}", left_token, right_token));
         }
-        
-        // 3. Final Pre-Norm
-        h_id = self.norm_f.forward(g, h_id);
-        
-        // 4. LM Head Projection: [Batch, Seq, HiddenDim] -> [Batch, Seq, VocabSize]
-        self.lm_head.forward(g, h_id)
-    }
 
-    fn params(&self) -> Vec<usize> {
-        let mut p = Vec::new();
-        p.extend(self.token_emb.params());
-        for block in &self.blocks { p.extend(block.params()); }
-        p.extend(self.norm_f.params());
-        p.extend(self.lm_head.params());
-        p
+        // 4. Construct the standard Hugging Face tokenizer JSON schema
+        let hf_tokenizer = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "BPE",
+                "vocab": hf_vocab,
+                "merges": hf_merges
+            }
+        });
+
+        // 5. Write to disk
+        std::fs::write(
+            file_path,
+            serde_json::to_string_pretty(&hf_tokenizer).expect("Failed to serialize JSON"),
+        ).expect("Failed to write tokenizer.json to disk");
+        
+        println!("Exported Hugging Face tokenizer to {}", file_path);
     }
 }
 
 fn main() {
+    use crate::nn::transformer::TransformerLM;
     println!("=== Eisen Phase 5: BPE Tokenization + Transformer LLM on GPU ===");
     
     let device = setup_gpu().expect("This Transformer example requires a CUDA GPU!");
