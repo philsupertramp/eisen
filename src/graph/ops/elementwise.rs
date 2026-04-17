@@ -132,10 +132,6 @@ impl Graph {
 
                 // Backward: grads are always FP32 — use accumulate_f32 unchanged
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
                     let a_grad_gpu = match &tensors[a_id].grad {
                         Storage::Gpu(s) => Some(s),
                         _ => None,
@@ -147,6 +143,10 @@ impl Graph {
 
                     // accumulate_f32 signature: (grad_target, grad_out, n, rank, s*, t*)
                     let launch_accum = |tgt: &CudaSlice<f32>, t_str: [u64; 3]| {
+                        let out_grad = match &tensors[out_id].grad {
+                            Storage::Gpu(s) => s,
+                            _ => unreachable!(),
+                        };
                         let mut b1 = stream_clone.launch_builder(&f_accumulate);
                         b1.arg(tgt)
                             .arg(out_grad)
@@ -164,9 +164,15 @@ impl Graph {
                     if let Some(a_grad) = a_grad_gpu {
                         launch_accum(a_grad, a_str);
                     } else if let Storage::Cpu(v) = &mut tensors[a_id].grad {
-                        let out_grad_host = stream_clone
-                            .clone_dtoh(out_grad)
-                            .expect("add backward: dtoh failed for out_grad (a)");
+                        let out_grad_host = {
+                            let out_grad = match &tensors[out_id].grad {
+                                Storage::Gpu(s) => s,
+                                _ => unreachable!(),
+                            };
+                            stream_clone
+                                .clone_dtoh(out_grad)
+                                .expect("add backward: dtoh failed for out_grad (a)")
+                        };
                         for i in 0..out_size {
                             let nd = Tensor::flat_to_nd(i, &out_shape);
                             v[Tensor::nd_to_flat(&nd, &a_strides)] += out_grad_host[i];
@@ -178,9 +184,15 @@ impl Graph {
                     if let Some(b_grad) = b_grad_gpu {
                         launch_accum(b_grad, b_str);
                     } else if let Storage::Cpu(v) = &mut tensors[b_id].grad {
-                        let out_grad_host = stream_clone
-                            .clone_dtoh(out_grad)
-                            .expect("add backward: dtoh failed for out_grad (b)");
+                        let out_grad_host = {
+                            let out_grad = match &tensors[out_id].grad {
+                                Storage::Gpu(s) => s,
+                                _ => unreachable!(),
+                            };
+                            stream_clone
+                                .clone_dtoh(out_grad)
+                                .expect("add backward: dtoh failed for out_grad (b)")
+                        };
                         for i in 0..out_size {
                             let nd = Tensor::flat_to_nd(i, &out_shape);
                             v[Tensor::nd_to_flat(&nd, &b_strides)] += out_grad_host[i];

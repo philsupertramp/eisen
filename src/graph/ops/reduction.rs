@@ -10,7 +10,6 @@ impl Graph {
         match &device {
             Device::Gpu(_, stream) => {
                 let a = &self.tensors[a_id];
-                let a_size = a.shape.iter().product::<usize>();
                 let mut out_shape = a.shape.clone();
                 let mut in_strides = a.strides.clone();
                 let reduced_dim_size = a.shape[dim] as u64;
@@ -198,7 +197,6 @@ impl Graph {
         match &device {
             Device::Gpu(_, stream) => {
                 let a = &self.tensors[a_id];
-                let a_size = a.shape.iter().product::<usize>();
                 let mut out_shape = a.shape.clone();
                 let mut in_strides = a.strides.clone();
                 let reduced_dim_size = a.shape[dim] as u64;

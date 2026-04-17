@@ -50,6 +50,7 @@ impl Graph {
                     self.functions.get("rmsnorm_backward_f32").unwrap().clone(),
                 );
 
+                #[cfg(feature = "bf16")]
                 let b_u16_slice: CudaSlice<u16>;
                 let out_id = self.alloc_pooled(x.shape.clone());
                 let (dim_u64, num_vecs_u64) = (dim as u64, num_vecs as u64);

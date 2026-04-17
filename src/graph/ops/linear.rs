@@ -6,12 +6,12 @@ use std::collections::HashMap;
 
 fn matmul_kernels(
     functions: &HashMap<String, CudaFunction>, 
-    a: &Storage, 
-    b: &Storage
+    _a: &Storage, 
+    _b: &Storage
 ) -> (CudaFunction, CudaFunction, CudaFunction) 
 {
     #[cfg(feature = "bf16")]
-    match (is_bf16(a), is_bf16(b)) {
+    match (is_bf16(_a), is_bf16(_b)) {
         (true, true) => (
             functions["matmul_bf16_f32"].clone(),
             functions["matmul_backward_a_bf16b_f32"].clone(),
