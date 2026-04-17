@@ -185,6 +185,8 @@ impl Graph {
                 "rope_f32",
                 "rope_backward_f32",
                 "adamw_step_f32",
+                "cross_entropy_masked_f32",
+                "cross_entropy_masked_backward_f32",
             ];
             for name in names {
                 let f = module
@@ -354,6 +356,19 @@ impl Graph {
                     stream
                         .memcpy_htod(host_data, gpu_slice)
                         .expect("Failed to copy weights from Host RAM to VRAM!");
+                } else {
+                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
+                }
+            }
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(cpu_vec) => {
+                if let Device::Gpu(_ctx, stream) = &self.device {
+                    // Convert f32 to bf16 by shifting off the lower 16 bits of the mantissa
+                    let u16_data: Vec<u16> = host_data
+                        .iter()
+                        .map(|&f| (f.to_bits() >> 16) as u16)
+                        .collect();
+                    cpu_vec.copy_from_slice(&u16_data);
                 } else {
                     panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
                 }
@@ -597,6 +612,17 @@ impl Graph {
                 u16_data
                     .into_iter()
                     .map(|b| f32::from_bits((b as u32) << 16))
+                    .collect()
+            }
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(s) => {
+                let (_, stream) = match &self.device {
+                    Device::Gpu(_, s) => (None::<f32>, s),
+                    _ => unreachable!(),
+                };
+                s
+                    .into_iter()
+                    .map(|b| f32::from_bits((*b as u32) << 16))
                     .collect()
             }
         }

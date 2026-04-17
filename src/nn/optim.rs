@@ -132,6 +132,13 @@ impl AdamW {
                         total_sq += xf * xf;
                     }
                 }
+                #[cfg(feature = "bf16")]
+                Storage::CpuBf16(v) => {
+                    for &x in v {
+                        let xf = x as f64;
+                        total_sq += xf * xf;
+                    }
+                }
                 Storage::Gpu(s) => {
                     let stream = stream_opt
                         .as_ref()
@@ -186,6 +193,8 @@ impl AdamW {
                 }
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
+                #[cfg(feature = "bf16")]
+                Storage::CpuBf16(v) => panic!("AdamW clip: BF16 grad storage is not supported."),
             }
         }
     }
@@ -266,6 +275,8 @@ impl AdamW {
                 }
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
+                #[cfg(feature = "bf16")]
+                Storage::CpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
             };
         }
 
@@ -300,6 +311,8 @@ impl AdamW {
                     }
                     #[cfg(feature = "bf16")]
                     Storage::GpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
+                    #[cfg(feature = "bf16")]
+                    Storage::CpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
                 }
             }
         }
@@ -508,37 +521,42 @@ impl AdamW {
                     unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
                 }
             } else {
-                // ── CPU path (streaming weights, or pure CPU graph) ────────────
+                // ── CPU path (streaming weights — either Cpu(f32) or CpuBf16) ──────────
                 let m = self.m_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
                 let v = self.v_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
 
-                let tensor = &mut g.tensors[p_id];
-                
-                // Borrow grad and weight robustly via field splitting 
-                let (data_storage, grad_storage) = (&mut tensor.data, &tensor.grad);
-                let weight_data = match data_storage {
-                    Storage::Cpu(vec) => vec,
-                    _ => unreachable!(),
-                };
-                let grad_data = match grad_storage {
-                    Storage::Cpu(vec) => vec,
-                    _ => unreachable!(),
-                };
+                // Borrow grad (always Cpu(f32))
+                let grad_data: Vec<f32> = g.tensors[p_id].grad.to_f32_vec();
+
+                // Read weights as f32 (decompresses CpuBf16 if needed)
+                let mut weights_f32: Vec<f32> = g.tensors[p_id].data.to_f32_vec();
 
                 for i in 0..size {
-                    let grad = grad_data[i];
-                    let weight = weight_data[i];
+                    let grad   = grad_data[i];
+                    let weight = weights_f32[i];
 
-                    // Decoupled weight decay (applied to weight, not gradient)
                     let decayed = weight * (1.0 - self.lr * self.weight_decay);
-
                     m[i] = self.beta1 * m[i] + (1.0 - self.beta1) * grad;
                     v[i] = self.beta2 * v[i] + (1.0 - self.beta2) * grad * grad;
-
                     let m_hat = m[i] * bc1;
                     let v_hat = v[i] * bc2;
+                    weights_f32[i] = decayed - self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                }
 
-                    weight_data[i] = decayed - self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                // Write back — recompress to BF16 if the weight was BF16 on CPU
+                #[cfg(feature = "bf16")]
+                {
+                    use crate::tensor::{Storage, f32_to_bf16u};
+                    if matches!(g.tensors[p_id].data, Storage::CpuBf16(_)) {
+                        let bf16_data: Vec<u16> = weights_f32.iter().map(|&f| f32_to_bf16u(f)).collect();
+                        g.tensors[p_id].data = Storage::CpuBf16(bf16_data);
+                    } else {
+                        g.tensors[p_id].data = Storage::Cpu(weights_f32);
+                    }
+                }
+                #[cfg(not(feature = "bf16"))]
+                {
+                    g.tensors[p_id].data = Storage::Cpu(weights_f32);
                 }
             }
         }

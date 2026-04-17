@@ -312,6 +312,7 @@ impl Graph {
             "matmul_bf16: lhs last dim must equal rhs first dim"
         );
         let device = self.device.clone();
+        self.ensure_on_gpu(b_id);
 
         match &device {
             Device::Gpu(_, stream) => {
@@ -389,6 +390,7 @@ impl Graph {
                     block_dim: (16, 16, 1),
                     shared_mem_bytes: 0,
                 };
+
                 match &self.tensors[b_id].data {
                     Storage::Gpu(b_fp32) => {
                         let mut builder = stream.launch_builder(&f_matmul_fp32rhs);
@@ -612,10 +614,8 @@ impl Graph {
         let stream_bwd = stream.clone();
 
         // ── Forward: htod b → kernel → SYNC → FREE ─────────────────────────────
-        let b_cpu = self.tensors[b_id].data.as_cpu().clone();
-        let b_temp_fwd = stream
-            .clone_htod(b_cpu.as_slice())
-            .expect("matmul_streamed: forward htod failed");
+        let b_f32_fwd = self.tensors[b_id].data.to_f32_vec();
+        let b_temp_fwd = stream.clone_htod(b_f32_fwd.as_slice()).expect("matmul_streamed: forward htod failed");
 
         let out_id = self.alloc_pooled(vec![m, n]);
 
@@ -689,10 +689,8 @@ impl Graph {
         // backward to get a fresh GPU buffer for the backward kernels.
         let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
             // Re-htod the CPU weight for backward kernels.
-            let b_cpu_bwd = tensors[b_id].data.as_cpu();
-            let b_temp_bwd = stream_bwd
-                .clone_htod(b_cpu_bwd)
-                .expect("matmul_streamed: backward htod failed");
+            let b_f32_bwd = tensors[b_id].data.to_f32_vec();
+            let b_temp_bwd = stream_bwd.clone_htod(b_f32_bwd.as_slice()).expect("matmul_streamed: backward htod failed");
 
             let out_grad = match &tensors[out_id].grad {
                 Storage::Gpu(s) => s,

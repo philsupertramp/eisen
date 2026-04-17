@@ -1,5 +1,6 @@
 use crate::graph::{Graph, TapeNode, is_bf16};
 use crate::tensor::{Tensor, Device, Storage};
+use crate::data::fim::IGNORE_INDEX;
 use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
 use crate::safe_bf16_temp;
 
@@ -701,4 +702,181 @@ impl Graph {
         }
     }
 
+    /// Cross-entropy loss where targets equal to `IGNORE_INDEX` (usize::MAX)
+    /// are silently skipped.  Falls back to `cross_entropy` if every target
+    /// is valid (no masked positions) to avoid the normaliser overhead.
+    pub fn cross_entropy_masked(&mut self, logits_id: usize, targets: &[usize]) -> usize {
+        let valid_count = targets.iter().filter(|&&t| t != IGNORE_INDEX).count();
+ 
+        // No masked positions → use standard (faster) CE.
+        if valid_count == targets.len() {
+            return self.cross_entropy(logits_id, targets);
+        }
+ 
+        // All positions masked — return zero loss (should not happen in practice).
+        if valid_count == 0 {
+            return self.alloc(vec![], vec![0.0]);
+        }
+ 
+        let normalizer = 1.0_f32 / valid_count as f32;
+ 
+        let device = self.device.clone();
+        match &device {
+            Device::Gpu(_, stream) => {
+                let logits      = &self.tensors[logits_id];
+                let batch_size  = logits.shape[0];
+                let num_classes = logits.shape[1];
+ 
+                let out_id  = self.alloc_pooled(vec![]);
+                let f_fwd   = self.functions.get("cross_entropy_masked_f32").unwrap().clone();
+                let f_bwd   = self.functions.get("cross_entropy_masked_backward_f32").unwrap().clone();
+                let stream_clone = stream.clone();
+ 
+                let targets_f32: Vec<f32> = targets
+                    .iter()
+                    .map(|&t| if t == IGNORE_INDEX { u32::MAX as f32 } else { t as f32 })
+                    .collect();
+                let targets_d = stream.clone_htod(targets_f32.as_slice()).unwrap();
+ 
+                // Optional BF16 cast for logits (same pattern as cross_entropy).
+                #[cfg(feature = "bf16")]
+                let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
+                #[cfg(feature = "bf16")]
+                let f_cast_to_f32_bwd = f_cast_to_f32.clone();
+ 
+                #[cfg(feature = "bf16")]
+                let l_temp_fwd = safe_bf16_temp!(
+                    self, logits_id, batch_size * num_classes, stream, &f_cast_to_f32
+                );
+                #[cfg(not(feature = "bf16"))]
+                let l_temp_fwd: Option<()> = None;
+ 
+                let l_s = match (&self.tensors[logits_id].data, &l_temp_fwd) {
+                    (Storage::Gpu(s), _) => s,
+                    #[cfg(feature = "bf16")]
+                    (_, Some(t)) => t,
+                    _ => unreachable!("cross_entropy_masked: logits must be Gpu or GpuBf16"),
+                };
+                let o_s = match &self.tensors[out_id].data {
+                    Storage::Gpu(s) => s,
+                    _ => unreachable!(),
+                };
+ 
+                let b_u64 = batch_size  as u64;
+                let c_u64 = num_classes as u64;
+ 
+                let mut builder = stream.launch_builder(&f_fwd);
+                builder
+                    .arg(l_s)
+                    .arg(&targets_d)
+                    .arg(o_s)
+                    .arg(&normalizer)
+                    .arg(&b_u64)
+                    .arg(&c_u64);
+                unsafe { builder.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
+ 
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    #[cfg(feature = "bf16")]
+                    let l_temp_bwd = crate::bf16_util::bf16_to_f32_temp(
+                        &tensors[logits_id].data,
+                        batch_size * num_classes,
+                        &stream_clone,
+                        &f_cast_to_f32_bwd,
+                    );
+                    #[cfg(not(feature = "bf16"))]
+                    let l_temp_bwd: Option<()> = None;
+ 
+                    let l_data = match (&tensors[logits_id].data, &l_temp_bwd) {
+                        (Storage::Gpu(s), _) => s,
+                        #[cfg(feature = "bf16")]
+                        (_, Some(t)) => t,
+                        _ => unreachable!(),
+                    };
+                    let out_grad = match &tensors[out_id].grad {
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
+                    };
+                    let l_grad = match &tensors[logits_id].grad {
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
+                    };
+ 
+                    let mut b1 = stream_clone.launch_builder(&f_bwd);
+                    b1.arg(l_data)
+                        .arg(&targets_d)
+                        .arg(out_grad)
+                        .arg(l_grad)
+                        .arg(&normalizer)
+                        .arg(&b_u64)
+                        .arg(&c_u64);
+                    unsafe { b1.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
+                });
+ 
+                if !self.no_grad {
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![logits_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
+ 
+            Device::Cpu => {
+                // CPU reference path (used by tests / small models).
+                let logits      = &self.tensors[logits_id];
+                let batch_size  = logits.shape[0];
+                let num_classes = logits.shape[1];
+                let logits_data = logits.data.as_cpu().clone();
+ 
+                let mut out_loss = 0.0_f32;
+                let mut probs    = vec![0.0_f32; batch_size * num_classes];
+ 
+                for b in 0..batch_size {
+                    if targets[b] == IGNORE_INDEX { continue; }
+                    let mut max_val = f32::NEG_INFINITY;
+                    for c in 0..num_classes {
+                        max_val = max_val.max(logits_data[b * num_classes + c]);
+                    }
+                    let mut sum_exp = 0.0_f32;
+                    for c in 0..num_classes {
+                        let e = (logits_data[b * num_classes + c] - max_val).exp();
+                        probs[b * num_classes + c] = e;
+                        sum_exp += e;
+                    }
+                    for c in 0..num_classes {
+                        probs[b * num_classes + c] /= sum_exp;
+                    }
+                    let p = probs[b * num_classes + targets[b]];
+                    out_loss += -(p + 1e-8).ln() * normalizer;
+                }
+ 
+                let targets_cap = targets.to_vec();
+                let out_id = self.alloc(vec![], vec![out_loss]);
+ 
+                let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                    let o_grad  = tensors[out_id].grad.as_cpu()[0];
+                    let l_grad  = tensors[logits_id].grad.as_cpu_mut();
+                    for b in 0..batch_size {
+                        if targets_cap[b] == IGNORE_INDEX { continue; }
+                        for c in 0..num_classes {
+                            let idx = b * num_classes + c;
+                            let mut g = probs[idx];
+                            if c == targets_cap[b] { g -= 1.0; }
+                            l_grad[idx] += g * normalizer * o_grad;
+                        }
+                    }
+                });
+ 
+                if !self.no_grad {
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![logits_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
+        }
+    }
 }

@@ -1,6 +1,66 @@
 #include "common.cuh"
 #define FLASH_MAX_HEAD_DIM 256
+#define FIM_IGNORE_INDEX 0xFFFFFFFFu
 
+extern "C" __global__ void cross_entropy_masked_f32(
+    const float* logits,
+    const float* targets,       // float-cast usize; IGNORE_INDEX → 4294967295.0
+    float* out_loss,
+    const float normalizer,     // 1.0 / valid_count
+    const size_t batch_size,
+    const size_t num_classes
+) {
+    size_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch_size) return;
+
+    unsigned int target_class = (unsigned int)targets[b];
+    if (target_class == FIM_IGNORE_INDEX) return;
+
+    float max_val = -1e20f;
+    for (size_t c = 0; c < num_classes; ++c) {
+        float val = bf16q(logits[b * num_classes + c]);
+        if (val > max_val) max_val = val;
+    }
+    float sum_exp = 0.0f;
+    for (size_t c = 0; c < num_classes; ++c)
+        sum_exp += expf(bf16q(logits[b * num_classes + c]) - max_val);
+
+    float prob = expf(bf16q(logits[b * num_classes + target_class]) - max_val) / sum_exp;
+    atomicAdd(out_loss, -logf(prob + 1e-8f) * normalizer);
+}
+
+extern "C" __global__ void cross_entropy_masked_backward_f32(
+    const float* logits,
+    const float* targets,
+    const float* grad_out,
+    float* grad_logits,
+    const float normalizer,
+    const size_t batch_size,
+    const size_t num_classes
+) {
+    size_t b = blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= batch_size) return;
+
+    unsigned int target_class = (unsigned int)targets[b];
+    if (target_class == FIM_IGNORE_INDEX) return;
+
+    float max_val = -1e20f;
+    for (size_t c = 0; c < num_classes; ++c) {
+        float val = bf16q(logits[b * num_classes + c]);
+        if (val > max_val) max_val = val;
+    }
+    float sum_exp = 0.0f;
+    for (size_t c = 0; c < num_classes; ++c)
+        sum_exp += expf(bf16q(logits[b * num_classes + c]) - max_val);
+
+    float go = bf16q(grad_out[0]) * normalizer;
+    for (size_t c = 0; c < num_classes; ++c) {
+        float prob = expf(bf16q(logits[b * num_classes + c]) - max_val) / sum_exp;
+        float g = prob;
+        if (c == (size_t)target_class) g -= 1.0f;
+        atomicAdd(&grad_logits[b * num_classes + c], bf16q(g * go));
+    }
+}
 
 // --- BROADCAST-AWARE ADDITION ---
 extern "C" __global__ void add_f32(

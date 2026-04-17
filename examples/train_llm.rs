@@ -26,6 +26,9 @@ use eisen::nn::scheduler::CosineScheduler;
 use eisen::nn::transformer::TransformerLM;
 use eisen::tensor::Device;
 use eisen::tools::huggingface::{LlamaConfig, write_llama_config, write_safetensors};
+ 
+use eisen::data::fim::{FimConfig, FimTokens};
+use eisen::data::dataloader::BatchResult;
 
 use std::env;
 use std::fs;
@@ -163,9 +166,29 @@ fn main() {
         BPETokenizer::load(tokenizer_path)
             .expect("Tokenizer not found — run examples/train_tokenizer.rs first"),
     );
-    let vocab_size = tokenizer.vocab.len();
-    println!("Vocab size: {}", vocab_size);
+    let base_vocab_size = tokenizer.vocab.len();
+    // FIM adds 4 special tokens; the model vocab must be trained-aware of them.
+    let fim_overhead = FimTokens::vocab_overhead(); // = 4
+    let vocab_size = base_vocab_size + fim_overhead;
+    println!("Base vocab: {}  FIM overhead: {}  Total vocab: {}",
+             base_vocab_size, fim_overhead, vocab_size);
 
+    // ----- FIM config ----
+    let fim_rate    = env_f32("EISEN_FIM_RATE",     0.5);
+    let fim_spm     = env_f32("EISEN_FIM_SPM_RATE", 0.5);
+    let use_fim     = fim_rate > 0.0;
+    let fim_config  = FimConfig::new(base_vocab_size)
+        .with_rate(fim_rate)
+        .with_spm_rate(fim_spm);
+ 
+    if use_fim {
+        println!(
+            "FIM enabled — rate={:.0}%, SPM={:.0}%, special tokens: prefix={} suffix={} middle={} pad={}",
+            fim_rate * 100.0, fim_spm * 100.0,
+            fim_config.tokens.prefix, fim_config.tokens.suffix,
+            fim_config.tokens.middle, fim_config.tokens.pad,
+        );
+    } 
     // ── Architecture ─────────────────────────────────────────────────────────
     let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 32);
     let num_heads = env_usize("EISEN_NUM_HEADS", 4);
@@ -183,7 +206,15 @@ fn main() {
     let epochs = env_usize("EISEN_EPOCHS", 1);
     let mut current_epoch = 1;
 
-    let mut dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
+    let mut dataloader = {
+        let dl = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size)
+            .with_seed(seed);
+        if use_fim {
+            dl.with_fim(fim_config.clone())
+        } else {
+            dl
+        }
+    };
 
     // Scale the total steps based on the number of epochs requested
     let total_steps = dataloader.total_batches() * epochs;
@@ -358,44 +389,48 @@ fn main() {
         let mut micro_count = 0_usize;
 
         for _ in 0..accum_steps {
-            let batch = match dataloader.next_batch() {
+            let batch: BatchResult = match dataloader.next_batch() {
                 Some(b) => b,
                 None => {
                     if current_epoch < epochs {
                         current_epoch += 1;
-                        println!("\nDataset exhausted. Starting Epoch {}/{} at step {}...", current_epoch, epochs, step);
-                        
-                        // Re-instantiate dataloader for the new epoch
-                        dataloader = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size);
-                        
-                        // Grab the first batch of the new epoch
+                        println!("\nEpoch {}/{} starting at step {}…",
+                                 current_epoch, epochs, step);
+                        dataloader = {
+                            let dl = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size)
+                                .with_seed(seed.wrapping_add(current_epoch as u64));
+                            if use_fim { dl.with_fim(fim_config.clone()) } else { dl }
+                        };
                         match dataloader.next_batch() {
                             Some(b) => b,
-                            None => {
-                                println!("\nDataset is completely empty.");
-                                break 'training;
-                            }
+                            None => { println!("Dataset empty."); break 'training; }
                         }
                     } else {
-                        println!("\nDataset exhausted at step {}. Target epochs ({}) reached.", step, epochs);
+                        println!("\nDataset exhausted at step {}. Done.", step);
                         break 'training;
                     }
                 }
             };
-            
-            let (x_batch, y_batch) = batch;
+ 
             let tokens_this_micro = micro_batch_size * seq_len;
-
+ 
             let x_id = g.alloc_pooled(vec![micro_batch_size, seq_len]);
-            g.load_tensor_data(x_id, &x_batch);
-            
-            let logits_id = model.forward(&mut g, x_id);
+            g.load_tensor_data(x_id, &batch.x);
+ 
+            let logits_id   = model.forward(&mut g, x_id);
             let flat_logits = g.reshape(logits_id, vec![tokens_this_micro, vocab_size]);
-            let loss_id = g.cross_entropy(flat_logits, &y_batch);
-
+ 
+            // Use masked CE when FIM has produced ignore-index positions;
+            // fall back to standard CE otherwise (no overhead).
+            let loss_id = if batch.has_masked {
+                g.cross_entropy_masked(flat_logits, &batch.targets)
+            } else {
+                g.cross_entropy(flat_logits, &batch.targets)
+            };
+ 
             step_loss += g.tensors[loss_id].sync_to_cpu()[0];
             micro_count += 1;
-
+ 
             g.backward(loss_id);
             g.clear_activations();
         }
