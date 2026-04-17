@@ -375,11 +375,6 @@ impl AdamW {
                 // ── Fused GPU kernel path ──────────────────────────────────────
                 let stream = stream_opt.as_ref().expect("GPU param but no GPU stream");
 
-                let grads = match &g.tensors[p_id].grad {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
-
                 let n = size as u64;
                 #[cfg(feature = "bf16")]
                 if adamw_bf16mom_fn_opt.is_some() {
@@ -398,6 +393,10 @@ impl AdamW {
                     let v_s = self.v_gpu_bf16.get(&p_id).unwrap();
                     match &g.tensors[p_id].data {
                         Storage::Gpu(weights) => {
+                            let grads = match &g.tensors[p_id].grad {
+                                Storage::Gpu(s) => s,
+                                _ => unreachable!(),
+                            };
                             let f = adamw_bf16mom_fn_opt.as_ref().unwrap().clone();
                             let mut builder = stream.launch_builder(&f);
                             builder
@@ -417,6 +416,10 @@ impl AdamW {
                                 .unwrap();
                         }
                         Storage::GpuBf16(weights) => {
+                            let grads = match &g.tensors[p_id].grad {
+                                Storage::Gpu(s) => s,
+                                _ => unreachable!(),
+                            };
                             let f = adamw_bf16w_fn_opt.as_ref().unwrap().clone();
                             let mut builder = stream.launch_builder(&f);
                             builder
@@ -453,6 +456,10 @@ impl AdamW {
                         Storage::Gpu(s) => s,
                         _ => panic!("FP32 AdamW kernel requires FP32 GPU weights"),
                     };
+                    let grads = match &g.tensors[p_id].grad {
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
+                    };
                     let f = adamw_fn_opt.as_ref().unwrap().clone();
                     let m_s = self.m_gpu.get(&p_id).unwrap();
                     let v_s = self.v_gpu.get(&p_id).unwrap();
@@ -488,6 +495,10 @@ impl AdamW {
                     let weights = match &g.tensors[p_id].data {
                         Storage::Gpu(s) => s,
                         _ => panic!("FP32 AdamW kernel requires FP32 GPU weights"),
+                    };
+                    let grads = match &g.tensors[p_id].grad {
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
                     };
                     let f = adamw_fn_opt.as_ref().unwrap().clone();
                     let m_s = self.m_gpu.get(&p_id).unwrap();
