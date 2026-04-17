@@ -1,11 +1,8 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
-use crate::tensor::{Tensor, Device, Storage};
-use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
-
-
+use crate::graph::{is_bf16, Graph, TapeNode};
+use crate::tensor::{Device, Storage, Tensor};
+use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 
 impl Graph {
-
     pub fn rms_norm(&mut self, x_id: usize, weight_id: usize, eps: f32) -> usize {
         let device = self.device.clone();
         match &device {
@@ -22,11 +19,24 @@ impl Graph {
                     match (x_bf, w_bf) {
                         (true, true) => (
                             self.functions.get("rmsnorm_bf16").unwrap().clone(),
-                            self.functions.get("rmsnorm_backward_bf16in_f32").unwrap().clone(),
+                            self.functions
+                                .get("rmsnorm_backward_bf16in_f32")
+                                .unwrap()
+                                .clone(),
+                        ),
+                        (true, false) => (
+                            self.functions.get("rmsnorm_bf16").unwrap().clone(),
+                            self.functions
+                                .get("rmsnorm_backward_bf16in_f32")
+                                .unwrap()
+                                .clone(),
                         ),
                         (false, true) => (
                             self.functions.get("rmsnorm_f32_bf16w").unwrap().clone(),
-                            self.functions.get("rmsnorm_backward_bf16w_f32").unwrap().clone(),
+                            self.functions
+                                .get("rmsnorm_backward_bf16w_f32")
+                                .unwrap()
+                                .clone(),
                         ),
                         _ => (
                             self.functions.get("rmsnorm_f32").unwrap().clone(),
@@ -52,79 +62,174 @@ impl Graph {
                         &self.tensors[out_id].data,
                     ) {
                         (Storage::Gpu(x_s), Storage::Gpu(w_s), Storage::Gpu(o_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(o_s)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(o_s)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(x_s), Storage::Gpu(w_s), Storage::Gpu(o_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(o_s)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(o_s)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
                         (Storage::Gpu(x_s), Storage::GpuBf16(w_s), Storage::Gpu(o_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(o_s)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(o_s)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(x_s), Storage::GpuBf16(w_s), Storage::GpuBf16(o_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(o_s)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(o_s)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(x_s), Storage::Cpu(w_s), Storage::GpuBf16(o_s)) => {
-                            let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
+                            let stream = match &self.device {
+                                Device::Gpu(_, s) => s.clone(),
+                                _ => unreachable!(),
+                            };
+                            let w_bf16: Vec<u16> = w_s
+                                .as_slice()
+                                .iter()
+                                .map(|&x| (x.to_bits() >> 16) as u16)
+                                .collect();
                             b_u16_slice = stream
-                                .clone_htod(&w_s.as_slice().iter().map(|&x| x as u16).collect::<Vec<u16>>())
+                                .clone_htod(&w_bf16)
                                 .expect("bf16_streamed: forward rms_norm failed");
 
-                            builder.arg(x_s).arg(&b_u16_slice).arg(o_s)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(&b_u16_slice)
+                                .arg(o_s)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         (p1, p2, p3) => panic!(
                             "rms_norm: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
                             p1, p2, p3
                         ),
                     }
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                        .unwrap();
                 }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
                     };
                     let x_grad = match &tensors[x_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
                     };
                     let w_grad = match &tensors[weight_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
                     };
                     let mut builder = stream_clone.launch_builder(&f_bwd);
                     match (&tensors[x_id].data, &tensors[weight_id].data) {
                         (Storage::Gpu(x_s), Storage::Gpu(w_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(out_grad)
-                                .arg(x_grad).arg(w_grad)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(out_grad)
+                                .arg(x_grad)
+                                .arg(w_grad)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
                         (Storage::Gpu(x_s), Storage::GpuBf16(w_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(out_grad)
-                                .arg(x_grad).arg(w_grad)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(out_grad)
+                                .arg(x_grad)
+                                .arg(w_grad)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(x_s), Storage::GpuBf16(w_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(out_grad)
-                                .arg(x_grad).arg(w_grad)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                            builder
+                                .arg(x_s)
+                                .arg(w_s)
+                                .arg(out_grad)
+                                .arg(x_grad)
+                                .arg(w_grad)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
+                        }
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(x_s), Storage::Cpu(w_s)) => {
+                            let w_bf16: Vec<u16> = w_s
+                                .as_slice()
+                                .iter()
+                                .map(|&x| (x.to_bits() >> 16) as u16)
+                                .collect();
+                            let w_temp = stream_clone
+                                .clone_htod(&w_bf16)
+                                .expect("rms_norm backward streamed: htod weight failed");
+                            let w_grad_temp = stream_clone
+                                .alloc_zeros::<f32>(dim)
+                                .expect("rms_norm backward streamed: alloc temp grad failed");
+
+                            builder
+                                .arg(x_s)
+                                .arg(&w_temp)
+                                .arg(out_grad)
+                                .arg(x_grad)
+                                .arg(&w_grad_temp)
+                                .arg(&dim_u64)
+                                .arg(&eps)
+                                .arg(&num_vecs_u64);
+                            unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                                .unwrap();
+                            stream_clone
+                                .synchronize()
+                                .expect("rms_norm backward streamed: sync failed");
+                            let w_grad_host = stream_clone
+                                .clone_dtoh(&w_grad_temp)
+                                .expect("rms_norm backward streamed: dtoh grad failed");
+                            let w_grad_cpu = tensors[weight_id].grad.as_cpu_mut();
+                            for (acc, delta) in w_grad_cpu.iter_mut().zip(w_grad_host.iter()) {
+                                *acc += *delta;
+                            }
+                            return;
                         }
                         _ => panic!("rms_norm backward: unsupported storage"),
                     }
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }
+                        .unwrap();
                 });
 
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
-                        inputs: vec![x_id, weight_id], output: out_id, backward_fn,
+                        inputs: vec![x_id, weight_id],
+                        output: out_id,
+                        backward_fn,
                     });
                 }
                 out_id
@@ -182,5 +287,4 @@ impl Graph {
             }
         }
     }
-
 }

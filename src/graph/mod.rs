@@ -1,5 +1,5 @@
-pub mod ops;
 pub mod memory;
+pub mod ops;
 
 use crate::tape::{Tape, TapeNode};
 use crate::tensor::{Device, Storage, Tensor};
@@ -8,7 +8,6 @@ use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use std::collections::{HashMap, HashSet};
 use std::env;
 
-
 #[cfg(feature = "bf16")]
 #[inline]
 fn is_bf16(s: &crate::tensor::Storage) -> bool {
@@ -16,17 +15,18 @@ fn is_bf16(s: &crate::tensor::Storage) -> bool {
 }
 #[cfg(not(feature = "bf16"))]
 #[inline]
-fn is_bf16(_s: &crate::tensor::Storage) -> bool { false }
+fn is_bf16(_s: &crate::tensor::Storage) -> bool {
+    false
+}
 
-
-#[macro_export] macro_rules! safe_bf16_temp {
+#[macro_export]
+macro_rules! safe_bf16_temp {
     ($self:ident, $id:expr, $size:expr, $stream:expr, $cast_fn:expr) => {{
         // 1. Check if it's BF16 (short immutable borrow, drops immediately)
         if is_bf16(&$self.tensors[$id].data) {
-            
             // 2. Safely allocate the temp buffer (mutable borrow of self)
             let tmp = $self.safe_alloc_zeros::<f32>($stream, $size);
-            
+
             // 3. Borrow the tensor again to run the cast
             if let Storage::GpuBf16(s) = &$self.tensors[$id].data {
                 let n = $size as u64;
@@ -304,7 +304,11 @@ impl Graph {
         while self.tensors.len() > save_point {
             let t = self.tensors.pop().unwrap();
             if t.is_pooled {
-                let size = if t.shape.is_empty() { 1 } else { t.shape.iter().product() };
+                let size = if t.shape.is_empty() {
+                    1
+                } else {
+                    t.shape.iter().product()
+                };
 
                 // Return grad block (always FP32) to the main pool
                 self.vram_pool.entry(size).or_default().push(t.grad);
@@ -382,7 +386,11 @@ impl Graph {
     }
 
     pub fn alloc_pooled(&mut self, shape: Vec<usize>) -> usize {
-        let size = if shape.is_empty() { 1 } else { shape.iter().product::<usize>() };
+        let size = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product::<usize>()
+        };
         let device = self.device.clone();
 
         // ── Data buffer: BF16 in Bf16Mixed mode, FP32 otherwise ───────────────
@@ -397,7 +405,8 @@ impl Graph {
                     }
 
                     // 2. Allocate if nothing was found (borrows self mutably, totally safe now!)
-                    let slice = cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
+                    let slice =
+                        cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
                     Storage::GpuBf16(slice)
                 }
                 Device::Cpu => Storage::Cpu(vec![0.0; size]), // CPU always FP32
@@ -410,13 +419,17 @@ impl Graph {
                 } else {
                     match &device {
                         Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                        Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                        Device::Gpu(_, stream) => {
+                            Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                        }
                     }
                 }
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Gpu(_, stream) => {
+                        Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                    }
                 }
             }
         };
@@ -424,17 +437,22 @@ impl Graph {
         #[cfg(not(feature = "bf16"))]
         let data_storage: Storage = {
             if let Some(blocks) = self.vram_pool.get_mut(&size) {
-                if let Some(block) = blocks.pop() { block }
-                else {
+                if let Some(block) = blocks.pop() {
+                    block
+                } else {
                     match &device {
                         Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                        Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                        Device::Gpu(_, stream) => {
+                            Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                        }
                     }
                 }
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Gpu(_, stream) => {
+                        Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                    }
                 }
             }
         };
@@ -457,7 +475,9 @@ impl Graph {
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Gpu(_, stream) => {
+                        Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                    }
                 }
             }
         };
@@ -465,7 +485,9 @@ impl Graph {
         // Zero the grad block before use
         match &device {
             Device::Cpu => {
-                if let Storage::Cpu(v) = &mut grad_storage { v.fill(0.0); }
+                if let Storage::Cpu(v) = &mut grad_storage {
+                    v.fill(0.0);
+                }
             }
             Device::Gpu(_, stream) => {
                 if let Storage::Gpu(s) = &mut grad_storage {
@@ -524,9 +546,7 @@ impl Graph {
                 let d_data = stream
                     .clone_htod(u16_data.as_slice())
                     .expect("alloc_param_bf16: htod failed");
-                let d_grad = stream
-                    .alloc_zeros::<f32>(size)
-                    .expect("OOM in alloc_param_bf16");
+                let d_grad = self.safe_alloc_zeros::<f32>(stream, size);
                 self.tensors.push(Tensor {
                     id,
                     shape,
@@ -602,9 +622,6 @@ impl Graph {
         }
     }
 
-
-
-
     pub fn backward(&mut self, loss_id: usize) {
         if self.no_grad {
             return;
@@ -624,7 +641,7 @@ impl Graph {
                 }
             }
         }
-        
+
         let (ctx, stream_opt) = match &self.device {
             Device::Gpu(ctx, s) => (Some(ctx.clone()), Some(s.clone())),
             _ => (None, None),
@@ -632,7 +649,7 @@ impl Graph {
 
         // --- 2. PREPARE VRAM FOR RAW CLOSURE ALLOCATIONS ---
         // The closures use raw `stream.alloc_zeros` and cannot access the pool.
-        // We MUST flush the forward-pass pool back to the driver so the driver 
+        // We MUST flush the forward-pass pool back to the driver so the driver
         // has space to fulfill those raw allocations.
         if let Some(stream) = &stream_opt {
             self.vram_pool.clear();
@@ -659,21 +676,31 @@ impl Graph {
             // 🚀 PROACTIVE SCRATCH SPACE GENERATION
             // Ensure the CUDA driver has enough raw free memory for bf16_to_f32_temp
             if let Some(stream) = &stream_opt {
-                let (free_vram, _) = ctx.clone().expect("Was not able to acquire context").mem_get_info().unwrap();
+                let (free_vram, _) = ctx
+                    .clone()
+                    .expect("Was not able to acquire context")
+                    .mem_get_info()
+                    .unwrap();
                 let mut current_free = free_vram;
                 let scratch_budget = 1024 * 1024 * 1024; // 128 MB safety buffer for temporaries
 
                 if current_free < scratch_budget {
                     // Evict tensors (that are not shielded) until we reach the budget
                     #[cfg(feature = "bf16")]
-                    let candidate_ids: Vec<usize> = self.tensors.iter()
-                        .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)))
+                    let candidate_ids: Vec<usize> = self
+                        .tensors
+                        .iter()
+                        .filter(|t| {
+                            t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_))
+                        })
                         .filter(|t| !self.active_node_tensors.contains(&t.id))
                         .map(|t| t.id)
                         .collect();
 
                     #[cfg(not(feature = "bf16"))]
-                    let candidate_ids: Vec<usize> = self.tensors.iter()
+                    let candidate_ids: Vec<usize> = self
+                        .tensors
+                        .iter()
                         .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_)))
                         .filter(|t| !self.active_node_tensors.contains(&t.id))
                         .map(|t| t.id)
@@ -682,8 +709,12 @@ impl Graph {
                     for id in candidate_ids {
                         self.demote_tensor_to_cpu(id);
                         stream.synchronize().unwrap();
-                        
-                        let (new_free, _) = ctx.clone().expect("Could not acquire context!").mem_get_info().unwrap();
+
+                        let (new_free, _) = ctx
+                            .clone()
+                            .expect("Could not acquire context!")
+                            .mem_get_info()
+                            .unwrap();
                         current_free = new_free;
                         if current_free >= scratch_budget {
                             break; // We have enough scratch space!
@@ -694,7 +725,7 @@ impl Graph {
                         println!("Did not manage to clear enough space!!!");
                         self.print_vram_state("backward pass error");
                     }
-                } 
+                }
                 //else {
                 //    println!("Currently available: {}, attempting to reclaim: {}", current_free, scratch_budget);
                 //    self.print_vram_state("backward pass");
@@ -710,4 +741,3 @@ impl Graph {
         self.tape.nodes = nodes;
     }
 }
-

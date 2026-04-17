@@ -68,7 +68,7 @@ impl AdamW {
 
     /// Pre-allocates moment buffers in VRAM. Call this before the training loop
     /// to prevent VRAM fragmentation and out-of-memory errors during the first step.
-    pub fn init_moments(&mut self, g: &Graph) {
+    pub fn init_moments(&mut self, g: &mut Graph) {
         let stream_opt = match &g.device {
             Device::Gpu(_, s) => Some(s.clone()),
             Device::Cpu => None,
@@ -88,20 +88,26 @@ impl AdamW {
                 #[cfg(feature = "bf16")]
                 if g.uses_bf16_mixed_precision() {
                     if !self.m_gpu_bf16.contains_key(&p_id) {
-                        self.m_gpu_bf16.insert(p_id, stream.alloc_zeros::<u16>(size).unwrap());
-                        self.v_gpu_bf16.insert(p_id, stream.alloc_zeros::<u16>(size).unwrap());
+                        self.m_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                        self.v_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
                     }
                 } else {
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
-                        self.v_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                 }
                 #[cfg(not(feature = "bf16"))]
                 {
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
-                        self.v_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                 }
             } else {
@@ -181,8 +187,7 @@ impl AdamW {
                     let mut builder = stream.launch_builder(&f);
                     let n = size as u64;
                     builder.arg(&*s).arg(&scale).arg(&n);
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
-                        .unwrap();
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
                 }
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
@@ -372,18 +377,10 @@ impl AdamW {
                 if adamw_bf16mom_fn_opt.is_some() {
                     // Lazy-init BF16 moment buffers (if init_moments wasn't called)
                     if !self.m_gpu_bf16.contains_key(&p_id) {
-                        self.m_gpu_bf16.insert(
-                            p_id,
-                            stream
-                                .alloc_zeros::<u16>(size)
-                                .expect("AdamW: failed to alloc BF16 m moment in VRAM"),
-                        );
-                        self.v_gpu_bf16.insert(
-                            p_id,
-                            stream
-                                .alloc_zeros::<u16>(size)
-                                .expect("AdamW: failed to alloc BF16 v moment in VRAM"),
-                        );
+                        self.m_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                        self.v_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
                     }
                     let m_s = self.m_gpu_bf16.get(&p_id).unwrap();
                     let v_s = self.v_gpu_bf16.get(&p_id).unwrap();
@@ -431,18 +428,10 @@ impl AdamW {
                 } else {
                     // Lazy-init FP32 moment buffers (if init_moments wasn't called)
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(
-                            p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc m moment in VRAM"),
-                        );
-                        self.v_gpu.insert(
-                            p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc v moment in VRAM"),
-                        );
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                     let weights = match &g.tensors[p_id].data {
                         Storage::Gpu(s) => s,
@@ -471,18 +460,10 @@ impl AdamW {
                 {
                     // Lazy-init FP32 moment buffers
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(
-                            p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc m moment in VRAM"),
-                        );
-                        self.v_gpu.insert(
-                            p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc v moment in VRAM"),
-                        );
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                     let weights = match &g.tensors[p_id].data {
                         Storage::Gpu(s) => s,
@@ -513,8 +494,8 @@ impl AdamW {
                 let v = self.v_cpu.entry(p_id).or_insert_with(|| vec![0.0; size]);
 
                 let tensor = &mut g.tensors[p_id];
-                
-                // Borrow grad and weight robustly via field splitting 
+
+                // Borrow grad and weight robustly via field splitting
                 let (data_storage, grad_storage) = (&mut tensor.data, &tensor.grad);
                 let weight_data = match data_storage {
                     Storage::Cpu(vec) => vec,

@@ -1,10 +1,9 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
+use crate::graph::{is_bf16, Graph, TapeNode};
 use crate::safe_bf16_temp;
-use crate::tensor::{Tensor, Device, Storage};
-use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
+use crate::tensor::{Device, Storage, Tensor};
+use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 
 use std::collections::HashSet;
-
 
 // ── StreamingReport ────────────────────────────────────────────────────────────
 
@@ -16,7 +15,7 @@ pub struct StreamingReport {
     pub streamed_param_ids: Vec<usize>,
     /// Total bytes of resident params (×4: data+grad+m+v per param).
     pub resident_bytes: usize,
-    /// 
+    ///
     pub resident_headroom_bytes: usize,
     /// Total bytes of streamed param data (just the weight bytes; moments
     /// are additional ×3 in CPU RAM).
@@ -59,9 +58,7 @@ impl std::fmt::Display for StreamingReport {
     }
 }
 
-
 impl Graph {
-
     /// Decide which parameters stay in VRAM and which stream from CPU RAM,
     /// then convert the overflow params in place.
     ///
@@ -116,7 +113,7 @@ impl Graph {
         let mut resident: Vec<usize> = Vec::new();
         let mut streamed: Vec<usize> = Vec::new();
         // leave some headroom for calculations (~10%)
-        let mut used = 0usize;//(vram_budget_bytes - budget_after_fixed) / 2;
+        let mut used = 0usize; //(vram_budget_bytes - budget_after_fixed) / 2;
         let headroom = used;
 
         for pid in &candidate_ids {
@@ -204,9 +201,9 @@ impl Graph {
 
     /// Helper to safely allocate with an emergency pool flush
     pub fn safe_alloc_zeros<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
-        &mut self, 
-        stream: &std::sync::Arc<cudarc::driver::CudaStream>, 
-        size: usize
+        &mut self,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        size: usize,
     ) -> cudarc::driver::CudaSlice<T> {
         // 1. Try standard allocation
         if let Ok(slice) = stream.alloc_zeros::<T>(size) {
@@ -227,24 +224,31 @@ impl Graph {
         // We collect the IDs first to avoid borrowing `self` during the loop
         // We will not evict tensors that are currently used.
         #[cfg(feature = "bf16")]
-        let candidate_ids: Vec<usize> = self.tensors.iter()
+        let candidate_ids: Vec<usize> = self
+            .tensors
+            .iter()
             .filter(|t| {
-                t.is_pooled && (
-                    matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)) || 
-                    matches!(t.grad, Storage::Gpu(_)) // 🚨 NEW: Catch stranded gradients!
-                )
+                t.is_pooled
+                    && (
+                        matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_))
+                            || matches!(t.grad, Storage::Gpu(_))
+                        // 🚨 NEW: Catch stranded gradients!
+                    )
             })
             .filter(|t| !self.active_node_tensors.contains(&t.id))
             .map(|t| t.id)
             .collect();
 
         #[cfg(not(feature = "bf16"))]
-        let candidate_ids: Vec<usize> = self.tensors.iter()
+        let candidate_ids: Vec<usize> = self
+            .tensors
+            .iter()
             .filter(|t| {
-                t.is_pooled && (
-                    matches!(t.data, Storage::Gpu(_)) || 
-                    matches!(t.grad, Storage::Gpu(_)) // 🚨 NEW: Catch stranded gradients!
-                )
+                t.is_pooled
+                    && (
+                        matches!(t.data, Storage::Gpu(_)) || matches!(t.grad, Storage::Gpu(_))
+                        // 🚨 NEW: Catch stranded gradients!
+                    )
             })
             .filter(|t| !self.active_node_tensors.contains(&t.id))
             .map(|t| t.id)
@@ -264,25 +268,26 @@ impl Graph {
 
     /// Ensures a tensor is on the GPU device
     pub fn ensure_on_gpu(&mut self, tensor_id: usize) {
-        if !self.tensors[tensor_id].is_pooled {
-            return; 
-        }
-
         let (is_gpu, stream) = match &self.device {
             Device::Gpu(_, s) => (true, Some(s.clone())),
             _ => (false, None),
         };
-        if !is_gpu { return; }
+        if !is_gpu {
+            return;
+        }
         let stream = stream.unwrap();
 
         // 1. Restore Data
         if let Storage::Cpu(cpu_data) = &self.tensors[tensor_id].data {
             let cpu_data_clone = cpu_data.clone();
-            
+
             #[cfg(feature = "bf16")]
             if self.uses_bf16_mixed_precision() && self.tensors[tensor_id].is_pooled {
                 // Restore as BF16
-                let u16_data: Vec<u16> = cpu_data_clone.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+                let u16_data: Vec<u16> = cpu_data_clone
+                    .iter()
+                    .map(|&f| (f.to_bits() >> 16) as u16)
+                    .collect();
                 let mut gpu_slice = self.safe_alloc_zeros::<u16>(&stream, u16_data.len());
                 stream.memcpy_htod(&u16_data, &mut gpu_slice).unwrap();
                 self.tensors[tensor_id].data = Storage::GpuBf16(gpu_slice);
@@ -292,7 +297,7 @@ impl Graph {
                 stream.memcpy_htod(&cpu_data_clone, &mut gpu_slice).unwrap();
                 self.tensors[tensor_id].data = Storage::Gpu(gpu_slice);
             }
-            
+
             #[cfg(not(feature = "bf16"))]
             {
                 let mut gpu_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_data_clone.len());
@@ -305,11 +310,13 @@ impl Graph {
         if let Storage::Cpu(cpu_grad) = &self.tensors[tensor_id].grad {
             let cpu_grad_clone = cpu_grad.clone();
             let mut gpu_grad_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_grad_clone.len());
-            stream.memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice).unwrap();
+            stream
+                .memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice)
+                .unwrap();
             self.tensors[tensor_id].grad = Storage::Gpu(gpu_grad_slice);
         }
     }
-    
+
     /// Move an existing tensor's data+grad storage to CPU RAM.
     ///
     /// Useful when building very large models on GPU without first holding all
@@ -356,7 +363,7 @@ impl Graph {
         if let Device::Gpu(ctx, stream) = &self.device {
             let (free, total) = ctx.mem_get_info().unwrap();
             let used = total - free;
-            
+
             let mut active_data_mb = 0;
             let mut active_grad_mb = 0;
             let mut offloaded_mb = 0;
@@ -377,12 +384,15 @@ impl Graph {
             }
 
             println!("--- VRAM STATE [{}] ---", context);
-            println!("Driver Used:   {:>5} MB / {} MB", used / 1024 / 1024, total / 1024 / 1024);
+            println!(
+                "Driver Used:   {:>5} MB / {} MB",
+                used / 1024 / 1024,
+                total / 1024 / 1024
+            );
             println!("Data on GPU:   {:>5} MB", active_data_mb);
             println!("Grads on GPU:  {:>5} MB", active_grad_mb);
             println!("CPU Offloaded: {:>5} MB", offloaded_mb);
             println!("---------------------------------");
         }
     }
-
 }
