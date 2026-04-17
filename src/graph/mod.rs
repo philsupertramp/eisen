@@ -532,14 +532,15 @@ impl Graph {
             shape.iter().product::<usize>()
         };
         let strides = Tensor::compute_strides(&shape);
+        let device = self.device.clone();
 
-        match &self.device {
+        match device {
             Device::Gpu(_, stream) => {
                 let u16_data: Vec<u16> = data.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
                 let d_data = stream
                     .clone_htod(u16_data.as_slice())
                     .expect("alloc_param_bf16: htod failed");
-                let d_grad = self.safe_alloc_zeros::<f32>(stream, size);
+                let d_grad = self.safe_alloc_zeros::<f32>(&stream, size);
                 self.tensors.push(Tensor {
                     id,
                     shape,
