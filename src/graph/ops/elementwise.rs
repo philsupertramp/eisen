@@ -148,32 +148,27 @@ impl Graph {
                         None
                     };
 
-                    // accumulate_f32 signature: (grad_target, grad_out, n, rank, s*, t*)
-                    let launch_accum = |tgt: &CudaSlice<f32>, t_str: [u64; 3]| {
+                    if a_grad_is_gpu {
+                        let a_grad = match &tensors[a_id].grad {
+                            Storage::Gpu(s) => s,
+                            _ => unreachable!(),
+                        };
                         let out_grad = match &tensors[out_id].grad {
                             Storage::Gpu(s) => s,
                             _ => unreachable!(),
                         };
                         let mut b1 = stream_clone.launch_builder(&f_accumulate);
-                        b1.arg(tgt)
+                        b1.arg(a_grad)
                             .arg(out_grad)
                             .arg(&n)
                             .arg(&rank)
                             .arg(&s[0])
                             .arg(&s[1])
                             .arg(&s[2])
-                            .arg(&t_str[0])
-                            .arg(&t_str[1])
-                            .arg(&t_str[2]);
+                            .arg(&a_str[0])
+                            .arg(&a_str[1])
+                            .arg(&a_str[2]);
                         unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
-                    };
-
-                    if a_grad_is_gpu {
-                        let a_grad = match &tensors[a_id].grad {
-                            Storage::Gpu(s) => s,
-                            _ => unreachable!(),
-                        };
-                        launch_accum(a_grad, a_str);
                     } else if let Storage::Cpu(v) = &mut tensors[a_id].grad {
                         let out_grad_host = out_grad_host.as_ref().unwrap();
                         for i in 0..out_size {
@@ -189,7 +184,22 @@ impl Graph {
                             Storage::Gpu(s) => s,
                             _ => unreachable!(),
                         };
-                        launch_accum(b_grad, b_str);
+                        let out_grad = match &tensors[out_id].grad {
+                            Storage::Gpu(s) => s,
+                            _ => unreachable!(),
+                        };
+                        let mut b1 = stream_clone.launch_builder(&f_accumulate);
+                        b1.arg(b_grad)
+                            .arg(out_grad)
+                            .arg(&n)
+                            .arg(&rank)
+                            .arg(&s[0])
+                            .arg(&s[1])
+                            .arg(&s[2])
+                            .arg(&b_str[0])
+                            .arg(&b_str[1])
+                            .arg(&b_str[2]);
+                        unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                     } else if let Storage::Cpu(v) = &mut tensors[b_id].grad {
                         let out_grad_host = out_grad_host.as_ref().unwrap();
                         for i in 0..out_size {
