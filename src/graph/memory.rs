@@ -201,16 +201,27 @@ impl Graph {
             return slice;
         }
 
+        let protected_ids: HashSet<usize> = if self.active_node_tensors.is_empty() {
+            let mut ids = HashSet::new();
+            for n in &self.tape.nodes {
+                ids.extend(n.inputs.iter().copied());
+                ids.insert(n.output);
+            }
+            ids
+        } else {
+            self.active_node_tensors.iter().copied().collect()
+        };
+
         #[cfg(feature = "bf16")]
         let candidate_ids: Vec<usize> = self.tensors.iter()
             .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)))
-            .filter(|t| !self.active_node_tensors.contains(&t.id))
+            .filter(|t| !protected_ids.contains(&t.id))
             .map(|t| t.id)
             .collect();
         #[cfg(not(feature = "bf16"))]
         let candidate_ids: Vec<usize> = self.tensors.iter()
             .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_)))
-            .filter(|t| !self.active_node_tensors.contains(&t.id))
+            .filter(|t| !protected_ids.contains(&t.id))
             .map(|t| t.id)
             .collect();
 
@@ -226,10 +237,6 @@ impl Graph {
     }
 
     pub fn ensure_on_gpu(&mut self, tensor_id: usize) {
-        if !self.tensors[tensor_id].is_pooled {
-            return;
-        }
-
         let stream = match &self.device {
             Device::Gpu(_, s) => s.clone(),
             _ => return,

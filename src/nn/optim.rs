@@ -68,7 +68,7 @@ impl AdamW {
 
     /// Pre-allocates moment buffers in VRAM. Call this before the training loop
     /// to prevent VRAM fragmentation and out-of-memory errors during the first step.
-    pub fn init_moments(&mut self, g: &Graph) {
+    pub fn init_moments(&mut self, g: &mut Graph) {
         let stream_opt = match &g.device {
             Device::Gpu(_, s) => Some(s.clone()),
             Device::Cpu => None,
@@ -88,20 +88,20 @@ impl AdamW {
                 #[cfg(feature = "bf16")]
                 if g.uses_bf16_mixed_precision() {
                     if !self.m_gpu_bf16.contains_key(&p_id) {
-                        self.m_gpu_bf16.insert(p_id, stream.alloc_zeros::<u16>(size).unwrap());
-                        self.v_gpu_bf16.insert(p_id, stream.alloc_zeros::<u16>(size).unwrap());
+                        self.m_gpu_bf16.insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                        self.v_gpu_bf16.insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
                     }
                 } else {
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
-                        self.v_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                        self.m_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                 }
                 #[cfg(not(feature = "bf16"))]
                 {
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
-                        self.v_gpu.insert(p_id, stream.alloc_zeros::<f32>(size).unwrap());
+                        self.m_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                 }
             } else {
@@ -387,15 +387,11 @@ impl AdamW {
                     if !self.m_gpu_bf16.contains_key(&p_id) {
                         self.m_gpu_bf16.insert(
                             p_id,
-                            stream
-                                .alloc_zeros::<u16>(size)
-                                .expect("AdamW: failed to alloc BF16 m moment in VRAM"),
+                            g.safe_alloc_zeros::<u16>(stream, size),
                         );
                         self.v_gpu_bf16.insert(
                             p_id,
-                            stream
-                                .alloc_zeros::<u16>(size)
-                                .expect("AdamW: failed to alloc BF16 v moment in VRAM"),
+                            g.safe_alloc_zeros::<u16>(stream, size),
                         );
                     }
                     let m_s = self.m_gpu_bf16.get(&p_id).unwrap();
@@ -446,15 +442,11 @@ impl AdamW {
                     if !self.m_gpu.contains_key(&p_id) {
                         self.m_gpu.insert(
                             p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc m moment in VRAM"),
+                            g.safe_alloc_zeros::<f32>(stream, size),
                         );
                         self.v_gpu.insert(
                             p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc v moment in VRAM"),
+                            g.safe_alloc_zeros::<f32>(stream, size),
                         );
                     }
                     let weights = match &g.tensors[p_id].data {
@@ -486,15 +478,11 @@ impl AdamW {
                     if !self.m_gpu.contains_key(&p_id) {
                         self.m_gpu.insert(
                             p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc m moment in VRAM"),
+                            g.safe_alloc_zeros::<f32>(stream, size),
                         );
                         self.v_gpu.insert(
                             p_id,
-                            stream
-                                .alloc_zeros::<f32>(size)
-                                .expect("AdamW: failed to alloc v moment in VRAM"),
+                            g.safe_alloc_zeros::<f32>(stream, size),
                         );
                     }
                     let weights = match &g.tensors[p_id].data {

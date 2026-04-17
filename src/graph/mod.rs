@@ -539,9 +539,7 @@ impl Graph {
                 let d_data = stream
                     .clone_htod(u16_data.as_slice())
                     .expect("alloc_param_bf16: htod failed");
-                let d_grad = stream
-                    .alloc_zeros::<f32>(size)
-                    .expect("OOM in alloc_param_bf16");
+                let d_grad = self.safe_alloc_zeros::<f32>(stream, size);
                 self.tensors.push(Tensor {
                     id,
                     shape,
@@ -736,4 +734,3 @@ impl Graph {
         self.tape.nodes = nodes;
     }
 }
-
