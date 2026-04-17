@@ -148,9 +148,9 @@ fn main() {
 
     // ── Paths ────────────────────────────────────────────────────────────────
     let tokenizer_path = "data/tinystory_tokenizer.model";
-    let bin_path = "data/german_tinystory_corpus.bin";
-    let output_path = "data/eisen_model_tinystory.bin";
-    let hf_out_dir = "data/hf_export_tinystory";
+    let bin_path = "data/german_corpus.bin";
+    let output_path = "data/eisen_model.bin";
+    let hf_out_dir = "data/hf_export";
 
     let grad_clip_norm = env_f32("EISEN_GRAD_CLIP_NORM", 1.0);
     let seed = env_u64("EISEN_SEED", 1337);
@@ -167,10 +167,10 @@ fn main() {
     println!("Vocab size: {}", vocab_size);
 
     // ── Architecture ─────────────────────────────────────────────────────────
-    let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 1536);
-    let num_heads = env_usize("EISEN_NUM_HEADS", 12);
-    let ffn_dim = env_usize("EISEN_FFN_DIM", 4096);
-    let num_layers = env_usize("EISEN_NUM_LAYERS", 48);
+    let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 32);
+    let num_heads = env_usize("EISEN_NUM_HEADS", 4);
+    let ffn_dim = env_usize("EISEN_FFN_DIM", 336);
+    let num_layers = env_usize("EISEN_NUM_LAYERS", 128);
 
     // ── Training hyperparameters ─────────────────────────────────────────────
     let seq_len = env_usize("EISEN_SEQ_LEN", 512);
@@ -187,7 +187,7 @@ fn main() {
 
     // Scale the total steps based on the number of epochs requested
     let total_steps = dataloader.total_batches() * epochs;
-    let warmup_steps = 0usize;
+    let warmup_steps = 2usize;
     let lr_max = 1e-3_f32;
     let lr_min = 1e-4_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
@@ -215,7 +215,7 @@ fn main() {
 
     println!("Planing memory streaming...");
     let vram_budget_mb = env_usize("EISEN_VRAM_BUDGET_MB", 6144);
-    let reserve_mb = env_usize("EISEN_ACTIVATION_RESERVE_MB", 4096);
+    let reserve_mb = env_usize("EISEN_ACTIVATION_RESERVE_MB", 1024);
     let report = g.plan_streaming(
         vram_budget_mb * 1024 * 1024,
         reserve_mb * 1024 * 1024,

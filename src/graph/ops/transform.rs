@@ -143,7 +143,6 @@ impl Graph {
 
                 let f_fwd_f32 = self.functions.get("gather_f32").unwrap().clone();
                 #[allow(unused_variables)]
-                let f_fwd_bf16 = self.functions.get("gather_bf16_f32").unwrap().clone();
                 let f_bwd = self.functions.get("gather_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
@@ -214,6 +213,7 @@ impl Graph {
                     }
                     #[cfg(feature = "bf16")]
                     (Storage::GpuBf16(w_s), Storage::Gpu(o_s)) => {
+                        let f_fwd_bf16 = self.functions.get("gather_bf16_f32").unwrap().clone();
                         let mut builder = stream.launch_builder(&f_fwd_bf16);
                         builder
                             .arg(w_s)

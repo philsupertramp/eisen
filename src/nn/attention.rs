@@ -199,6 +199,8 @@ impl MultiHeadAttention {
                 } else {
                     g.alloc(vec![1, seq_len, seq_len], mask_data)
                 };
+                #[cfg(not(feature = "bf16"))]
+                let mask_id = g.alloc(vec![1, seq_len, seq_len], mask_data);
 
                 g.add(scaled_scores_id, mask_id) // Add broadcasts across Batch*Heads
             } else {

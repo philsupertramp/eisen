@@ -12,6 +12,7 @@ pub struct TransformerBlock {
     pub norm2: RMSNorm,
     pub ffn1: Linear,
     pub ffn2: Linear,
+    pub ffn_gate: Linear,
 }
 
 impl TransformerBlock {
@@ -21,6 +22,7 @@ impl TransformerBlock {
             attn: MultiHeadAttention::new(g, hidden_dim, num_heads),
             norm2: RMSNorm::new(g, hidden_dim, 1e-5),
             // No biases in modern LLM FFN layers
+            ffn_gate: Linear::new(g, hidden_dim, ffn_dim, false),
             ffn1: Linear::new(g, hidden_dim, ffn_dim, false), 
             ffn2: Linear::new(g, ffn_dim, hidden_dim, false),
         }
@@ -35,9 +37,11 @@ impl TransformerBlock {
         
         // --- 2. Feed-Forward Block (Pre-Norm) ---
         let norm2_out = self.norm2.forward(g, res1_out);
-        let ffn1_out = self.ffn1.forward(g, norm2_out);
-        let act_out = g.silu(ffn1_out);
-        let ffn2_out = self.ffn2.forward(g, act_out);
+        let gate_out = self.ffn_gate.forward(g, norm2_out);
+        let gate = g.silu(gate_out);
+        let up = self.ffn1.forward(g, norm2_out);
+        let gated = g.mul(gate, up);
+        let ffn2_out = self.ffn2.forward(g, gated);
         // Residual Connection 2
         let res2_out = g.add(res1_out, ffn2_out);
         
@@ -57,6 +61,7 @@ impl Module for TransformerBlock {
         p.extend(self.norm2.params());
         p.extend(self.ffn1.params());
         p.extend(self.ffn2.params());
+        p.extend(self.ffn_gate.params());
         p
     }
 }
@@ -132,7 +137,7 @@ impl TransformerLM {
             ));
             out.push((
                 format!("model.layers.{i}.mlp.gate_proj.weight"),
-                b.ffn1.weight_id,
+                b.ffn_gate.weight_id,
             ));
 
             out.push((

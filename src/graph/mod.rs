@@ -665,8 +665,16 @@ impl Graph {
 
                 if current_free < scratch_budget {
                     // Evict tensors (that are not shielded) until we reach the budget
+                    #[cfg(feature = "bf16")]
                     let candidate_ids: Vec<usize> = self.tensors.iter()
                         .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)))
+                        .filter(|t| !self.active_node_tensors.contains(&t.id))
+                        .map(|t| t.id)
+                        .collect();
+
+                    #[cfg(not(feature = "bf16"))]
+                    let candidate_ids: Vec<usize> = self.tensors.iter()
+                        .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_)))
                         .filter(|t| !self.active_node_tensors.contains(&t.id))
                         .map(|t| t.id)
                         .collect();

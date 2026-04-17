@@ -208,7 +208,7 @@ fn main() {
     };
 
     println!("Loading tokenizer...");
-    let tokenizer = BPETokenizer::load("data/tokenizer.model").unwrap();
+    let tokenizer = BPETokenizer::load(tokenizer_file).unwrap();
     let vocab_size = tokenizer.vocab.len();
 
     // Dynamically load architecture parameters from the run manifest
@@ -240,10 +240,10 @@ fn main() {
 
     // Initialize our advanced sampler config
     let sampler_config = SamplerConfig {
-        temperature: 0.2,
+        temperature: 0.1,
         top_k: 40,
-        top_p: 0.85,
-        repetition_penalty: 1.2,
+        top_p: 0.99,
+        repetition_penalty: 1.10,
     };
 
     println!("\nModel ready! Type your prompt below. Type 'exit' to quit.");

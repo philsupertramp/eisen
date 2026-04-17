@@ -226,10 +226,23 @@ impl Graph {
         // 3. EMERGENCY EVICTION: Offload activations to CPU RAM
         // We collect the IDs first to avoid borrowing `self` during the loop
         // We will not evict tensors that are currently used.
+        #[cfg(feature = "bf16")]
         let candidate_ids: Vec<usize> = self.tensors.iter()
             .filter(|t| {
                 t.is_pooled && (
                     matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)) || 
+                    matches!(t.grad, Storage::Gpu(_)) // 🚨 NEW: Catch stranded gradients!
+                )
+            })
+            .filter(|t| !self.active_node_tensors.contains(&t.id))
+            .map(|t| t.id)
+            .collect();
+
+        #[cfg(not(feature = "bf16"))]
+        let candidate_ids: Vec<usize> = self.tensors.iter()
+            .filter(|t| {
+                t.is_pooled && (
+                    matches!(t.data, Storage::Gpu(_)) || 
                     matches!(t.grad, Storage::Gpu(_)) // 🚨 NEW: Catch stranded gradients!
                 )
             })
