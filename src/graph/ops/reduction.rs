@@ -531,10 +531,9 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
+                    let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);
                     let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
+                    let grad_slice = self.safe_alloc_zeros::<f32>(stream, 1);
                     self.tensors.push(Tensor {
                         id: tmp_id, shape: vec![],
                         strides: vec![],
@@ -728,6 +727,25 @@ impl Graph {
                 let num_classes = logits.shape[1];
  
                 let out_id  = self.alloc_pooled(vec![]);
+                #[cfg(feature = "bf16")]
+                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
+                    let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);
+                    let tmp_id = self.tensors.len();
+                    let grad_slice = self.safe_alloc_zeros::<f32>(stream, 1);
+                    self.tensors.push(Tensor {
+                        id: tmp_id, shape: vec![],
+                        strides: vec![],
+                        data: Storage::Gpu(f32_slice),
+                        grad: Storage::Gpu(grad_slice),
+                        device: self.device.clone(), name: None, is_pooled: false,
+                    });
+                    (tmp_id, true)
+                } else {
+                    (out_id, false)
+                };
+                #[cfg(not(feature = "bf16"))]
+                #[allow(unused_variables)]
+                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
                 let f_fwd   = self.functions.get("cross_entropy_masked_f32").unwrap().clone();
                 let f_bwd   = self.functions.get("cross_entropy_masked_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
@@ -757,7 +775,7 @@ impl Graph {
                     (_, Some(t)) => t,
                     _ => unreachable!("cross_entropy_masked: logits must be Gpu or GpuBf16"),
                 };
-                let o_s = match &self.tensors[out_id].data {
+                let o_s = match &self.tensors[compute_target_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
@@ -811,6 +829,22 @@ impl Graph {
                         .arg(&c_u64);
                     unsafe { b1.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
                 });
+
+                #[cfg(feature = "bf16")]
+                if cast_to_bf16_after {
+                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
+                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
+                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
+                            let mut b = stream.launch_builder(&f_cast);
+                            let n_elem = 1u64;
+                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
+                            unsafe { b.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
+                            stream.synchronize().unwrap();
+                        }
+                        _ => {}
+                    }
+                    self.tensors.pop();
+                }
  
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {

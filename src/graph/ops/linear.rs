@@ -639,6 +639,41 @@ impl Graph {
         #[allow(unused_variables)]
         let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
 
+        let grad_b_workspace_id = {
+            let tmp_id = self.tensors.len();
+            let grad_b_temp = self.safe_alloc_zeros::<f32>(&stream, k * n);
+            let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
+            self.tensors.push(Tensor {
+                id: tmp_id,
+                shape: vec![k, n],
+                strides: Tensor::compute_strides(&[k, n]),
+                data: Storage::Gpu(grad_b_temp),
+                grad: Storage::Gpu(grad_slice),
+                device: self.device.clone(),
+                name: None,
+                is_pooled: false,
+            });
+            tmp_id
+        };
+
+        #[cfg(feature = "bf16")]
+        let a_bwd_cast_workspace_id = {
+            let tmp_id = self.tensors.len();
+            let a_cast_temp = self.safe_alloc_zeros::<f32>(&stream, m * k);
+            let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
+            self.tensors.push(Tensor {
+                id: tmp_id,
+                shape: vec![m, k],
+                strides: Tensor::compute_strides(&[m, k]),
+                data: Storage::Gpu(a_cast_temp),
+                grad: Storage::Gpu(grad_slice),
+                device: self.device.clone(),
+                name: None,
+                is_pooled: false,
+            });
+            tmp_id
+        };
+
         #[cfg(feature = "bf16")]
         let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
         #[cfg(feature = "bf16")]
@@ -702,13 +737,24 @@ impl Graph {
             };
             
             #[cfg(feature = "bf16")]
-            let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, m * k, &stream_bwd, &f_cast_to_f32_bwd);
+            let a_data = match &tensors[a_id].data {
+                Storage::Gpu(s) => s,
+                Storage::GpuBf16(s) => {
+                    let a_cast_temp = match &tensors[a_bwd_cast_workspace_id].data {
+                        Storage::Gpu(t) => t,
+                        _ => unreachable!("matmul_streamed: a cast workspace must be GPU FP32"),
+                    };
+                    let n = (m * k) as u64;
+                    let mut b = stream_bwd.launch_builder(&f_cast_to_f32_bwd);
+                    b.arg(s).arg(a_cast_temp).arg(&n);
+                    unsafe { b.launch(LaunchConfig::for_num_elems((m * k) as u32)) }.unwrap();
+                    a_cast_temp
+                }
+                _ => unreachable!(),
+            };
             #[cfg(not(feature = "bf16"))]
-            let a_temp_bwd: Option<()> = None;
-
-            let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
-                (Storage::Gpu(s), _) => s,
-                #[cfg(feature = "bf16")] (_, Some(t)) => t,
+            let a_data = match &tensors[a_id].data {
+                Storage::Gpu(s) => s,
                 _ => unreachable!(),
             };
 
@@ -728,9 +774,10 @@ impl Graph {
             unsafe { b1.launch(cfg_a) }.unwrap();
 
             // grad_b = a^T @ grad_out  (GPU temp → dtoh → accumulate into CPU grad)
-            let grad_b_temp = stream_bwd
-                .alloc_zeros::<f32>(k * n)
-                .expect("OOM in backward.");
+            let grad_b_temp = match &tensors[grad_b_workspace_id].data {
+                Storage::Gpu(s) => s,
+                _ => unreachable!("matmul_streamed: grad_b workspace must be GPU FP32"),
+            };
 
             let cfg_b = LaunchConfig {
                 grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
@@ -740,7 +787,7 @@ impl Graph {
             let mut b2 = stream_bwd.launch_builder(&f_bwd_b);
             b2.arg(a_data)
                 .arg(out_grad)
-                .arg(&grad_b_temp)
+                .arg(grad_b_temp)
                 .arg(&m_u64)
                 .arg(&k_u64)
                 .arg(&n_u64);
@@ -752,13 +799,11 @@ impl Graph {
                 .expect("matmul_streamed: backward sync failed");
 
             let grad_b_gpu = stream_bwd
-                .clone_dtoh(&grad_b_temp)
+                .clone_dtoh(grad_b_temp)
                 .expect("matmul_streamed: grad dtoh failed");
 
             // Free GPU temporaries now that data is on CPU
             drop(b_temp_bwd);
-            drop(grad_b_temp);
-
             // Accumulate into the CPU grad buffer (supports gradient accumulation:
             // multiple backward passes add up here, zero_grad resets between steps)
             let b_grad = tensors[b_id].grad.as_cpu_mut();
