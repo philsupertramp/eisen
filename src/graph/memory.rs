@@ -254,11 +254,19 @@ impl Graph {
                     let mut gpu_slice = self.safe_alloc_zeros::<u16>(&stream, u16_data.len());
                     stream.memcpy_htod(&u16_data, &mut gpu_slice).unwrap();
                     self.tensors[tensor_id].data = Storage::GpuBf16(gpu_slice);
-                    return; // grad handled below
                 }
-                let mut gpu_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_data_clone.len());
-                stream.memcpy_htod(&cpu_data_clone, &mut gpu_slice).unwrap();
-                self.tensors[tensor_id].data = Storage::Gpu(gpu_slice);
+                #[cfg(feature = "bf16")]
+                if !(self.uses_bf16_mixed_precision() && self.tensors[tensor_id].is_pooled) {
+                    let mut gpu_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_data_clone.len());
+                    stream.memcpy_htod(&cpu_data_clone, &mut gpu_slice).unwrap();
+                    self.tensors[tensor_id].data = Storage::Gpu(gpu_slice);
+                }
+                #[cfg(not(feature = "bf16"))]
+                {
+                    let mut gpu_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_data_clone.len());
+                    stream.memcpy_htod(&cpu_data_clone, &mut gpu_slice).unwrap();
+                    self.tensors[tensor_id].data = Storage::Gpu(gpu_slice);
+                }
             }
             #[cfg(feature = "bf16")]
             Storage::CpuBf16(bf16_data) => {
