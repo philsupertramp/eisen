@@ -265,7 +265,7 @@ fn main() {
     optim.set_grad_clip_norm(grad_clip_norm);
 
     println!("Pre-allocating optimizer moment buffers...");
-    optim.init_moments(&g);
+    optim.init_moments(&mut g);
 
     let total_params: usize = model
         .params()
