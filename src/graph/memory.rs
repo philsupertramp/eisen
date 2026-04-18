@@ -165,6 +165,11 @@ impl Graph {
             self.tensors[pid].grad = Storage::Cpu(vec![0.0; size]);
         }
 
+        // ensure gpu resident tensors are on the device
+        for &pid in &resident {
+            self.ensure_on_gpu(pid);
+        }
+
         let resident_bytes: usize = pinned_ids
             .iter()
             .chain(resident.iter())
@@ -231,7 +236,13 @@ impl Graph {
             }
         }
 
-        panic!("FATAL OOM: Exhausted VRAM even after full activation eviction!");
+        self.print_vram_state("safe_alloc_zeros");
+        let requested_mb = (size * std::mem::size_of::<T>()) as f64 / 1024.0 / 1024.0;
+        panic!(
+            "FATAL OOM: Exhausted VRAM even after full activation eviction! \n\
+            Attempted to allocate {:.2} MB ({} elements). Driver state likely corrupted by a previous kernel error.", 
+            requested_mb, size
+        );
     }
 
     pub fn ensure_on_gpu(&mut self, tensor_id: usize) {
@@ -342,28 +353,28 @@ impl Graph {
 
             for t in &self.tensors {
                 match &t.data {
-                    Storage::Gpu(s) => active_data_mb += (s.len() * 4) / 1024 / 1024,
+                    Storage::Gpu(s) => active_data_mb += s.len() * 4,
                     #[cfg(feature = "bf16")]
-                    Storage::GpuBf16(s) => active_data_mb += (s.len() * 2) / 1024 / 1024,
-                    Storage::Cpu(s) => offloaded_mb += (s.len() * 4) / 1024 / 1024,
+                    Storage::GpuBf16(s) => active_data_mb += s.len() * 2,
+                    Storage::Cpu(s) => offloaded_mb += s.len() * 4,
                     #[cfg(feature = "bf16")]
-                    Storage::CpuBf16(s) => offloaded_mb += (s.len() * 2) / 1024 / 1024,
+                    Storage::CpuBf16(s) => offloaded_mb += s.len() * 2,
                 }
                 match &t.grad {
-                    Storage::Gpu(s) => active_grad_mb += (s.len() * 4) / 1024 / 1024,
+                    Storage::Gpu(s) => active_grad_mb += s.len() * 4,
                     #[cfg(feature = "bf16")]
-                    Storage::GpuBf16(s) => active_grad_mb += (s.len() * 2) / 1024 / 1024,
-                    Storage::Cpu(s) => offloaded_mb += (s.len() * 4) / 1024 / 1024,
+                    Storage::GpuBf16(s) => active_grad_mb += s.len() * 2,
+                    Storage::Cpu(s) => offloaded_mb += s.len() * 4,
                     #[cfg(feature = "bf16")]
-                    Storage::CpuBf16(s) => offloaded_mb += (s.len() * 2) / 1024 / 1024,
+                    Storage::CpuBf16(s) => offloaded_mb += s.len() * 2,
                 }
             }
 
             println!("--- VRAM STATE [{}] ---", context);
             println!("Driver Used:   {:>5} MB / {} MB", used / 1024 / 1024, total / 1024 / 1024);
-            println!("Data on GPU:   {:>5} MB", active_data_mb);
-            println!("Grads on GPU:  {:>5} MB", active_grad_mb);
-            println!("CPU Offloaded: {:>5} MB  (BF16-compressed where applicable)", offloaded_mb);
+            println!("Data on GPU:   {:>5.3} MB", active_data_mb as f32 / 1024.0 / 1024.0);
+            println!("Grads on GPU:  {:>5.3} MB", active_grad_mb as f32 / 1024.0 / 1024.0);
+            println!("CPU Offloaded: {:>5.3} MB  (BF16-compressed where applicable)", offloaded_mb as f32 / 1024.0 / 1024.0);
             println!("---------------------------------");
         }
     }
