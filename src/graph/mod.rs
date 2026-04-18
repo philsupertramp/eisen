@@ -3,9 +3,8 @@ pub mod memory;
 
 use crate::tape::{Tape, TapeNode};
 use crate::tensor::{Device, Storage, Tensor};
-use cudarc::driver::CudaSlice;
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::env;
 
 
@@ -362,7 +361,7 @@ impl Graph {
             }
             #[cfg(feature = "bf16")]
             Storage::CpuBf16(cpu_vec) => {
-                if let Device::Gpu(_ctx, stream) = &self.device {
+                if let Device::Gpu(_ctx, _stream) = &self.device {
                     // Convert f32 to bf16 by shifting off the lower 16 bits of the mantissa
                     let u16_data: Vec<u16> = host_data
                         .iter()
@@ -615,7 +614,7 @@ impl Graph {
             }
             #[cfg(feature = "bf16")]
             Storage::CpuBf16(s) => {
-                let (_, stream) = match &self.device {
+                let (_, _stream) = match &self.device {
                     Device::Gpu(_, s) => (None::<f32>, s),
                     _ => unreachable!(),
                 };

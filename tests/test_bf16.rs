@@ -2,7 +2,6 @@
 use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg};
 use eisen::graph::Graph;
 use eisen::tensor::{Device, Storage};
-use std::sync::Arc;
 
 fn setup_gpu() -> Option<Device> {
     match CudaContext::new(0) {

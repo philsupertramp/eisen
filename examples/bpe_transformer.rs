@@ -1,9 +1,6 @@
 use eisen::graph::Graph;
-use eisen::nn::embedding::Embedding;
-use eisen::nn::linear::Linear;
 use eisen::nn::optim::AdamW;
-use eisen::nn::rmsnorm::RMSNorm;
-use eisen::nn::transformer::TransformerBlock;
+use eisen::nn::transformer::TransformerLM;
 use eisen::nn::Module;
 use eisen::tensor::Device;
 use cudarc::driver::CudaContext;
@@ -177,7 +174,6 @@ impl BPETokenizer {
 }
 
 fn main() {
-    use crate::nn::transformer::TransformerLM;
     println!("=== Eisen Phase 5: BPE Tokenization + Transformer LLM on GPU ===");
     
     let device = setup_gpu().expect("This Transformer example requires a CUDA GPU!");

@@ -1,6 +1,6 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
+use crate::graph::{Graph, is_bf16};
 use crate::tensor::{Tensor, Device, Storage};
-use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
+use cudarc::driver::{PushKernelArg, LaunchConfig};
 use crate::safe_bf16_temp;
 
 impl Graph {

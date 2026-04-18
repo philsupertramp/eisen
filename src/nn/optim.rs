@@ -194,7 +194,7 @@ impl AdamW {
                 #[cfg(feature = "bf16")]
                 Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
                 #[cfg(feature = "bf16")]
-                Storage::CpuBf16(v) => panic!("AdamW clip: BF16 grad storage is not supported."),
+                Storage::CpuBf16(_) => panic!("AdamW clip: BF16 grad storage is not supported."),
             }
         }
     }

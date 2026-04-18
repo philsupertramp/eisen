@@ -4,7 +4,6 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::thread;
 
 pub mod huggingface;
 
@@ -143,18 +142,3 @@ pub fn pre_tokenize_resumable(
     println!("Pre-tokenization completely finished!");
 }
 
-fn main() {
-    // 1. Load the tokenizer you trained earlier
-    let tokenizer = Arc::new(
-        BPETokenizer::load("data/tokenizer.model")
-            .expect("Train the tokenizer first with tools/train_tokenizer.rs!"),
-    );
-
-    // 2. Transform the Wikipedia/OSCAR dump securely
-    pre_tokenize_resumable(
-        "data/german_large_corpus.txt",
-        "data/german_large_corpus.bin",
-        "data/preprocess_state.txt",
-        tokenizer,
-    );
-}

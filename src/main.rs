@@ -1,6 +1,5 @@
 use eisen::graph::Graph;
 use eisen::tensor::Device;
-use std::sync::Arc;
 use cudarc::driver::{CudaContext};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

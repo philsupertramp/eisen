@@ -1,7 +1,7 @@
 use crate::graph::{Graph, TapeNode, is_bf16};
 use crate::tensor::{Tensor, Device, Storage};
 use crate::data::fim::IGNORE_INDEX;
-use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
+use cudarc::driver::{PushKernelArg, LaunchConfig};
 use crate::safe_bf16_temp;
 
 impl Graph {
@@ -11,7 +11,7 @@ impl Graph {
         match &device {
             Device::Gpu(_, stream) => {
                 let a = &self.tensors[a_id];
-                let a_size = a.shape.iter().product::<usize>();
+                let _a_size = a.shape.iter().product::<usize>();
                 let mut out_shape = a.shape.clone();
                 let mut in_strides = a.strides.clone();
                 let reduced_dim_size = a.shape[dim] as u64;
@@ -63,7 +63,7 @@ impl Graph {
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
 
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = safe_bf16_temp!(self, a_id, a_size, stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, _a_size, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
@@ -199,7 +199,7 @@ impl Graph {
         match &device {
             Device::Gpu(_, stream) => {
                 let a = &self.tensors[a_id];
-                let a_size = a.shape.iter().product::<usize>();
+                let _a_size = a.shape.iter().product::<usize>();
                 let mut out_shape = a.shape.clone();
                 let mut in_strides = a.strides.clone();
                 let reduced_dim_size = a.shape[dim] as u64;
@@ -251,9 +251,9 @@ impl Graph {
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
+                
                 #[cfg(feature = "bf16")]
-                let a_temp_fwd = safe_bf16_temp!(self, a_id, a_size, stream, &f_cast_to_f32);
+                let a_temp_fwd = safe_bf16_temp!(self, a_id, _a_size, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let a_temp_fwd: Option<()> = None;
 
@@ -286,7 +286,7 @@ impl Graph {
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     #[cfg(feature = "bf16")]
-                    let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, a_size, &stream_clone, &f_cast_to_f32_bwd);
+                    let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, _a_size, &stream_clone, &f_cast_to_f32_bwd);
                     #[cfg(not(feature = "bf16"))]
                     let a_temp_bwd: Option<()> = None;
 

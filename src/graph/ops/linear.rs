@@ -1,7 +1,7 @@
 use crate::graph::{Graph, TapeNode, is_bf16};
 use crate::safe_bf16_temp;
 use crate::tensor::{Tensor, Device, Storage};
-use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
+use cudarc::driver::{PushKernelArg, LaunchConfig, CudaFunction};
 use std::collections::HashMap;
 
 fn matmul_kernels(
