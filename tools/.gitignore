@@ -1,0 +1,6 @@
+models/
+.venv/
+
+*.jsonl
+*.txt
+*.json
