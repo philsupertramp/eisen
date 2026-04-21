@@ -422,6 +422,9 @@ impl Graph {
 
                 let out_id = self.alloc_pooled(out_shape);
 
+                self.ensure_on_gpu(a_id);
+                self.ensure_on_gpu(out_id);
+
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
                     match (&self.tensors[a_id].data, &self.tensors[out_id].data) {
@@ -432,7 +435,10 @@ impl Graph {
                         (Storage::GpuBf16(a_s), Storage::GpuBf16(o_s)) => {
                             builder.arg(a_s).arg(o_s).arg(&b).arg(&n);
                         }
-                        _ => panic!("softmax: unsupported storage"),
+                        (p1, p2) => panic!(
+                            "softmax: unsupported storage combination. Received: ({:?}, {:?})",
+                            p1, p2
+                        ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(b as u32)) }.unwrap();
                 }

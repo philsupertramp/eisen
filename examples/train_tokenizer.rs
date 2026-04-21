@@ -7,11 +7,11 @@ use rand::Rng;
 /// The entry point for training our German BPE model on large datasets.
 fn main() {
     // --- CONFIGURATION ---
-    let input_path = "data/german_tiny_story_corpus.txt"; // The output from your Python script
-    let output_tokenizer_path = "data/tinystory_tokenizer.model";
-    let cache_path = "data/tinystory_sampled_training_text.txt"; // State recovery cache
+    let input_path = "data/german_corpus.txt"; // The output from your Python script
+    let output_tokenizer_path = "data/tokenizer.model";
+    let cache_path = "data/sampled_training_text.txt"; // State recovery cache
     let target_vocab_size = 65536; // Larger vocab for complex German compounds
-    let sample_size_mb = 1.5 * 1024 * 1024 * 1024;     // Statistical sample size (50MB is plenty for BPE)
+    let sample_size_mb = (1.5 * 1024.0 * 1024.0 * 1024.0) as usize;     // Statistical sample size (50MB is plenty for BPE)
 
     println!("=== Eisen Tokenizer Trainer ===");
     

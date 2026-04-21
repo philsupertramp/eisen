@@ -74,6 +74,10 @@ impl Graph {
                         };
                     }
 
+                    self.ensure_on_gpu(a_id);
+                    self.ensure_on_gpu(b_id);
+                    self.ensure_on_gpu(out_id);
+
                     match (
                         &self.tensors[a_id].data,
                         &self.tensors[b_id].data,
@@ -103,7 +107,10 @@ impl Graph {
                             builder.arg(a).arg(&b_u16_slice).arg(o);
                             push_stride_args!(builder);
                         }
-                        _ => panic!("add: unsupported storage combination"),
+                        (p1, p2, p3) => panic!(
+                            "add: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
+                            p1, p2, p3
+                        ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 }
@@ -220,6 +227,9 @@ impl Graph {
 
                 let out_id = self.alloc_pooled(out_shape);
                 let n = out_size as u64;
+                self.ensure_on_gpu(a_id);
+                self.ensure_on_gpu(b_id);
+                self.ensure_on_gpu(out_id);
 
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
@@ -239,7 +249,10 @@ impl Graph {
                         (Storage::GpuBf16(a), Storage::Gpu(b), Storage::GpuBf16(o)) => {
                             builder.arg(a).arg(b).arg(o).arg(&n);
                         }
-                        _ => panic!("mul: unsupported storage combination"),
+                        (p1, p2, p3) => panic!(
+                            "mul: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
+                            p1, p2, p3
+                        ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 }
@@ -267,7 +280,10 @@ impl Graph {
                         (Storage::GpuBf16(a), Storage::Gpu(b)) => {
                             builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
                         }
-                        _ => panic!("mul_backward: unsupported storage"),
+                        (p1, p2) => panic!(
+                            "mul_backward: unsupported storage combination. Received: ({:?}, {:?})",
+                            p1, p2
+                        ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
@@ -352,6 +368,9 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(a_shape);
+
+                self.ensure_on_gpu(a_id);
+                self.ensure_on_gpu(out_id);
 
                 // ── Forward launch ─────────────────────────────────────────────
                 {

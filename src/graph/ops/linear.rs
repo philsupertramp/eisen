@@ -106,6 +106,10 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 let b_temp_fwd: Option<()> = None;
 
+                self.ensure_on_gpu(a_id);
+                self.ensure_on_gpu(b_id);
+                self.ensure_on_gpu(compute_target_id);
+
                 let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
                     #[cfg(feature = "bf16")] (_, Some(t)) => t,
@@ -912,6 +916,10 @@ impl Graph {
                 let b_temp_fwd = safe_bf16_temp!(self, b_id, batch * k * n, &stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let b_temp_fwd: Option<()> = None;
+
+                self.ensure_on_gpu(a_id);
+                self.ensure_on_gpu(b_id);
+                self.ensure_on_gpu(compute_target_id);
 
                 let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
