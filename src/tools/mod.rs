@@ -63,7 +63,19 @@ pub fn train_on_sampled_data(
     }
 
     println!("Training BPE on sampled text...");
-    let tokenizer = BPETokenizer::train(&combined_text, target_vocab_size);
+    let special_tokens = vec![
+        "<|endoftext|>".to_string(),
+        "<|pad|>".to_string(),
+        "<EMAIL>".to_string(),
+        "<PHONE>".to_string(),
+        "<IBAN>".to_string(),
+        "<|system|>".to_string(),
+        "<|user|>".to_string(),
+        "<|assistant|>".to_string(),
+        "<|leichte_sprache|>".to_string()
+    ];
+
+    let tokenizer = BPETokenizer::train(&combined_text, target_vocab_size, special_tokens);
 
     println!("Saving tokenizer to {}...", output_tokenizer_path);
     tokenizer

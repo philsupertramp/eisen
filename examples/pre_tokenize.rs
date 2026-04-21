@@ -161,7 +161,7 @@ pub fn pre_tokenize_multithreaded(txt_input_path: &str, bin_output_path: &str, s
 
 fn main() {
     let tokenizer = Arc::new(
-        BPETokenizer::load("data/tinystory_tokenizer.model")
+        BPETokenizer::load("data/german_tokenizer.model")
             .expect("Train the tokenizer first with examples/train_tokenizer.rs!")
     );
 

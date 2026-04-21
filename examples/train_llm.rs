@@ -150,7 +150,7 @@ fn main() {
     spawn_eisenboard(shared_stats.clone(), &board_bind);
 
     // ── Paths ────────────────────────────────────────────────────────────────
-    let tokenizer_path = "data/tokenizer.model";
+    let tokenizer_path = "data/german_tokenizer.model";
     let bin_path = "data/german_large_corpus.bin";
     let output_path = "data/eisen_model.bin";
     let hf_out_dir = "data/hf_export";
