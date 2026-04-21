@@ -174,8 +174,8 @@ fn main() {
              base_vocab_size, fim_overhead, vocab_size);
 
     // ----- FIM config ----
-    let fim_rate    = env_f32("EISEN_FIM_RATE",     0.5);
-    let fim_spm     = env_f32("EISEN_FIM_SPM_RATE", 0.5);
+    let fim_rate    = env_f32("EISEN_FIM_RATE",     0.0);
+    let fim_spm     = env_f32("EISEN_FIM_SPM_RATE", 0.0);
     let use_fim     = fim_rate > 0.0;
     let fim_config  = FimConfig::new(base_vocab_size)
         .with_rate(fim_rate)
@@ -218,7 +218,7 @@ fn main() {
 
     // Scale the total steps based on the number of epochs requested
     let total_steps = dataloader.total_batches() * epochs;
-    let warmup_steps = 2usize;
+    let warmup_steps = 0usize;
     let lr_max = 1e-3_f32;
     let lr_min = 1e-4_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);

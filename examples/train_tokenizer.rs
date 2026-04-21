@@ -28,12 +28,12 @@ fn main() {
         let sample_bytes = sample_size_mb;
         let mut text = String::with_capacity(sample_bytes);
         
-        println!("Dataset: {} ({:.2} GB)", input_path, file_size as f64 / 1e9);
-        println!("Sampling strategy: 100 random chunks totalling {} MB", sample_size_mb);
+        println!("Dataset: {} ({:} [{:.2} GB])", input_path, file_size, file_size as f64 / 1e9);
+        println!("Sampling strategy: 100 random chunks totalling {} MB", sample_size_mb as f64 / 1024.0 / 1024.0 / 1024.0);
 
         let mut rng = rand::thread_rng();
         let num_chunks = 100; 
-        let chunk_size = sample_bytes / num_chunks;
+        let chunk_size = (sample_bytes / num_chunks).max(1);
 
         for i in 0..num_chunks {
             let offset = rng.gen_range(0..file_size.saturating_sub(chunk_size as u64));
