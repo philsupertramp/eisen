@@ -4,3 +4,4 @@ pub mod linear;
 pub mod normalization;
 pub mod reduction;
 pub mod transform;
+pub mod gqa;

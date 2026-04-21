@@ -24,7 +24,7 @@ fn main() {
     let batch_size = 4usize;
 
     let model = TransformerLM::new(
-        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers,
+        &mut g, vocab_size, hidden_dim, num_heads, num_heads, ffn_dim, num_layers, false
     );
     g.mark_params();
     let mut optim = AdamW::new(model.params(), 1e-3);

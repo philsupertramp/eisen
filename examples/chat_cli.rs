@@ -227,7 +227,7 @@ fn main() {
              num_layers, hidden_dim, num_heads, ffn_dim, seq_len);
 
     let mut g = Graph::new(device);
-    let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers);
+    let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, num_heads, ffn_dim, num_layers, false);
     
     // CRITICAL FIX: Lock parameters so clear_activations doesn't delete them!
     g.mark_params(); 

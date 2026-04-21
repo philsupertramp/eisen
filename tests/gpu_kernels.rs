@@ -527,7 +527,7 @@ fn test_gpu_transformer_block_forward_backward() {
 
     // Instantiate the complete Transformer Block
     let block =
-        eisen::nn::transformer::TransformerBlock::new(&mut g, hidden_dim, num_heads, ffn_dim);
+        eisen::nn::transformer::TransformerBlock::new(&mut g, hidden_dim, num_heads, num_heads, ffn_dim);
 
     // Mock Input: Batch=2, SeqLen=4, HiddenDim=16
     let x_data = vec![0.5; 2 * 4 * 16];
@@ -565,7 +565,7 @@ fn test_gpu_gradient_checkpointing() {
     let mut g = Graph::new(device);
 
     let hidden_dim = 16;
-    let block = eisen::nn::transformer::TransformerBlock::new(&mut g, hidden_dim, 4, 64);
+    let block = eisen::nn::transformer::TransformerBlock::new(&mut g, hidden_dim, 4, 4, 64);
     g.mark_params();
 
     // 1. Allocate block input
@@ -574,6 +574,7 @@ fn test_gpu_gradient_checkpointing() {
 
     // ** SAVE POINT: Captures the graph exactly at `x_id`. **
     let save_point = g.mark_save_point();
+    g.mark_params();
 
     // 2. FORWARD PASS WITH CHECKPOINTING (Saves VRAM)
     g.no_grad = true;

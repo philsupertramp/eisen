@@ -753,3 +753,55 @@ extern "C" __global__ void matmul_f32_bf16out(
     if (row < (int)m && col < (int)n)
         out[row * n + col] = __float2bfloat16(sum);
 }
+
+extern "C" __global__ void repeat_kv_bf16(
+    const __nv_bfloat16* __restrict__ input,
+    __nv_bfloat16* __restrict__ output,
+    int batch, int num_kv_heads, int repeats, int seq_len, int head_dim
+) {
+    int num_q_heads = num_kv_heads * repeats;
+    int total_elements = batch * num_q_heads * seq_len * head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_elements) {
+        int d = idx % head_dim;
+        int s = (idx / head_dim) % seq_len;
+        int q_h = (idx / (head_dim * seq_len)) % num_q_heads;
+        int b = idx / (head_dim * seq_len * num_q_heads);
+
+        int kv_h = q_h / repeats;
+        int in_idx = ((b * num_kv_heads + kv_h) * seq_len + s) * head_dim + d;
+
+        output[idx] = input[in_idx];
+    }
+}
+
+extern "C" __global__ void repeat_kv_backward_bf16(
+    const __nv_bfloat16* __restrict__ grad_out,
+    __nv_bfloat16* __restrict__ grad_in,
+    int batch, int num_kv_heads, int repeats, int seq_len, int head_dim
+) {
+    int total_kv_elements = batch * num_kv_heads * seq_len * head_dim;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < total_kv_elements) {
+        int d = idx % head_dim;
+        int s = (idx / head_dim) % seq_len;
+        int kv_h = (idx / (head_dim * seq_len)) % num_kv_heads;
+        int b = idx / (head_dim * seq_len * num_kv_heads);
+
+        // ALWAYS accumulate gradients in FP32 to avoid vanishing gradients
+        float sum = 0.0f;
+        int num_q_heads = num_kv_heads * repeats;
+        
+        for (int r = 0; r < repeats; ++r) {
+            int q_h = kv_h * repeats + r;
+            int gout_idx = ((b * num_q_heads + q_h) * seq_len + s) * head_dim + d;
+            sum += __bfloat162float(grad_out[gout_idx]);
+        }
+
+        // Add back to existing gradient and cast down to BF16
+        float current_grad = __bfloat162float(grad_in[idx]);
+        grad_in[idx] = __float2bfloat16(current_grad + sum);
+    }
+}

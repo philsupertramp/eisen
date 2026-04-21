@@ -534,7 +534,6 @@ impl Graph {
                 let batch_size = logits.shape[0];
                 let num_classes = logits.shape[1];
                 let out_id = self.alloc_pooled(vec![]);
-
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);
@@ -575,6 +574,17 @@ impl Graph {
                 let l_temp_fwd = safe_bf16_temp!(self, logits_id, batch_size * num_classes, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let l_temp_fwd: Option<()> = None;
+
+                if let (Storage::Gpu(s), Device::Gpu(_, stream)) =
+                    (&self.tensors[compute_target_id].data, &self.device)
+                {
+                    let f_fill = self.functions.get("fill_f32").unwrap().clone();
+                    let n = 1u64;
+                    let val = 0.0f32;
+                    let mut builder = stream.launch_builder(&f_fill);
+                    builder.arg(s).arg(&val).arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
+                }
 
                 let l_s = match (&self.tensors[logits_id].data, &l_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
@@ -755,6 +765,17 @@ impl Graph {
                 let f_fwd   = self.functions.get("cross_entropy_masked_f32").unwrap().clone();
                 let f_bwd   = self.functions.get("cross_entropy_masked_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
+
+                if let (Storage::Gpu(s), Device::Gpu(_, stream)) =
+                    (&self.tensors[compute_target_id].data, &self.device)
+                {
+                    let f_fill = self.functions.get("fill_f32").unwrap().clone();
+                    let n = 1u64;
+                    let val = 0.0f32;
+                    let mut builder = stream.launch_builder(&f_fill);
+                    builder.arg(s).arg(&val).arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
+                }
  
                 let targets_f32: Vec<f32> = targets
                     .iter()

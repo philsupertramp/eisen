@@ -33,7 +33,7 @@ use eisen::data::dataloader::BatchResult;
 use std::env;
 use std::fs;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, UNIX_EPOCH, SystemTime};
 
@@ -218,19 +218,20 @@ fn main() {
 
     // Scale the total steps based on the number of epochs requested
     let total_steps = dataloader.total_batches() * epochs;
-    let warmup_steps = 0usize;
-    let lr_max = 1e-3_f32;
-    let lr_min = 1e-4_f32;
+    let warmup_steps = 500usize;
+    let lr_max = 6e-4_f32;
+    let lr_min = 6e-5_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
     let log_interval = 50_usize;
+    let board_interval = 1_usize;
 
     // ── Model + streaming layout ──────────────────────────────────────────────
     println!("\nBuilding model…");
     let mut g = Graph::new(device);
     let model = TransformerLM::new(
-        &mut g, vocab_size, hidden_dim, num_heads, ffn_dim, num_layers
+        &mut g, vocab_size, hidden_dim, num_heads, 4, ffn_dim, num_layers, true
     );
 
     g.mark_params();
@@ -267,12 +268,7 @@ fn main() {
     println!("Pre-allocating optimizer moment buffers...");
     optim.init_moments(&mut g);
 
-    let total_params: usize = model
-        .params()
-        .iter()
-        .map(|&id| g.tensors[id].shape.iter().product::<usize>())
-        .sum();
-        
+    let total_params = g.tensors[0..g.num_params].iter().map(|t| t.size()).sum::<usize>();
     println!("\nArchitecture summary:");
     println!("Trainable parameters: {}", total_params);
     println!(
@@ -388,7 +384,16 @@ fn main() {
         let mut step_loss = 0.0_f32;
         let mut micro_count = 0_usize;
 
-        for _ in 0..accum_steps {
+        // Change `_` to `m_step`
+        for m_step in 0..accum_steps {
+            // --- NEW: Inline progress indicator ---
+            // Update every 10 steps to avoid excessive I/O overhead
+            if accum_steps > 100 && m_step % 10 == 0 {
+                print!("\x1b[2K\rEpoch {} | Step {:06} | Accumulating {}/{} ({:.1}%)", 
+                       current_epoch, step, m_step, accum_steps, 
+                       (m_step as f32 / accum_steps as f32) * 100.0);
+                let _ = io::stdout().flush();
+            }
             let batch: BatchResult = match dataloader.next_batch() {
                 Some(b) => b,
                 None => {
@@ -435,6 +440,12 @@ fn main() {
             g.clear_activations();
         }
 
+        // --- NEW: Clear the progress line before the optimizer step ---
+        if accum_steps > 100 {
+            print!("\x1b[2K\r");
+            let _ = io::stdout().flush();
+        }
+
         if micro_count == 0 {
             break;
         }
@@ -468,10 +479,10 @@ fn main() {
         }
 
         // ── EisenBoard telemetry ──────────────────────────────────────────────
-        if step % 1 == 0 {
+        if step % board_interval == 0 {
             let elapsed = board_timer.elapsed().as_secs_f32();
-            let tps = (10 * tokens_per_step) as f32 / elapsed.max(1e-6);
-            let batch_time_ms = (elapsed * 1000.0) / 10.0;
+            let tps = (board_interval * tokens_per_step) as f32 / elapsed.max(1e-6);
+            let batch_time_ms = (elapsed * 1000.0) / (board_interval as f32);
 
             if let Ok(mut s) = shared_stats.write() {
                 s.step = step;

@@ -1,6 +1,6 @@
 use crate::graph::Graph;
 use crate::nn::Module;
-use crate::nn::attention::MultiHeadAttention;
+use crate::nn::attention::GroupedQueryAttention;
 use crate::nn::linear::Linear;
 use crate::nn::rmsnorm::RMSNorm;
 use crate::nn::embedding::Embedding;
@@ -8,7 +8,7 @@ use crate::nn::embedding::Embedding;
 /// A standard Pre-Norm Transformer Block.
 pub struct TransformerBlock {
     pub norm1: RMSNorm,
-    pub attn: MultiHeadAttention,
+    pub attn: GroupedQueryAttention,
     pub norm2: RMSNorm,
     pub ffn1: Linear,
     pub ffn2: Linear,
@@ -16,10 +16,10 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize, ffn_dim: usize) -> Self {
+    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize, num_kv_heads: usize, ffn_dim: usize) -> Self {
         Self {
             norm1: RMSNorm::new(g, hidden_dim, 1e-5),
-            attn: MultiHeadAttention::new(g, hidden_dim, num_heads),
+            attn: GroupedQueryAttention::new(g, hidden_dim, num_heads, num_kv_heads),
             norm2: RMSNorm::new(g, hidden_dim, 1e-5),
             // No biases in modern LLM FFN layers
             ffn_gate: Linear::new(g, hidden_dim, ffn_dim, false),
@@ -71,6 +71,7 @@ pub struct TransformerLM {
     pub blocks:    Vec<TransformerBlock>,
     pub norm_f:    RMSNorm,
     pub lm_head:   Linear,
+    pub tie_weights: bool,
 }
 
 impl TransformerLM {
@@ -79,8 +80,10 @@ impl TransformerLM {
         vocab_size: usize,
         hidden_dim: usize,
         num_heads:  usize,
+        num_kv_heads: usize,
         ffn_dim:    usize,
         num_layers: usize,
+        tie_weights: bool,
     ) -> Self {
         let token_emb = Embedding::new(g, vocab_size, hidden_dim);
 
@@ -88,7 +91,7 @@ impl TransformerLM {
         // CPU so model init does not require full-model VRAM residency.
         let mut blocks = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
-            let block = TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim);
+            let block = TransformerBlock::new(g, hidden_dim, num_heads, num_kv_heads, ffn_dim);
             for pid in block.params() {
                 // Keep tiny 1D norm scales resident; stream only matrix weights.
                 // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
@@ -100,8 +103,17 @@ impl TransformerLM {
         }
 
         let norm_f  = RMSNorm::new(g, hidden_dim, 1e-5);
-        let lm_head = Linear::new(g, hidden_dim, vocab_size, false);
-        Self { token_emb, blocks, norm_f, lm_head }
+        
+        let lm_head = if tie_weights {
+            Linear {
+                weight_id: token_emb.weight_id,
+                bias_id: None,
+            }
+        } else {
+            Linear::new(g, hidden_dim, vocab_size, false)
+        };
+
+        Self { token_emb, blocks, norm_f, lm_head, tie_weights }
     }
 
     pub fn named_params(&self) -> Vec<(String, usize)> {
@@ -150,7 +162,12 @@ impl TransformerLM {
             ));
         }
         out.push(("model.norm.weight".to_string(), self.norm_f.weight_id));
-        out.push(("lm_head.weight".to_string(), self.lm_head.weight_id));
+        
+        // Prevent HF export/checkpointing from duplicating the huge tensor
+        if !self.tie_weights {
+            out.push(("lm_head.weight".to_string(), self.lm_head.weight_id));
+        }
+        
         out
     }
 
@@ -163,14 +180,25 @@ impl Module for TransformerLM {
             h = block.forward_with_mask(g, h, true);
         }
         h = self.norm_f.forward(g, h);
-        self.lm_head.forward(g, h)
+        
+        if self.tie_weights {
+            g.matmul_trans_b(h, self.lm_head.weight_id)
+        } else {
+            self.lm_head.forward(g, h)
+        }
     }
+    
     fn params(&self) -> Vec<usize> {
         let mut p = self.token_emb.params();
         for b in &self.blocks { p.extend(b.params()); }
         p.extend(self.norm_f.params());
-        p.extend(self.lm_head.params());
+        
+        // Critically important: Prevent the optimizer from double-stepping
+        // the gradients/momentum on the exact same tensor ID.
+        if !self.tie_weights {
+            p.extend(self.lm_head.params());
+        }
+        
         p
     }
 }
-

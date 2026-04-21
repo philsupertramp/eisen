@@ -245,3 +245,157 @@ impl Module for MultiHeadAttention {
         p
     }
 }
+
+pub struct GroupedQueryAttention {
+    pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub head_dim: usize,
+    pub hidden_dim: usize,
+    pub q_proj: Linear,
+    pub k_proj: Linear,
+    pub v_proj: Linear,
+    pub out_proj: Linear,
+}
+
+impl GroupedQueryAttention {
+    pub fn new(g: &mut Graph, hidden_dim: usize, num_heads: usize, num_kv_heads: usize) -> Self {
+        assert!(
+            hidden_dim % num_heads == 0,
+            "hidden_dim must be cleanly divisible by num_heads"
+        );
+        assert!(
+            num_heads % num_kv_heads == 0,
+            "num_heads must be divisible by num_kv_heads"
+        );
+
+        let head_dim = hidden_dim / num_heads;
+        let kv_dim = num_kv_heads * head_dim;
+
+        Self {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            hidden_dim,
+            q_proj: Linear::new(g, hidden_dim, hidden_dim, false),
+            // Look here: Projections are drastically smaller!
+            k_proj: Linear::new(g, hidden_dim, kv_dim, false),
+            v_proj: Linear::new(g, hidden_dim, kv_dim, false),
+            out_proj: Linear::new(g, hidden_dim, hidden_dim, false),
+        }
+    }
+
+    pub fn forward_with_mask(&self, g: &mut Graph, x_id: usize, causal: bool) -> usize {
+        let shape = g.tensors[x_id].shape.clone();
+        assert_eq!(shape.len(), 3, "GQA requires [Batch, Seq, Dim]");
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        // 1. Projections -> Q is [B, S, HDim], K/V are [B, S, KVDim]
+        let q_id = self.q_proj.forward(g, x_id);
+        let k_id = self.k_proj.forward(g, x_id);
+        let v_id = self.v_proj.forward(g, x_id);
+
+        // 2. Rotary Embeddings applied natively
+        let q_rope_id = g.rope(q_id, self.head_dim);
+        let k_rope_id = g.rope(k_id, self.head_dim);
+
+        // 3. Reshape for Heads
+        let q_4d = g.reshape(
+            q_rope_id,
+            vec![batch, seq_len, self.num_heads, self.head_dim],
+        );
+        let k_4d = g.reshape(
+            k_rope_id,
+            vec![batch, seq_len, self.num_kv_heads, self.head_dim],
+        );
+        let v_4d = g.reshape(
+            v_id, 
+            vec![batch, seq_len, self.num_kv_heads, self.head_dim]
+        );
+
+        // 4. Transpose to [Batch, Heads, Seq, HeadDim]
+        let q_t = g.transpose_0213(q_4d);
+        let k_t = g.transpose_0213(k_4d);
+        let v_t = g.transpose_0213(v_4d);
+
+        // 5. Repeat KV Heads to match Query Heads
+        let repeats = self.num_heads / self.num_kv_heads;
+        let k_repeated = g.repeat_kv(k_t, repeats);
+        let v_repeated = g.repeat_kv(v_t, repeats);
+
+        // 6. Flatten Batch and Heads to use BMM -> [Batch * Heads, Seq, HeadDim]
+        let bh = batch * self.num_heads;
+        g.reinterpret_shape(q_t, vec![bh, seq_len, self.head_dim]);
+        g.reinterpret_shape(k_repeated, vec![bh, seq_len, self.head_dim]);
+        g.reinterpret_shape(v_repeated, vec![bh, seq_len, self.head_dim]);
+
+        let scale = 1.0 / (self.head_dim as f32).sqrt();
+        let context_flat = if g.no_grad {
+            g.flash_attention(q_t, k_repeated, v_repeated, scale, causal)
+        } else {
+            // 7. Q @ K.T -> Scores [Batch * Heads, Seq, Seq]
+            let scores_id = g.bmm(q_t, k_repeated, true);
+
+            // 8. Scale
+            let scale_id = g.alloc_pooled(vec![bh, seq_len, seq_len]);
+            let scale_m = vec![scale; bh * seq_len * seq_len];
+            g.load_tensor_data(scale_id, &scale_m);
+            let scaled_scores_id = g.mul(scores_id, scale_id);
+
+            // 9. Masking
+            let masked_scores_id = if causal {
+                let mut mask_data = vec![0.0; seq_len * seq_len];
+                for r in 0..seq_len {
+                    for c in 0..seq_len {
+                        if c > r {
+                            mask_data[r * seq_len + c] = -1e20;
+                        }
+                    }
+                }
+
+                #[cfg(feature = "bf16")]
+                let mask_id = if g.uses_bf16_mixed_precision() {
+                    g.alloc_param_bf16(vec![1, seq_len, seq_len], mask_data)
+                } else {
+                    g.alloc(vec![1, seq_len, seq_len], mask_data)
+                };
+                #[cfg(not(feature = "bf16"))]
+                let mask_id = g.alloc(vec![1, seq_len, seq_len], mask_data);
+
+                g.add(scaled_scores_id, mask_id)
+            } else {
+                scaled_scores_id
+            };
+
+            // 10. Softmax & V
+            let probs_id = g.softmax(masked_scores_id);
+            g.bmm(probs_id, v_repeated, false)
+        };
+
+        // 11. Reshape & Transpose Back
+        g.reinterpret_shape(
+            context_flat,
+            vec![batch, self.num_heads, seq_len, self.head_dim],
+        );
+        let context_t = g.transpose_0213(context_flat);
+        let context_id = g.reshape(context_t, vec![batch, seq_len, self.hidden_dim]);
+
+        // 12. Final Projection
+        self.out_proj.forward(g, context_id)
+    }
+}
+
+impl Module for GroupedQueryAttention {
+    fn forward(&self, g: &mut Graph, x_id: usize) -> usize {
+        self.forward_with_mask(g, x_id, true)
+    }
+
+    fn params(&self) -> Vec<usize> {
+        let mut p = Vec::new();
+        p.extend(self.q_proj.params());
+        p.extend(self.k_proj.params());
+        p.extend(self.v_proj.params());
+        p.extend(self.out_proj.params());
+        p
+    }
+}

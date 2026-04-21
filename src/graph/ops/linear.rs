@@ -284,6 +284,174 @@ impl Graph {
         }
     }
 
+    pub fn matmul_trans_b(&mut self, a_id: usize, b_id: usize) -> usize {
+        // 1. Streaming dispatch (consistent with matmul)
+        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        #[cfg(feature = "bf16")]
+        let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
+        #[cfg(not(feature = "bf16"))]
+        let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_));
+
+        if a_is_gpu && b_is_cpu {
+            // For now, we assume tied weights (embedding) are already on GPU
+            // or we'd implement a matmul_trans_b_streamed here.
+        }
+
+        let a_shape = self.tensors[a_id].shape.clone();
+        let b_shape = self.tensors[b_id].shape.clone();
+        
+        assert!(a_shape.len() >= 2, "matmul_trans_b: lhs must have rank >= 2");
+        assert_eq!(b_shape.len(), 2, "matmul_trans_b: rhs must have rank 2 [n, k]");
+        
+        let k = *a_shape.last().unwrap();
+        let m = a_shape[..a_shape.len() - 1].iter().product::<usize>();
+        let n = b_shape[0]; 
+        
+        assert_eq!(
+            b_shape[1], k,
+            "matmul_trans_b: lhs last dim must equal rhs last dim (k)"
+        );
+
+        let device = self.device.clone();
+
+        match &device {
+            Device::Gpu(_, stream) => {
+                let stream_clone = stream.clone();
+
+                // Resolve kernels (sticking to the naming convention)
+                let f_fwd = self.functions.get("matmul_trans_b_f32").expect("matmul_trans_b_f32 kernel not found").clone();
+                let f_bwd_a = self.functions.get("matmul_f32").expect("matmul_f32 kernel not found").clone();
+                let f_bwd_b = self.functions.get("matmul_trans_a_f32").expect("matmul_trans_a_f32 kernel not found").clone();
+
+                #[cfg(feature = "bf16")]
+                let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
+                #[cfg(feature = "bf16")]
+                let f_cast_to_f32_bwd = f_cast_to_f32.clone();
+
+
+                let mut out_shape = a_shape.clone();
+                *out_shape.last_mut().unwrap() = n;
+                let out_id = self.alloc_pooled(out_shape);
+
+                self.ensure_on_gpu(a_id);
+                self.ensure_on_gpu(b_id);
+                self.ensure_on_gpu(out_id);
+
+                let m_u64 = m as u64;
+                let k_u64 = k as u64;
+                let n_u64 = n as u64;
+
+                // --- FORWARD ---
+                {
+                    #[cfg(feature = "bf16")]
+                    let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
+                    #[cfg(not(feature = "bf16"))]
+                    let a_temp_fwd: Option<()> = None;
+
+                    #[cfg(feature = "bf16")]
+                    let b_temp_fwd = safe_bf16_temp!(self, b_id, k * n, &stream, &f_cast_to_f32);
+                    #[cfg(not(feature = "bf16"))]
+                    let b_temp_fwd: Option<()> = None;
+
+                    let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
+                        (Storage::Gpu(s), _) => s,
+                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                        _ => unreachable!(),
+                    };
+                    let b_s = match (&self.tensors[b_id].data, &b_temp_fwd) {
+                        (Storage::Gpu(s), _) => s,
+                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                        _ => unreachable!(),
+                    };
+                    let o_s = match &self.tensors[out_id].data {
+                        Storage::Gpu(s) => s,
+                        _ => unreachable!(),
+                    };
+
+                    let mut builder = stream.launch_builder(&f_fwd);
+                    builder.arg(a_s).arg(b_s).arg(o_s).arg(&m_u64).arg(&k_u64).arg(&n_u64);
+
+                    let cfg = LaunchConfig {
+                        grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
+                        block_dim: (16, 16, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    unsafe { builder.launch(cfg) }.unwrap();
+                }
+
+                // --- BACKWARD ---
+                if !self.no_grad {
+                    let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+                        let out_grad = match &tensors[out_id].grad {
+                            Storage::Gpu(s) => s,
+                            _ => unreachable!(),
+                        };
+                        let a_grad = match &tensors[a_id].grad {
+                            Storage::Gpu(s) => s,
+                            _ => unreachable!(),
+                        };
+                        let b_grad = match &tensors[b_id].grad {
+                            Storage::Gpu(s) => s,
+                            _ => unreachable!(),
+                        };
+                        
+                        #[cfg(feature = "bf16")]
+                        let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, m * k, &stream_clone, &f_cast_to_f32_bwd);
+                        #[cfg(not(feature = "bf16"))]
+                        let a_temp_bwd: Option<()> = None;
+
+                        #[cfg(feature = "bf16")]
+                        let b_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[b_id].data, k * n, &stream_clone, &f_cast_to_f32_bwd);
+                        #[cfg(not(feature = "bf16"))]
+                        let b_temp_bwd: Option<()> = None;
+
+                        let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
+                            (Storage::Gpu(s), _) => s,
+                            #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                            _ => unreachable!(),
+                        };
+                        let b_data = match (&tensors[b_id].data, &b_temp_bwd) {
+                            (Storage::Gpu(s), _) => s,
+                            #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                            _ => unreachable!(),
+                        };
+
+                        // 1. dA = dC * B  (Standard Matmul)
+                        let mut b1 = stream_clone.launch_builder(&f_bwd_a);
+                        b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                        let cfg_a = LaunchConfig {
+                            grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
+                            block_dim: (16, 16, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe { b1.launch(cfg_a) }.unwrap();
+
+                        // 2. dB = dC^T * A (Transposed A Matmul)
+                        let mut b2 = stream_clone.launch_builder(&f_bwd_b);
+                        b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                        let cfg_b = LaunchConfig {
+                            grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
+                            block_dim: (16, 16, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        unsafe { b2.launch(cfg_b) }.unwrap();
+                    });
+
+                    self.tape.nodes.push(TapeNode {
+                        inputs: vec![a_id, b_id],
+                        output: out_id,
+                        backward_fn,
+                    });
+                }
+                out_id
+            }
+            Device::Cpu => {
+                // ... (existing CPU logic would go here)
+                unimplemented!("CPU matmul_trans_b not implemented yet")
+            }
+        }
+    }
+
     /// Mixed-precision matrix multiplication.
     ///
     /// Forward:  A_fp32 → BF16  |  B_fp32 → BF16  |  BF16 × BF16 → FP32 out

@@ -71,7 +71,7 @@ impl TransformerLM {
         
         let mut blocks = Vec::new();
         for _ in 0..num_layers {
-            blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, ffn_dim));
+            blocks.push(TransformerBlock::new(g, hidden_dim, num_heads, num_heads, ffn_dim));
         }
         
         let norm_f = RMSNorm::new(g, hidden_dim, 1e-5);

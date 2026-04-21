@@ -186,6 +186,10 @@ impl Graph {
                 "adamw_step_f32",
                 "cross_entropy_masked_f32",
                 "cross_entropy_masked_backward_f32",
+                "repeat_kv_f32",
+                "repeat_kv_backward_f32",
+                "matmul_trans_b_f32",
+                "matmul_trans_a_f32",
             ];
             for name in names {
                 let f = module
@@ -235,6 +239,8 @@ impl Graph {
                     "gather_bf16_bf16out",
                     "bmm_f32_bf16out",
                     "matmul_f32_bf16out",
+                    "repeat_kv_bf16",
+                    "repeat_kv_backward_bf16",
                 ];
 
                 for name in names {
@@ -306,11 +312,7 @@ impl Graph {
             let t = self.tensors.pop().unwrap();
             if t.is_pooled {
                 let size = if t.shape.is_empty() { 1 } else { t.shape.iter().product() };
-
-                // Return grad block (always FP32) to the main pool
                 self.vram_pool.entry(size).or_default().push(t.grad);
-
-                // Return data block to the correct pool based on its storage type
                 match t.data {
                     #[cfg(feature = "bf16")]
                     Storage::GpuBf16(slice) => {
@@ -321,7 +323,6 @@ impl Graph {
                     }
                 }
             }
-            // non-pooled tensors drop here → cudaFree via RAII
         }
     }
 
@@ -626,9 +627,6 @@ impl Graph {
         }
     }
 
-
-
-
     pub fn backward(&mut self, loss_id: usize) {
         if self.no_grad {
             return;
@@ -643,82 +641,67 @@ impl Graph {
             }
             Device::Gpu(_, stream) => {
                 if let Storage::Gpu(g) = &mut self.tensors[loss_id].grad {
-                    let host_ones = vec![1.0f32; g.len()];
-                    stream.memcpy_htod(&host_ones, g).unwrap();
+                    // Use an asynchronous kernel fill rather than blocking Host-to-Device transfer
+                    let f = self.functions.get("fill_f32").unwrap().clone();
+                    let val = 1.0f32;
+                    let n = g.len() as u64;
+                    let mut b = stream.launch_builder(&f);
+                    let num_elems = g.len() as u32;
+                    b.arg(g).arg(&val).arg(&n);
+                    unsafe { b.launch(LaunchConfig::for_num_elems(num_elems)) }.unwrap();
                 }
             }
         }
-        
+
+
+        // Note: Removed stream.synchronize() entirely! 
+        // We now rely on stream-ordered execution. 
+        // VRAM Pool remains intact to prevent Driver Malloc bottlenecks.
+        let nodes = std::mem::take(&mut self.tape.nodes);
         let (ctx, stream_opt) = match &self.device {
             Device::Gpu(ctx, s) => (Some(ctx.clone()), Some(s.clone())),
-            _ => (None, None),
+            _ => (None, None)
         };
 
-        // --- 2. PREPARE VRAM FOR RAW CLOSURE ALLOCATIONS ---
-        // The closures use raw `stream.alloc_zeros` and cannot access the pool.
-        // We MUST flush the forward-pass pool back to the driver so the driver 
-        // has space to fulfill those raw allocations.
-        if let Some(stream) = &stream_opt {
-            self.vram_pool.clear();
-            #[cfg(feature = "bf16")]
-            self.vram_pool_bf16.clear();
-            stream.synchronize().unwrap();
-        }
-
-        // --- 3. EXECUTE THE TAPE ---
-        let nodes = std::mem::take(&mut self.tape.nodes);
-
         for node in nodes.iter().rev() {
-            // 🛡️ SHIELD: Protect the active tensors from being cannibalized
             self.active_node_tensors.clear();
             self.active_node_tensors.extend_from_slice(&node.inputs);
             self.active_node_tensors.push(node.output);
 
-            // JIT Page-In
             for &input_id in &node.inputs {
                 self.ensure_on_gpu(input_id);
             }
             self.ensure_on_gpu(node.output);
 
-            // 🚀 PROACTIVE SCRATCH SPACE GENERATION
-            // Ensure the CUDA driver has enough raw free memory for bf16_to_f32_temp
-            if let Some(stream) = &stream_opt {
-                let (free_vram, _) = ctx.clone().expect("Was not able to acquire context").mem_get_info().unwrap();
-                let mut current_free = free_vram;
-                let scratch_budget = 1024 * 1024 * 1024; // 128 MB safety buffer for temporaries
+            // Lazy eviction logic without global pipeline halts
+            if let Some(context) = &ctx {
+                let (free_vram, _) = context.mem_get_info().unwrap();
+                let scratch_budget = 1024 * 1024 * 1024; // Lowered to 64MB buffer
 
-                if current_free < scratch_budget {
-                    // Evict tensors (that are not shielded) until we reach the budget
-                    #[cfg(feature = "bf16")]
+                if free_vram < scratch_budget {
+                    // Evict unused pooled tensors directly to CPU
                     let candidate_ids: Vec<usize> = self.tensors.iter()
-                        .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)))
-                        .filter(|t| !self.active_node_tensors.contains(&t.id))
-                        .map(|t| t.id)
-                        .collect();
-
-                    #[cfg(not(feature = "bf16"))]
-                    let candidate_ids: Vec<usize> = self.tensors.iter()
-                        .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_)))
-                        .filter(|t| !self.active_node_tensors.contains(&t.id))
+                        .filter(|t| t.is_pooled && !self.active_node_tensors.contains(&t.id))
                         .map(|t| t.id)
                         .collect();
 
                     for id in candidate_ids {
                         self.demote_tensor_to_cpu(id);
-                        stream.synchronize().unwrap();
-                        
-                        let (new_free, _) = ctx.clone().expect("Could not acquire context!").mem_get_info().unwrap();
-                        current_free = new_free;
-                        if current_free >= scratch_budget {
+                        if let Some(stream) = &stream_opt {
+                            stream.synchronize().unwrap();
+                        }
+
+                        let (free_vram, _) = context.mem_get_info().unwrap();
+                        if free_vram >= scratch_budget {
                             break; // We have enough scratch space!
                         }
                     }
 
-                    if current_free < scratch_budget {
+                    if free_vram < scratch_budget {
                         println!("Did not manage to clear enough space!!!");
                         self.print_vram_state("backward pass error");
                     }
-                } 
+                }
                 //else {
                 //    println!("Currently available: {}, attempting to reclaim: {}", current_free, scratch_budget);
                 //    self.print_vram_state("backward pass");
