@@ -171,6 +171,13 @@ impl TransformerLM {
         out
     }
 
+    /// Tags every parameter tensor in the graph with its human-readable name.
+    /// Call this once after model initialization.
+    pub fn tag_parameters(&self, g: &mut Graph) {
+        for (name, id) in self.named_params() {
+            g.tensors[id].name = Some(name);
+        }
+    }
 }
 
 impl Module for TransformerLM {

@@ -58,6 +58,7 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(out_shape);
+                self.name_tensor(out_id, "gqa_output");
 
                 // Convert dimensions to i32 for the CUDA kernel arguments
                 let (b_i32, kv_h_i32, rep_i32, s_i32, d_i32) = (

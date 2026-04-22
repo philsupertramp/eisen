@@ -41,6 +41,7 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(out_shape);
+                self.name_tensor(out_id, "transpose_0213_output");
                 let (b_u64, s_u64, h_u64, d_u64) = (b as u64, s as u64, h as u64, d as u64);
                 self.ensure_on_gpu(a_id);
                 self.ensure_on_gpu(out_id);
@@ -149,6 +150,7 @@ impl Graph {
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(out_shape.clone());
+                self.name_tensor(out_id, "gather_output");
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() && !is_bf16(&self.tensors[weights_id].data) {
@@ -346,6 +348,7 @@ impl Graph {
                 let f_bwd = self.functions.get("accumulate_f32").unwrap().clone();
 
                 let out_id = self.alloc_pooled(new_shape);
+                self.name_tensor(out_id, "reshape_output");
                 let n = old_size as u64;
 
                 self.ensure_on_gpu(a_id);
@@ -496,6 +499,7 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(shape);
+                self.name_tensor(out_id, "rope_output");
                 let (s_u64, hd_u64, hdim_u64, np_u64) = (
                     seq_len as u64, hidden_dim as u64, head_dim as u64, num_pairs as u64,
                 );

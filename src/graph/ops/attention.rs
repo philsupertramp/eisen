@@ -43,6 +43,7 @@ impl Graph {
             Device::Gpu(_, stream) => {
                 let f_fwd = self.functions.get("flash_attention_f32").unwrap().clone();
                 let out_id = self.alloc_pooled(vec![batch, m, d]);
+                self.name_tensor(out_id, "flash_attention_output");
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {

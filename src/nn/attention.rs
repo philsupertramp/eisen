@@ -178,6 +178,8 @@ impl MultiHeadAttention {
             let scale_id = g.alloc_pooled(
                 vec![bh, seq_len, seq_len],
             );
+            g.name_tensor(scale_id, "attn_scale");
+
             let scale_m = vec![scale; bh * seq_len * seq_len];
             g.load_tensor_data(scale_id, &scale_m);
             let scaled_scores_id = g.mul(scores_id, scale_id);
@@ -338,6 +340,7 @@ impl GroupedQueryAttention {
 
             // 8. Scale
             let scale_id = g.alloc_pooled(vec![bh, seq_len, seq_len]);
+            g.name_tensor(scale_id, "gqa_attn_scale");
             let scale_m = vec![scale; bh * seq_len * seq_len];
             g.load_tensor_data(scale_id, &scale_m);
             let scaled_scores_id = g.mul(scores_id, scale_id);

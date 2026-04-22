@@ -342,40 +342,151 @@ impl Graph {
         }
     }
 
+    /// Ensures that a tensor's gradient is allocated on the GPU.
+    /// This should be called inside backward closures right before writing to a gradient.
+    pub fn ensure_grad_allocated(&mut self, id: usize) {
+        let (size, is_pooled) = {
+            let t = &self.tensors[id];
+            // Already allocated?
+            if matches!(t.grad, Storage::Gpu(_)) { return; }
+            (t.shape.iter().product::<usize>(), t.is_pooled)
+        };
+
+        let stream = match &self.device {
+            Device::Gpu(_, s) => s.clone(),
+            _ => panic!("ensure_grad_allocated only supported on GPU"),
+        };
+
+        // Pull from the appropriate pool
+        let grad_slice = self.safe_alloc_zeros::<f32>(&stream, size);
+        self.tensors[id].grad = Storage::Gpu(grad_slice);
+    }
+
     pub fn print_vram_state(&self, context: &str) {
         if let Device::Gpu(ctx, _stream) = &self.device {
             let (free, total) = ctx.mem_get_info().unwrap();
             let used = total - free;
 
-            let mut active_data_mb = 0usize;
-            let mut active_grad_mb = 0usize;
-            let mut offloaded_mb = 0usize;
+            let mut param_data_bytes = 0usize;
+            let mut param_grad_bytes = 0usize;
+            let mut pooled_data_bytes = 0usize;
+            let mut pooled_grad_bytes = 0usize;
 
             for t in &self.tensors {
+                let mut d = 0;
                 match &t.data {
-                    Storage::Gpu(s) => active_data_mb += s.len() * 4,
+                    Storage::Gpu(s) => d = s.len() * 4,
                     #[cfg(feature = "bf16")]
-                    Storage::GpuBf16(s) => active_data_mb += s.len() * 2,
-                    Storage::Cpu(s) => offloaded_mb += s.len() * 4,
-                    #[cfg(feature = "bf16")]
-                    Storage::CpuBf16(s) => offloaded_mb += s.len() * 2,
+                    Storage::GpuBf16(s) => d = s.len() * 2,
+                    _ => {}
                 }
+
+                let mut g = 0;
                 match &t.grad {
-                    Storage::Gpu(s) => active_grad_mb += s.len() * 4,
-                    #[cfg(feature = "bf16")]
-                    Storage::GpuBf16(s) => active_grad_mb += s.len() * 2,
-                    Storage::Cpu(s) => offloaded_mb += s.len() * 4,
-                    #[cfg(feature = "bf16")]
-                    Storage::CpuBf16(s) => offloaded_mb += s.len() * 2,
+                    Storage::Gpu(s) => g = s.len() * 4,
+                    _ => {}
+                }
+
+                if t.is_pooled {
+                    pooled_data_bytes += d;
+                    pooled_grad_bytes += g;
+                } else {
+                    param_data_bytes += d;
+                    param_grad_bytes += g;
                 }
             }
 
+            let mut idle_pool_bytes = 0usize;
+            for (size, blocks) in &self.vram_pool { idle_pool_bytes += size * 4 * blocks.len(); }
+            #[cfg(feature = "bf16")]
+            for (size, blocks) in &self.vram_pool_bf16 { idle_pool_bytes += size * 2 * blocks.len(); }
+
+            let total_accounted = param_data_bytes + param_grad_bytes + pooled_data_bytes + pooled_grad_bytes + idle_pool_bytes;
+            let unaccounted = used as i64 - total_accounted as i64;
+
             println!("--- VRAM STATE [{}] ---", context);
-            println!("Driver Used:   {:>5} MB / {} MB", used / 1024 / 1024, total / 1024 / 1024);
-            println!("Data on GPU:   {:>5.3} MB", active_data_mb as f32 / 1024.0 / 1024.0);
-            println!("Grads on GPU:  {:>5.3} MB", active_grad_mb as f32 / 1024.0 / 1024.0);
-            println!("CPU Offloaded: {:>5.3} MB  (BF16-compressed where applicable)", offloaded_mb as f32 / 1024.0 / 1024.0);
+            println!("Driver Used:   {:>8.2} MB / {:.2} MB", used as f32 / 1024.0 / 1024.0, total as f32 / 1024.0 / 1024.0);
+            println!("Params (D+G):  {:>8.2} MB (Data: {:.1}, Grad: {:.1})", (param_data_bytes+param_grad_bytes) as f32/1024./1024., param_data_bytes as f32/1024./1024., param_grad_bytes as f32/1024./1024.);
+            println!("Pooled (D+G):  {:>8.2} MB (Data: {:.1}, Grad: {:.1})", (pooled_data_bytes+pooled_grad_bytes) as f32/1024./1024., pooled_data_bytes as f32/1024./1024., pooled_grad_bytes as f32/1024./1024.);
+            println!("Idle Pool:     {:>8.2} MB", idle_pool_bytes as f32 / 1024.0 / 1024.0);
+            println!("Unaccounted:   {:>8.2} MB (Fragmentation / Workspace / Overhead)", unaccounted as f32 / 1024.0 / 1024.0);
+            
+            // Efficiency warning for researchers
+            if pooled_grad_bytes > (pooled_data_bytes / 2) && pooled_data_bytes > 0 {
+                println!("⚠️ WARNING: High Pooled Grad/Data Ratio ({:.2}).", pooled_grad_bytes as f32 / pooled_data_bytes as f32);
+                println!("   Intermediate activations are carrying gradients during forward pass.");
+            }
             println!("---------------------------------");
+
+            self.print_tensor_breakdown();
         }
+    }
+
+    pub fn print_tensor_breakdown(&self) {
+        use std::collections::HashMap;
+        
+        struct Usage {
+            data_bytes: usize,
+            grad_bytes: usize,
+            count: usize,
+            is_pooled: bool,
+        }
+
+        let mut stats: HashMap<String, Usage> = HashMap::new();
+
+        for t in &self.tensors {
+            let mut d_bytes = 0;
+            match &t.data {
+                Storage::Gpu(s) => d_bytes += s.len() * 4,
+                #[cfg(feature = "bf16")]
+                Storage::GpuBf16(s) => d_bytes += s.len() * 2,
+                _ => {}
+            }
+            
+            let mut g_bytes = 0;
+            match &t.grad {
+                Storage::Gpu(s) => g_bytes += s.len() * 4,
+                _ => {}
+            }
+            
+            if d_bytes > 0 || g_bytes > 0 {
+                let tag = if t.is_pooled { "[P]" } else { "[S]" };
+                let identity = t.name.clone().unwrap_or_else(|| format!("ID {} {:?}", t.id, t.shape));
+                let key = format!("{} {}", tag, identity);
+                
+                let entry = stats.entry(key).or_insert(Usage {
+                    data_bytes: 0,
+                    grad_bytes: 0,
+                    count: 0,
+                    is_pooled: t.is_pooled,
+                });
+                entry.data_bytes += d_bytes;
+                entry.grad_bytes += g_bytes;
+                entry.count += 1;
+            }
+        }
+
+        let mut sorted: Vec<_> = stats.into_iter().collect();
+        sorted.sort_by(|a, b| (b.1.data_bytes + b.1.grad_bytes).cmp(&(a.1.data_bytes + a.1.grad_bytes))); 
+
+        println!("--- Top GPU Tensor Consumers ---");
+        println!("  TOTAL MEM  |  DATA MEM  |  GRAD MEM  | G/D | COUNT | IDENTITY");
+        for (name, usage) in sorted.into_iter() {
+            let total_mb = (usage.data_bytes + usage.grad_bytes) as f32 / 1024.0 / 1024.0;
+            let data_mb = usage.data_bytes as f32 / 1024.0 / 1024.0;
+            let grad_mb = usage.grad_bytes as f32 / 1024.0 / 1024.0;
+            
+            let ratio = if usage.data_bytes > 0 {
+                format!("{:.1}", grad_mb / data_mb)
+            } else {
+                "inf".to_string()
+            };
+            
+            println!(
+                "  {:>8.2} MB | {:>8.2} MB | {:>8.2} MB | {:>3} | {:>5} | {}",
+                total_mb, data_mb, grad_mb, ratio, usage.count, name
+            );
+        }
+        println!("---------------------------------");
     }
 }

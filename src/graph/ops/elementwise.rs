@@ -61,6 +61,7 @@ impl Graph {
                 let b_u16_slice: CudaSlice<u16>;
 
                 let out_id = self.alloc_pooled(out_shape.clone());
+                self.name_tensor(out_id, "add_output");
 
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
@@ -226,6 +227,8 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(out_shape);
+                self.name_tensor(out_id, "mul_output");
+
                 let n = out_size as u64;
                 self.ensure_on_gpu(a_id);
                 self.ensure_on_gpu(b_id);
@@ -368,6 +371,7 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(a_shape);
+                self.name_tensor(out_id, "silu_output");
 
                 self.ensure_on_gpu(a_id);
                 self.ensure_on_gpu(out_id);

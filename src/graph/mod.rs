@@ -214,6 +214,8 @@ impl Graph {
                     "matmul_f32_bf16accum_f32",
                     "matmul_f32_bf16rhsaccum_f32",
                     "matmul_backward_a_bf16b_f32",
+                    "matmul_trans_b_bf16",
+                    "matmul_trans_a_bf16",
                     "bmm_f32_bf16accum_f32",
                     "gather_bf16_f32",
                     "rmsnorm_f32_bf16w",
@@ -286,6 +288,10 @@ impl Graph {
 
     pub fn precision_mode(&self) -> PrecisionMode {
         self.precision_mode
+    }
+
+    pub fn name_tensor(&mut self, id: usize, name: &str) {
+        self.tensors[id].name = Some(name.to_string());
     }
 
     pub fn uses_bf16_mixed_precision(&self) -> bool {
@@ -455,6 +461,7 @@ impl Graph {
         };
 
         // ── Grad buffer: always FP32 (optimizer stability requirement) ─────────
+        /*
         let mut grad_storage = {
             let mut reused_block = None;
             if let Some(blocks) = self.vram_pool.get_mut(&size) {
@@ -493,6 +500,7 @@ impl Graph {
                 }
             }
         }
+        */
 
         let mut strides = vec![1usize; shape.len()];
         if !shape.is_empty() {
@@ -507,7 +515,7 @@ impl Graph {
             shape,
             strides,
             data: data_storage,
-            grad: grad_storage,
+            grad: Storage::Cpu(vec![]),
             device,
             name: None,
             is_pooled: true,
@@ -632,6 +640,7 @@ impl Graph {
             return;
         }
 
+        self.ensure_grad_allocated(loss_id);
         // --- 1. INITIALIZE LOSS GRADIENT TO 1.0 ---
         match &self.device {
             Device::Cpu => {
@@ -668,10 +677,13 @@ impl Graph {
             self.active_node_tensors.extend_from_slice(&node.inputs);
             self.active_node_tensors.push(node.output);
 
+            // 3. LAZY ALLOCATION: Do this BEFORE the closure runs.
+            // We know exactly which tensors this backward step needs!
+            self.ensure_grad_allocated(node.output);
             for &input_id in &node.inputs {
-                self.ensure_on_gpu(input_id);
+                self.ensure_grad_allocated(input_id);
             }
-            self.ensure_on_gpu(node.output);
+
 
             // Lazy eviction logic without global pipeline halts
             if let Some(context) = &ctx {
@@ -707,9 +719,22 @@ impl Graph {
                 //    self.print_vram_state("backward pass");
                 //}
             }
+            // 3. LAZY ALLOCATION: Do this BEFORE the closure runs.
+            // We know exactly which tensors this backward step needs!
+            self.ensure_on_gpu(node.output);
+            for &input_id in &node.inputs {
+                self.ensure_on_gpu(input_id);
+            }
 
+            if let Some(stream) = &stream_opt {
+                stream.synchronize().unwrap_or_else(|err| {
+                    panic!("backward post-cast synchronize failed: {:?}", err)
+                });
+            }
             // Execute the backward closure safely
             (node.backward_fn)(&mut self.tensors);
+
+
         }
 
         // --- 4. CLEANUP ---

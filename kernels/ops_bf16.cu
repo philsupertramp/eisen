@@ -173,6 +173,55 @@ extern "C" __global__ void matmul_backward_a_bf16b_f32(
         grad_a[row * k + col] += sum;
 }
 
+// Forward: C = A * B^T
+extern "C" __global__ void matmul_trans_b_bf16(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned long long M,
+    unsigned long long K,
+    unsigned long long N
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < M && col < N) {
+        // MUST accumulate in FP32 to prevent vanishing gradients/overflow
+        float sum = 0.0f; 
+        for (int i = 0; i < K; ++i) {
+            float a_val = __bfloat162float(A[row * K + i]);
+            float b_val = __bfloat162float(B[col * K + i]);
+            sum += a_val * b_val;
+        }
+        // Downcast back to BF16 for the write
+        C[row * N + col] = __float2bfloat16(sum);
+    }
+}
+
+// Backward Weight Update: dB = dC^T * A
+extern "C" __global__ void matmul_trans_a_bf16(
+    const __nv_bfloat16* __restrict__ dC,
+    const __nv_bfloat16* __restrict__ A,
+    __nv_bfloat16* __restrict__ dB,
+    unsigned long long M,
+    unsigned long long N,
+    unsigned long long K
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < N && col < K) {
+        float sum = 0.0f;
+        for (int i = 0; i < M; ++i) {
+            float dc_val = __bfloat162float(dC[i * N + row]);
+            float a_val  = __bfloat162float(A[i * K + col]);
+            sum += dc_val * a_val;
+        }
+        // Accumulate into the existing gradient (Weights are updated across batches)
+        float current_db = __bfloat162float(dB[row * K + col]);
+        dB[row * K + col] = __float2bfloat16(current_db + sum);
+    }
+}
 extern "C" __global__ void gather_bf16_f32(
     const __nv_bfloat16* weights,
     const float* indices,

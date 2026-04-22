@@ -41,6 +41,7 @@ impl Graph {
 
                 let b_u16_slice: CudaSlice<u16>;
                 let out_id = self.alloc_pooled(x.shape.clone());
+                self.name_tensor(out_id, "rmsnorm_output");
                 let (dim_u64, num_vecs_u64) = (dim as u64, num_vecs as u64);
 
                 self.ensure_on_gpu(x_id);

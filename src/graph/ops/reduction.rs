@@ -37,6 +37,7 @@ impl Graph {
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(out_shape.clone());
+                self.name_tensor(out_id, "sum_output");
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
@@ -225,6 +226,7 @@ impl Graph {
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(out_shape.clone());
+                self.name_tensor(out_id, "max_output");
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
@@ -421,6 +423,7 @@ impl Graph {
                 );
 
                 let out_id = self.alloc_pooled(out_shape);
+                self.name_tensor(out_id, "softmax_output");
 
                 self.ensure_on_gpu(a_id);
                 self.ensure_on_gpu(out_id);
@@ -534,6 +537,7 @@ impl Graph {
                 let batch_size = logits.shape[0];
                 let num_classes = logits.shape[1];
                 let out_id = self.alloc_pooled(vec![]);
+                self.name_tensor(out_id, "cross_entropy_output");
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);
@@ -743,6 +747,7 @@ impl Graph {
                 let num_classes = logits.shape[1];
  
                 let out_id  = self.alloc_pooled(vec![]);
+                self.name_tensor(out_id, "cross_entropy_masked_output");
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
                     let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);

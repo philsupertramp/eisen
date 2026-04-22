@@ -233,6 +233,7 @@ fn main() {
     let model = TransformerLM::new(
         &mut g, vocab_size, hidden_dim, num_heads, 4, ffn_dim, num_layers, true
     );
+    model.tag_parameters(&mut g);
 
     g.mark_params();
 
@@ -420,9 +421,12 @@ fn main() {
             let tokens_this_micro = micro_batch_size * seq_len;
  
             let x_id = g.alloc_pooled(vec![micro_batch_size, seq_len]);
+            g.name_tensor(x_id, "input");
             g.load_tensor_data(x_id, &batch.x);
  
+            g.print_vram_state("PRE FORWARD pass");
             let logits_id   = model.forward(&mut g, x_id);
+            g.print_vram_state("POST FORWARD pass");
             let flat_logits = g.reshape(logits_id, vec![tokens_this_micro, vocab_size]);
  
             // Use masked CE when FIM has produced ignore-index positions;
@@ -435,8 +439,11 @@ fn main() {
  
             step_loss += g.tensors[loss_id].sync_to_cpu()[0];
             micro_count += 1;
+            g.print_vram_state("FORWARD pass");
  
             g.backward(loss_id);
+            g.print_vram_state("PAST backward pass");
+
             g.clear_activations();
         }
 
@@ -542,6 +549,7 @@ fn main() {
 
         let context_f32: Vec<f32> = context.iter().map(|&t| t as f32).collect();
         let x_id = g.alloc_pooled(vec![1, csl]);
+        g.name_tensor(x_id, "input");
         g.load_tensor_data(x_id, &context_f32);
         
         let logits_id = model.forward(&mut g, x_id);
