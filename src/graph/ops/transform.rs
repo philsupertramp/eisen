@@ -43,8 +43,6 @@ impl Graph {
                 let out_id = self.alloc_pooled(out_shape);
                 self.name_tensor(out_id, "transpose_0213_output");
                 let (b_u64, s_u64, h_u64, d_u64) = (b as u64, s as u64, h as u64, d as u64);
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(out_id);
 
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
@@ -351,9 +349,6 @@ impl Graph {
                 self.name_tensor(out_id, "reshape_output");
                 let n = old_size as u64;
 
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(out_id);
-
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
                     match (&self.tensors[a_id].data, &self.tensors[out_id].data) {
@@ -364,6 +359,7 @@ impl Graph {
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(old_size as u32)) }.unwrap();
                 }
+                stream.synchronize().unwrap();
 
                 // Backward: grad is always FP32 — accumulate_f32 unchanged
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
@@ -503,8 +499,6 @@ impl Graph {
                 let (s_u64, hd_u64, hdim_u64, np_u64) = (
                     seq_len as u64, hidden_dim as u64, head_dim as u64, num_pairs as u64,
                 );
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(out_id);
 
                 {
                     let mut builder = stream.launch_builder(&f_fwd);

@@ -416,6 +416,16 @@ impl Graph {
         self.tensors[id].grad = Storage::Gpu(grad_slice);
     }
 
+    pub fn get_used_vram(&self) -> usize {
+        if let Device::Gpu(ctx, _stream) = &self.device {
+            let (total_free, _total) = ctx.mem_get_info().unwrap();
+            let total = self.vram_budget_bytes.expect("No budget set.");
+            let free = total_free.min(total);
+            return _total - total_free;
+        }
+        0_usize
+    }
+
     pub fn print_vram_state(&self, context: &str) {
         if let Device::Gpu(ctx, _stream) = &self.device {
             let (total_free, _total) = ctx.mem_get_info().unwrap();
@@ -507,7 +517,16 @@ impl Graph {
             }
             
             if d_bytes > 0 || g_bytes > 0 {
-                let tag = if t.is_pooled { "[P]" } else { "[S]" };
+                let pool_tag = if t.is_pooled { "[P]" } else { "[S]" };
+                let device_tag = match &t.data {
+                    Storage::Gpu(_) => "Gpu",
+                    Storage::Cpu(_) => "Cpu",
+                    #[cfg(feature = "bf16")]
+                    Storage::GpuBf16(_) => "GpuBf16",
+                    #[cfg(feature = "bf16")]
+                    Storage::CpuBf16(_) => "CpuBf16",
+                };
+                let tag = format!("{} @ {}: ", pool_tag, device_tag);
                 let identity = t.name.clone().unwrap_or_else(|| format!("ID {} {:?}", t.id, t.shape));
                 let key = format!("{} {}", tag, identity);
                 
@@ -527,7 +546,7 @@ impl Graph {
         sorted.sort_by(|a, b| (b.1.data_bytes + b.1.grad_bytes).cmp(&(a.1.data_bytes + a.1.grad_bytes))); 
 
         println!("--- Top GPU Tensor Consumers ---");
-        println!("  TOTAL MEM  |  DATA MEM  |  GRAD MEM  | G/D | COUNT | IDENTITY");
+        println!("  TOTAL MEM   |  DATA MEM   |  GRAD MEM   | G/D | COUNT | IDENTITY");
         for (name, usage) in sorted.into_iter().take(25) {
             let total_mb = (usage.data_bytes + usage.grad_bytes) as f32 / 1024.0 / 1024.0;
             let data_mb = usage.data_bytes as f32 / 1024.0 / 1024.0;

@@ -12,11 +12,22 @@ impl Linear {
         let weight_len = in_features * out_features;
         let mut weight_data = vec![0.0; weight_len];
 
+        // Instead of Xavier uniform:
+        // let limit = (6.0f32 / (in_features + out_features)).sqrt();
+        // Instead use:
+        let std = 0.02;
+
+        // Box-Muller to generate normal distribution
         let mut seed: u32 = 42;
         for i in 0..weight_len {
+            let u1 = ((seed as f32 / u32::MAX as f32) + 1e-7).min(1.0 - 1e-7);
             seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-            let rand_val = (seed as f32 / u32::MAX as f32) * 2.0 - 1.0;
-            weight_data[i] = rand_val * limit;
+            let u2 = (seed as f32 / u32::MAX as f32).max(1e-7).min(1.0 - 1e-7);
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            
+            let mag = (-2.0 * u1.ln()).sqrt();
+            let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
+            weight_data[i] = z0 * std;
         }
 
         #[cfg(feature = "bf16")]

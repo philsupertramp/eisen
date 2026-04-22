@@ -75,10 +75,6 @@ impl Graph {
                         };
                     }
 
-                    self.ensure_on_gpu(a_id);
-                    self.ensure_on_gpu(b_id);
-                    self.ensure_on_gpu(out_id);
-
                     match (
                         &self.tensors[a_id].data,
                         &self.tensors[b_id].data,
@@ -230,9 +226,6 @@ impl Graph {
                 self.name_tensor(out_id, "mul_output");
 
                 let n = out_size as u64;
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(b_id);
-                self.ensure_on_gpu(out_id);
 
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
@@ -372,9 +365,6 @@ impl Graph {
 
                 let out_id = self.alloc_pooled(a_shape);
                 self.name_tensor(out_id, "silu_output");
-
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(out_id);
 
                 // ── Forward launch ─────────────────────────────────────────────
                 {

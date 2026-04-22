@@ -69,9 +69,6 @@ impl Graph {
                     head_dim as i32,
                 );
 
-                self.ensure_on_gpu(x_id);
-                self.ensure_on_gpu(out_id);
-
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
                     match (&self.tensors[x_id].data, &self.tensors[out_id].data) {

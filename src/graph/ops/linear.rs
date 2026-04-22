@@ -105,10 +105,6 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 let b_temp_fwd: Option<()> = None;
 
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(b_id);
-                self.ensure_on_gpu(compute_target_id);
-
                 let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
                     #[cfg(feature = "bf16")] (_, Some(t)) => t,
@@ -370,10 +366,6 @@ impl Graph {
                 
                 self.name_tensor(compute_target_id, "tmp_matmul_trans_b_out");
 
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(b_id);
-                self.ensure_on_gpu(compute_target_id);
-
                 let m_u64 = m as u64;
                 let k_u64 = k as u64;
                 let n_u64 = n as u64;
@@ -550,7 +542,6 @@ impl Graph {
             "matmul_bf16: lhs last dim must equal rhs first dim"
         );
         let device = self.device.clone();
-        self.ensure_on_gpu(b_id);
 
         match &device {
             Device::Gpu(_, stream) => {
@@ -574,6 +565,7 @@ impl Graph {
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(vec![m, n]);
+                self.ensure_on_gpu(b_id);
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
@@ -626,6 +618,7 @@ impl Graph {
                     shared_mem_bytes: 0,
                 };
 
+
                 match &self.tensors[b_id].data {
                     Storage::Gpu(b_fp32) => {
                         let mut builder = stream.launch_builder(&f_matmul_fp32rhs);
@@ -653,7 +646,10 @@ impl Graph {
                             panic!("matmul_bf16 forward kernel launch failed (bf16 rhs): {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_fwd.grid_dim, cfg_fwd.block_dim)
                         });
                     }
-                    _ => unreachable!(),
+                    s => {
+                        self.print_vram_state("matmul_bf16");
+                        panic!("Wrong storage type: {:?}", s)
+                    },
                 }
                 
                 // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
@@ -726,8 +722,8 @@ impl Graph {
                     b2.arg(a_data)
                         .arg(out_grad)
                         .arg(b_grad)
-                        .arg(&k_u64)
                         .arg(&m_u64)
+                        .arg(&k_u64)
                         .arg(&n_u64);
                     unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                         panic!("matmul_bf16 backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
@@ -1272,10 +1268,6 @@ impl Graph {
                 let b_temp_fwd = safe_bf16_temp!(self, b_id, batch * k * n, &stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
                 let b_temp_fwd: Option<()> = None;
-
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(b_id);
-                self.ensure_on_gpu(compute_target_id);
 
                 let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
                     (Storage::Gpu(s), _) => s,

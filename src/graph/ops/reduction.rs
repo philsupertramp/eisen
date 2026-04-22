@@ -425,9 +425,6 @@ impl Graph {
                 let out_id = self.alloc_pooled(out_shape);
                 self.name_tensor(out_id, "softmax_output");
 
-                self.ensure_on_gpu(a_id);
-                self.ensure_on_gpu(out_id);
-
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
                     match (&self.tensors[a_id].data, &self.tensors[out_id].data) {

@@ -7,6 +7,12 @@ use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
 use std::collections::{HashMap};
 use std::env;
 
+fn env_usize(name: &str, default: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
 
 #[cfg(feature = "bf16")]
 #[inline]
@@ -67,6 +73,8 @@ pub struct Graph {
 
     /// Allowd VRAM budget provided by the user
     pub vram_budget_bytes: Option<usize>,
+
+    pub scratch_budget_mb: Option<usize>,
 }
 
 impl Default for Graph {
@@ -277,6 +285,8 @@ impl Graph {
             .and_then(|v| v.parse::<usize>().ok())
             .map(|mb| mb * 1024 * 1024);
 
+        let scratch_budget_mb: usize = env_usize("EISEN_ACTIVATION_RESERVE_MB", 64);
+
         Self {
             tensors: Vec::new(),
             tape: Tape::default(),
@@ -292,6 +302,7 @@ impl Graph {
 
             active_node_tensors: Vec::new(),
             vram_budget_bytes,
+            scratch_budget_mb: Some(scratch_budget_mb),
         }
     }
 
@@ -700,7 +711,7 @@ impl Graph {
 
             // Lazy eviction logic without global pipeline halts
             if let Some(context) = &ctx {
-                let scratch_budget = 64 * 1024 * 1024; // Fixed: lowered to true 64MB buffer
+                let scratch_budget = self.scratch_budget_mb.unwrap_or_else(|| 64) * 1024 * 1024; // Fixed: lowered to true 64MB buffer
 
                 self.ensure_grad_allocated(node.output);
                 for &input_id in &node.inputs {

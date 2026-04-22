@@ -37,7 +37,7 @@ use std::io::{self, BufWriter, Write};
 use std::sync::{Arc, RwLock};
 use std::time::{Instant, UNIX_EPOCH, SystemTime};
 
-use eisenboard::{StepRecord, TrainStats, spawn_eisenboard};
+use eisenboard::{StepRecord, TrainStats, spawn_eisenboard, get_rss_bytes};
 
 // ─── GPU setup ────────────────────────────────────────────────────────────────
 
@@ -218,9 +218,9 @@ fn main() {
 
     // Scale the total steps based on the number of epochs requested
     let total_steps = dataloader.total_batches() * epochs;
-    let warmup_steps = 500usize;
-    let lr_max = 6e-4_f32;
-    let lr_min = 6e-5_f32;
+    let warmup_steps = 25usize;
+    let lr_max = 3e-4_f32;
+    let lr_min = 3e-5_f32;
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
@@ -337,7 +337,7 @@ fn main() {
     }
 
     let run_manifest = format!(
-        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n    \"rss\": {}\n    \"gpu_mem\": {}  }}\n}}",
         started_unix,
         run_seed,
         deterministic,
@@ -355,6 +355,8 @@ fn main() {
         lr_min,
         warmup_steps,
         total_steps,
+        get_rss_bytes(),
+        g.get_used_vram(),
     );
     write_run_manifest(&manifest_path, &run_manifest);
 
@@ -504,7 +506,8 @@ fn main() {
                 s.seq_len = seq_len;
                 s.micro_batch_size = micro_batch_size;
                 s.effective_batch = effective_batch;
-
+                s.rss = get_rss_bytes();
+                s.gpu_mem = g.get_used_vram();
                 if s.history.len() >= 200 {
                     s.history.remove(0);
                 }
@@ -517,6 +520,7 @@ fn main() {
             board_timer = Instant::now();
         }
 
+        /*
         // ── Checkpoint ────────────────────────────────────────────────────────
         if avg_loss < best_loss && !avg_loss.is_nan() {
             println!("🚀 NEW BEST LOSS: {:.4} (previous was {:.4})", avg_loss, best_loss);
@@ -527,6 +531,7 @@ fn main() {
                 hf_out_dir,
             );
         }
+        */
     }
 
     // Final save
