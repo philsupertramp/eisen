@@ -698,29 +698,36 @@ impl Graph {
             self.active_node_tensors.extend_from_slice(&node.inputs);
             self.active_node_tensors.push(node.output);
 
-            // 3. LAZY ALLOCATION: Do this BEFORE the closure runs.
-            // We know exactly which tensors this backward step needs!
-            self.ensure_grad_allocated(node.output);
-            for &input_id in &node.inputs {
-                self.ensure_grad_allocated(input_id);
-            }
-
-
             // Lazy eviction logic without global pipeline halts
             if let Some(context) = &ctx {
                 let scratch_budget = 64 * 1024 * 1024; // Fixed: lowered to true 64MB buffer
 
+                self.ensure_grad_allocated(node.output);
+                for &input_id in &node.inputs {
+                    self.ensure_grad_allocated(input_id);
+                }
+
+
                 // Calculate free VRAM based on the user budget if provided, else fall back to driver info
-                let free_vram = if let Some(budget) = self.vram_budget_bytes {
+                let mut free_vram = if let Some(budget) = self.vram_budget_bytes {
                     budget.saturating_sub(self.current_vram_usage())
                 } else {
                     context.mem_get_info().unwrap().0
                 };
 
                 if free_vram < scratch_budget {
-                    // Evict unused pooled tensors directly to CPU
+                    // FIX 1: Only target tensors that are ACTUALLY currently taking up VRAM
+                    #[cfg(feature = "bf16")]
                     let candidate_ids: Vec<usize> = self.tensors.iter()
                         .filter(|t| t.is_pooled && !self.active_node_tensors.contains(&t.id))
+                        .filter(|t| matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)) || matches!(t.grad, Storage::Gpu(_)))
+                        .map(|t| t.id)
+                        .collect();
+
+                    #[cfg(not(feature = "bf16"))]
+                    let candidate_ids: Vec<usize> = self.tensors.iter()
+                        .filter(|t| t.is_pooled && !self.active_node_tensors.contains(&t.id))
+                        .filter(|t| matches!(t.data, Storage::Gpu(_)) || matches!(t.grad, Storage::Gpu(_)))
                         .map(|t| t.id)
                         .collect();
 
@@ -730,9 +737,15 @@ impl Graph {
                             stream.synchronize().unwrap();
                         }
 
-                        let (free_vram, _) = context.mem_get_info().unwrap();
+                        // FIX 2: Correctly recalculate free_vram respecting the user's budget limit
+                        free_vram = if let Some(budget) = self.vram_budget_bytes {
+                            budget.saturating_sub(self.current_vram_usage())
+                        } else {
+                            context.mem_get_info().unwrap().0
+                        };
+
                         if free_vram >= scratch_budget {
-                            break; // We have enough scratch space!
+                            break; // We have genuinely cleared enough scratch space!
                         }
                     }
 
@@ -740,10 +753,6 @@ impl Graph {
                         println!("Did not manage to clear enough space!!!");
                         self.print_vram_state("backward pass error");
                     }
-                }
-                else {
-                    println!("Currently available: {}, attempting to reclaim: {}", free_vram / 1024 / 1024, scratch_budget);
-                    self.print_vram_state("backward pass");
                 }
             }
             // 3. LAZY ALLOCATION: Do this BEFORE the closure runs.
@@ -760,6 +769,7 @@ impl Graph {
             }
             // Execute the backward closure safely
             (node.backward_fn)(&mut self.tensors);
+
             if let Some(stream) = &stream_opt {
                 stream.synchronize().unwrap_or_else(|err| {
                     panic!("backward post-call synchronize failed: {:?}", err)

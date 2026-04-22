@@ -310,53 +310,62 @@ impl Graph {
 
         // ── Restore gradients (always FP32) ───────────────────────────────────
         if let Storage::Cpu(cpu_grad) = &self.tensors[tensor_id].grad {
-            let cpu_grad_clone = cpu_grad.clone();
-            let mut gpu_grad_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_grad_clone.len());
-            stream.memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice).unwrap();
-            self.tensors[tensor_id].grad = Storage::Gpu(gpu_grad_slice);
+            if !cpu_grad.is_empty() { // Prevent zero-size allocations
+                let cpu_grad_clone = cpu_grad.clone();
+                let mut gpu_grad_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_grad_clone.len());
+                stream.memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice).unwrap();
+                self.tensors[tensor_id].grad = Storage::Gpu(gpu_grad_slice);
+            } else {
+                println!("IS EMPTY TENSOR!");
+            }
         }
     }
 
     pub fn demote_tensor_to_cpu(&mut self, tensor_id: usize) {
-        let size = self.tensors[tensor_id].size();
         let stream = match &self.device {
             Device::Gpu(_, s) => Some(s.clone()),
             Device::Cpu => None,
         };
 
-        let cpu_f32: Vec<f32> = match &self.tensors[tensor_id].data {
-            Storage::Cpu(_) => return,
+        // ── 1. Demote Data Safely ──────────────────────────────────────────────
+        let cpu_data_opt: Option<Vec<f32>> = match &self.tensors[tensor_id].data {
+            Storage::Cpu(_) => None, // Already on CPU
             #[cfg(feature = "bf16")]
-            Storage::CpuBf16(_) => return, // already CPU
+            Storage::CpuBf16(_) => None,
             Storage::Gpu(s) => {
-                let st = stream.as_ref().expect("GPU storage without GPU stream");
-                st.clone_dtoh(s).expect("demote: dtoh data failed")
+                let st = stream.as_ref().expect("GPU storage without stream");
+                Some(st.clone_dtoh(s).expect("demote: dtoh data failed"))
             }
             #[cfg(feature = "bf16")]
             Storage::GpuBf16(s) => {
-                let st = stream.as_ref().expect("GPU storage without GPU stream");
+                let st = stream.as_ref().expect("GPU storage without stream");
                 let bf16 = st.clone_dtoh(s).expect("demote: dtoh BF16 data failed");
-                bf16.into_iter().map(bf16u_to_f32).collect()
+                Some(bf16.into_iter().map(bf16u_to_f32).collect())
             }
         };
 
-        // Compress if this is a large 2D weight and BF16 feature is on
-        #[cfg(feature = "bf16")]
-        {
-            if should_compress_to_bf16(&self.tensors[tensor_id].shape) {
-                let bf16_data: Vec<u16> = cpu_f32.iter().map(|&f| f32_to_bf16u(f)).collect();
-                self.tensors[tensor_id].data = Storage::CpuBf16(bf16_data);
-            } else {
+        if let Some(cpu_f32) = cpu_data_opt {
+            #[cfg(feature = "bf16")]
+            {
+                if should_compress_to_bf16(&self.tensors[tensor_id].shape) {
+                    let bf16_data: Vec<u16> = cpu_f32.iter().map(|&f| f32_to_bf16u(f)).collect();
+                    self.tensors[tensor_id].data = Storage::CpuBf16(bf16_data);
+                } else {
+                    self.tensors[tensor_id].data = Storage::Cpu(cpu_f32);
+                }
+            }
+            #[cfg(not(feature = "bf16"))]
+            {
                 self.tensors[tensor_id].data = Storage::Cpu(cpu_f32);
             }
         }
-        #[cfg(not(feature = "bf16"))]
-        {
-            self.tensors[tensor_id].data = Storage::Cpu(cpu_f32);
-        }
 
-        self.tensors[tensor_id].grad = Storage::Cpu(vec![0.0; size]);
-        println!("EVICTION!");
+        // ── 2. Demote Grad Safely (Preserve computed gradients!) ───────────────
+        if let Storage::Gpu(s) = &self.tensors[tensor_id].grad {
+            let st = stream.as_ref().expect("GPU storage without stream");
+            let cpu_grad = st.clone_dtoh(s).expect("demote: dtoh grad failed");
+            self.tensors[tensor_id].grad = Storage::Cpu(cpu_grad);
+        }
 
         if let Some(st) = stream {
             st.synchronize().expect("demote: stream sync failed");
@@ -409,8 +418,11 @@ impl Graph {
 
     pub fn print_vram_state(&self, context: &str) {
         if let Device::Gpu(ctx, _stream) = &self.device {
-            let (free, total) = ctx.mem_get_info().unwrap();
+            let (total_free, _total) = ctx.mem_get_info().unwrap();
+            let total = self.vram_budget_bytes.expect("No budget set.");
+            let free = total_free.min(total);
             let used = total - free;
+            let device_used = _total - total_free;
 
             let mut param_data_bytes = 0usize;
             let mut param_grad_bytes = 0usize;
@@ -447,7 +459,7 @@ impl Graph {
             for (size, blocks) in &self.vram_pool_bf16 { idle_pool_bytes += size * 2 * blocks.len(); }
 
             let total_accounted = param_data_bytes + param_grad_bytes + pooled_data_bytes + pooled_grad_bytes + idle_pool_bytes;
-            let unaccounted = used as i64 - total_accounted as i64;
+            let unaccounted = device_used as i64 - total_accounted as i64;
 
             println!("--- VRAM STATE [{}] ---", context);
             println!("Driver Used:   {:>8.2} MB / {:.2} MB", used as f32 / 1024.0 / 1024.0, total as f32 / 1024.0 / 1024.0);
@@ -516,7 +528,7 @@ impl Graph {
 
         println!("--- Top GPU Tensor Consumers ---");
         println!("  TOTAL MEM  |  DATA MEM  |  GRAD MEM  | G/D | COUNT | IDENTITY");
-        for (name, usage) in sorted.into_iter() {
+        for (name, usage) in sorted.into_iter().take(25) {
             let total_mb = (usage.data_bytes + usage.grad_bytes) as f32 / 1024.0 / 1024.0;
             let data_mb = usage.data_bytes as f32 / 1024.0 / 1024.0;
             let grad_mb = usage.grad_bytes as f32 / 1024.0 / 1024.0;

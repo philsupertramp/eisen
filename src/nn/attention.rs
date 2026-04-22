@@ -1,6 +1,7 @@
 use crate::graph::Graph;
 use crate::nn::linear::Linear;
 use crate::nn::Module;
+use std::sync::RwLock;
 
 /// Attention module.
 /// Configured for Single-Head Attention (num_heads=1) to fit our 3D tensor limits
@@ -11,6 +12,8 @@ pub struct Attention {
     pub v_proj: Linear,
     pub out_proj: Linear,
     pub hidden_dim: usize,
+    pub cached_scale: RwLock<Option<((usize, usize), usize)>>, // ((batch, seq_len), id)
+    pub cached_mask: RwLock<Option<(usize, usize)>>,           // (seq_len, id)
 }
 
 impl Attention {
@@ -21,6 +24,8 @@ impl Attention {
             v_proj: Linear::new(g, hidden_dim, hidden_dim, false),
             out_proj: Linear::new(g, hidden_dim, hidden_dim, false),
             hidden_dim,
+            cached_scale: RwLock::new(None),
+            cached_mask: RwLock::new(None),
         }
     }
 
@@ -49,24 +54,49 @@ impl Attention {
             let scores_id = g.bmm(q_id, k_id, true);
 
             // 3. Scale by 1 / sqrt(d_k)
-            let scores_size = batch * seq_len * seq_len;
-            // Allocate a full-size scale tensor since `mul` isn't broadcast-aware yet
-            let scale_id = g.alloc(vec![batch, seq_len, seq_len], vec![scale; scores_size]);
+            let mut current_scale = None;
+            if let Some(((c_b, c_s), id)) = *self.cached_scale.read().unwrap() {
+                if c_b == batch && c_s == seq_len {
+                    current_scale = Some(id);
+                }
+            }
+            let scale_id = if let Some(id) = current_scale {
+                id
+            } else {
+                let scores_size = batch * seq_len * seq_len;
+                let id = g.alloc(vec![batch, seq_len, seq_len], vec![scale; scores_size]);
+                *self.cached_scale.write().unwrap() = Some(((batch, seq_len), id));
+                id
+            };
+            
             let scaled_scores_id = g.mul(scores_id, scale_id);
 
             // 4. Causal Masking (for autoregressive generation)
             let masked_scores_id = if causal {
-                let mut mask_data = vec![0.0; seq_len * seq_len];
-                for r in 0..seq_len {
-                    for c in 0..seq_len {
-                        // Tokens cannot look ahead into the future
-                        if c > r {
-                            mask_data[r * seq_len + c] = -1e20;
-                        }
+                let mut current_mask = None;
+                if let Some((c_s, id)) = *self.cached_mask.read().unwrap() {
+                    if c_s == seq_len {
+                        current_mask = Some(id);
                     }
                 }
-                // Broadcast mask [1, Seq, Seq] over the Batch dimension
-                let mask_id = g.alloc(vec![1, seq_len, seq_len], mask_data);
+                
+                let mask_id = if let Some(id) = current_mask {
+                    id
+                } else {
+                    let mut mask_data = vec![0.0; seq_len * seq_len];
+                    for r in 0..seq_len {
+                        for c in 0..seq_len {
+                            // Tokens cannot look ahead into the future
+                            if c > r {
+                                mask_data[r * seq_len + c] = -1e20;
+                            }
+                        }
+                    }
+                    // Broadcast mask [1, Seq, Seq] over the Batch dimension
+                    let id = g.alloc(vec![1, seq_len, seq_len], mask_data);
+                    *self.cached_mask.write().unwrap() = Some((seq_len, id));
+                    id
+                };
                 g.add(scaled_scores_id, mask_id)
             } else {
                 scaled_scores_id
@@ -107,6 +137,8 @@ pub struct MultiHeadAttention {
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub out_proj: Linear,
+    pub cached_scale: RwLock<Option<((usize, usize), usize)>>,
+    pub cached_mask: RwLock<Option<(usize, usize)>>,
 }
 
 impl MultiHeadAttention {
@@ -125,6 +157,8 @@ impl MultiHeadAttention {
             k_proj: Linear::new(g, hidden_dim, hidden_dim, false),
             v_proj: Linear::new(g, hidden_dim, hidden_dim, false),
             out_proj: Linear::new(g, hidden_dim, hidden_dim, false),
+            cached_scale: RwLock::new(None),
+            cached_mask: RwLock::new(None),
         }
     }
 
@@ -175,34 +209,58 @@ impl MultiHeadAttention {
             let scores_id = g.bmm(q_t, k_t, true);
 
             // 6. Scale by 1 / sqrt(d_k)
-            let scale_id = g.alloc_pooled(
-                vec![bh, seq_len, seq_len],
-            );
-            g.name_tensor(scale_id, "attn_scale");
-
-            let scale_m = vec![scale; bh * seq_len * seq_len];
-            g.load_tensor_data(scale_id, &scale_m);
+            let mut current_scale = None;
+            if let Some(((c_bh, c_s), id)) = *self.cached_scale.read().unwrap() {
+                if c_bh == bh && c_s == seq_len {
+                    current_scale = Some(id);
+                }
+            }
+            
+            let scale_id = if let Some(id) = current_scale {
+                id
+            } else {
+                let scale_m = vec![scale; bh * seq_len * seq_len];
+                let id = g.alloc(vec![bh, seq_len, seq_len], scale_m);
+                g.name_tensor(id, "attn_scale");
+                *self.cached_scale.write().unwrap() = Some(((bh, seq_len), id));
+                id
+            };
+            
             let scaled_scores_id = g.mul(scores_id, scale_id);
 
             // 7. Causal Masking
             let masked_scores_id = if causal {
-                let mut mask_data = vec![0.0; seq_len * seq_len];
-                for r in 0..seq_len {
-                    for c in 0..seq_len {
-                        if c > r {
-                            mask_data[r * seq_len + c] = -1e20;
-                        }
+                let mut current_mask = None;
+                if let Some((c_s, id)) = *self.cached_mask.read().unwrap() {
+                    if c_s == seq_len {
+                        current_mask = Some(id);
                     }
                 }
 
-                #[cfg(feature = "bf16")]
-                let mask_id = if g.uses_bf16_mixed_precision() {
-                    g.alloc_param_bf16(vec![1, seq_len, seq_len], mask_data)
+                let mask_id = if let Some(id) = current_mask {
+                    id
                 } else {
-                    g.alloc(vec![1, seq_len, seq_len], mask_data)
+                    let mut mask_data = vec![0.0; seq_len * seq_len];
+                    for r in 0..seq_len {
+                        for c in 0..seq_len {
+                            if c > r {
+                                mask_data[r * seq_len + c] = -1e20;
+                            }
+                        }
+                    }
+
+                    #[cfg(feature = "bf16")]
+                    let id = if g.uses_bf16_mixed_precision() {
+                        g.alloc_param_bf16(vec![1, seq_len, seq_len], mask_data)
+                    } else {
+                        g.alloc(vec![1, seq_len, seq_len], mask_data)
+                    };
+                    #[cfg(not(feature = "bf16"))]
+                    let id = g.alloc(vec![1, seq_len, seq_len], mask_data);
+                    
+                    *self.cached_mask.write().unwrap() = Some((seq_len, id));
+                    id
                 };
-                #[cfg(not(feature = "bf16"))]
-                let mask_id = g.alloc(vec![1, seq_len, seq_len], mask_data);
 
                 g.add(scaled_scores_id, mask_id) // Add broadcasts across Batch*Heads
             } else {
@@ -257,6 +315,8 @@ pub struct GroupedQueryAttention {
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub out_proj: Linear,
+    pub cached_scale: RwLock<Option<((usize, usize), usize)>>,
+    pub cached_mask: RwLock<Option<(usize, usize)>>,
 }
 
 impl GroupedQueryAttention {
@@ -283,6 +343,8 @@ impl GroupedQueryAttention {
             k_proj: Linear::new(g, hidden_dim, kv_dim, false),
             v_proj: Linear::new(g, hidden_dim, kv_dim, false),
             out_proj: Linear::new(g, hidden_dim, hidden_dim, false),
+            cached_scale: RwLock::new(None),
+            cached_mask: RwLock::new(None),
         }
     }
 
@@ -339,31 +401,61 @@ impl GroupedQueryAttention {
             let scores_id = g.bmm(q_t, k_repeated, true);
 
             // 8. Scale
-            let scale_id = g.alloc_pooled(vec![bh, seq_len, seq_len]);
-            g.name_tensor(scale_id, "gqa_attn_scale");
-            let scale_m = vec![scale; bh * seq_len * seq_len];
-            g.load_tensor_data(scale_id, &scale_m);
+            let mut current_scale = None;
+            if let Some(((c_bh, c_s), id)) = *self.cached_scale.read().unwrap() {
+                if c_bh == bh && c_s == seq_len {
+                    current_scale = Some(id);
+                    println!("FOUND PREV MASK");
+                }
+            }
+            
+            let scale_id = if let Some(id) = current_scale {
+                id
+            } else {
+                println!("ALLOC ATTN MASK");
+                let scale_m = vec![scale; bh * seq_len * seq_len];
+                let id = g.alloc_pooled(vec![bh, seq_len, seq_len]);
+                g.load_tensor_data(id, scale_m.as_slice());
+                g.name_tensor(id, "gqa_attn_scale");
+                *self.cached_scale.write().unwrap() = Some(((bh, seq_len), id));
+                id
+            };
+            
             let scaled_scores_id = g.mul(scores_id, scale_id);
 
             // 9. Masking
             let masked_scores_id = if causal {
-                let mut mask_data = vec![0.0; seq_len * seq_len];
-                for r in 0..seq_len {
-                    for c in 0..seq_len {
-                        if c > r {
-                            mask_data[r * seq_len + c] = -1e20;
-                        }
+                let mut current_mask = None;
+                if let Some((c_s, id)) = *self.cached_mask.read().unwrap() {
+                    if c_s == seq_len {
+                        current_mask = Some(id);
                     }
                 }
 
-                #[cfg(feature = "bf16")]
-                let mask_id = if g.uses_bf16_mixed_precision() {
-                    g.alloc_param_bf16(vec![1, seq_len, seq_len], mask_data)
+                let mask_id = if let Some(id) = current_mask {
+                    id
                 } else {
-                    g.alloc(vec![1, seq_len, seq_len], mask_data)
+                    let mut mask_data = vec![0.0; seq_len * seq_len];
+                    for r in 0..seq_len {
+                        for c in 0..seq_len {
+                            if c > r {
+                                mask_data[r * seq_len + c] = -1e20;
+                            }
+                        }
+                    }
+
+                    #[cfg(feature = "bf16")]
+                    let id = if g.uses_bf16_mixed_precision() {
+                        g.alloc_param_bf16(vec![1, seq_len, seq_len], mask_data)
+                    } else {
+                        g.alloc(vec![1, seq_len, seq_len], mask_data)
+                    };
+                    #[cfg(not(feature = "bf16"))]
+                    let id = g.alloc(vec![1, seq_len, seq_len], mask_data);
+                    
+                    *self.cached_mask.write().unwrap() = Some((seq_len, id));
+                    id
                 };
-                #[cfg(not(feature = "bf16"))]
-                let mask_id = g.alloc(vec![1, seq_len, seq_len], mask_data);
 
                 g.add(scaled_scores_id, mask_id)
             } else {

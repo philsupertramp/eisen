@@ -197,6 +197,31 @@ impl Tensor {
         }
     }
 
+    pub fn sync_grad_to_cpu(&self) -> Vec<f32> {
+        match &self.grad {
+            Storage::Cpu(v) => v.clone(),
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(v) => v.iter().map(|&b| bf16u_to_f32(b)).collect(),
+            Storage::Gpu(s) => {
+                let stream = match &self.device {
+                    Device::Gpu(_, s) => s,
+                    _ => unreachable!(),
+                };
+                stream.clone_dtoh(s).expect("Failed to copy data from VRAM to Host")
+            }
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(s) => {
+                let stream = match &self.device {
+                    Device::Gpu(_, s) => s,
+                    _ => unreachable!(),
+                };
+                let u16_data = stream.clone_dtoh(s)
+                    .expect("Failed to copy BF16 data from VRAM to Host");
+                u16_data.into_iter().map(bf16u_to_f32).collect()
+            }
+        }
+    }
+
     pub fn compute_strides(shape: &[usize]) -> Vec<usize> {
         let mut strides = vec![0; shape.len()];
         let mut current = 1;

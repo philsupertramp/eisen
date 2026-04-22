@@ -87,6 +87,8 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 #[allow(unused_variables)]
                 let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
+                
+                self.name_tensor(compute_target_id, "tmp_matmul_out");
 
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
@@ -263,6 +265,8 @@ impl Graph {
                     }
                 }
                 let out_id = self.alloc(vec![m, n], out_data);
+                self.name_tensor(out_id, "tmp_matmul_out_cpu");
+
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();
@@ -363,6 +367,8 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 #[allow(unused_variables)]
                 let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
+                
+                self.name_tensor(compute_target_id, "tmp_matmul_trans_b_out");
 
                 self.ensure_on_gpu(a_id);
                 self.ensure_on_gpu(b_id);
@@ -416,6 +422,11 @@ impl Graph {
 
                 if !self.no_grad {
                     let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
+
+                        stream_clone.synchronize().unwrap_or_else(|err| {
+                            panic!("matmul_trans_b PRE backward sync failed: {:?}", err)
+                        });
+
                         let out_grad = match &tensors[out_id].grad {
                             Storage::Gpu(s) => s,
                             _ => unreachable!(),
@@ -461,10 +472,13 @@ impl Graph {
                         unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                             panic!("matmul_trans_b backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
                         });
+                        stream_clone.synchronize().unwrap_or_else(|err| {
+                            panic!("matmul_trans_b backward sync failed: {:?}", err)
+                        });
 
                         // 2. dB = dC^T * A (Transposed A Matmul: N x M @ M x K -> N x K)
                         let mut b2 = stream_clone.launch_builder(&f_bwd_b);
-                        b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&n_u64).arg(&m_u64).arg(&k_u64);
+                        b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
                         let cfg_b = LaunchConfig {
                             grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
                             block_dim: (16, 16, 1),
@@ -581,6 +595,7 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 #[allow(unused_variables)]
                 let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
+                self.name_tensor(compute_target_id, "tmp_matmul_bf16_out");
 
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
@@ -711,8 +726,8 @@ impl Graph {
                     b2.arg(a_data)
                         .arg(out_grad)
                         .arg(b_grad)
-                        .arg(&m_u64)
                         .arg(&k_u64)
+                        .arg(&m_u64)
                         .arg(&n_u64);
                     unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                         panic!("matmul_bf16 backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
@@ -816,6 +831,8 @@ impl Graph {
         #[cfg(not(feature = "bf16"))]
         #[allow(unused_variables)]
         let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
+                
+        self.name_tensor(compute_target_id, "tmp_matmul_streamed_out");
 
         #[cfg(feature = "bf16")]
         let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
@@ -863,7 +880,7 @@ impl Graph {
         drop(b_temp_fwd); 
 
         let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-            let b_f32_bwd = tensors[b_id].data.to_f32_vec();
+            let b_f32_bwd = tensors[b_id].sync_to_cpu();
             let b_temp_bwd = stream_bwd.clone_htod(b_f32_bwd.as_slice()).unwrap_or_else(|err| {
                 panic!("matmul_streamed: backward htod failed for size {}: {:?}", b_f32_bwd.len(), err)
             });
@@ -933,7 +950,7 @@ impl Graph {
                 .unwrap_or_else(|err| panic!("matmul_streamed: grad dtoh failed: {:?}", err));
 
             drop(b_temp_bwd);
-            let b_grad = tensors[b_id].grad.as_cpu_mut();
+            let mut b_grad = tensors[b_id].sync_grad_to_cpu();
             for (acc, delta) in b_grad.iter_mut().zip(grad_b_gpu.iter()) {
                 *acc += delta;
             }
@@ -1025,6 +1042,8 @@ impl Graph {
         #[cfg(not(feature = "bf16"))]
         #[allow(unused_variables)]
         let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
+                
+        self.name_tensor(compute_target_id, "tmp_matmul_trans_b_streamed_out");
 
         #[cfg(feature = "bf16")]
         let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
@@ -1237,6 +1256,7 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 #[allow(unused_variables)]
                 let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
+                self.name_tensor(compute_target_id, "tmp_bmm_out");
 
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
@@ -1434,6 +1454,8 @@ impl Graph {
                 }
 
                 let out_id = self.alloc(vec![batch, m, n], out_data);
+                self.name_tensor(out_id, "tmp_bmm_out_cpu");
+
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
 

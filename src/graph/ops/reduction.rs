@@ -630,7 +630,7 @@ impl Graph {
                     };
                     let l_grad = match &tensors[logits_id].grad {
                         Storage::Gpu(s) => s,
-                        _ => unreachable!("cross_entropy backward: l_grad must be Gpu"),
+                        s => unreachable!("cross_entropy backward: l_grad must be Gpu [{:?}]", s),
                     };
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
