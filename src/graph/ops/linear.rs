@@ -33,8 +33,6 @@ fn matmul_kernels(
 
 impl Graph {
     pub fn matmul(&mut self, a_id: usize, b_id: usize) -> usize {
-        // Streaming dispatch: if b is CPU-homed (weight streaming), use the
-        // streaming path which htods b on demand and frees it immediately.
         let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
         #[cfg(feature = "bf16")]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
@@ -71,7 +69,6 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    // allocate a ephemeral FP32 compute buffer (not pooled, owned by this scope)
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
                     let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
                     let tmp_id = self.tensors.len();
@@ -80,7 +77,7 @@ impl Graph {
                         id: tmp_id, shape: vec![m, n],
                         strides: Tensor::compute_strides(&[m, n]),
                         data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice), // unused
+                        grad: Storage::Gpu(grad_slice), 
                         device: self.device.clone(), name: None, is_pooled: false,
                     });
                     (tmp_id, true)
@@ -146,6 +143,9 @@ impl Graph {
                 unsafe { builder.launch(cfg) }.unwrap_or_else(|err| {
                     panic!("matmul forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg.grid_dim, cfg.block_dim)
                 });
+                
+                // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
+                stream.synchronize().expect("matmul forward sync failed");
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad {
@@ -214,7 +214,6 @@ impl Graph {
                         panic!("matmul backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
                     });
 
-                    // Sync to ensure kernels finish reading local temp buffers before they drop!
                     stream_clone.synchronize().unwrap_or_else(|err| {
                         panic!("matmul backward sync failed: {:?}", err)
                     });
@@ -239,8 +238,7 @@ impl Graph {
                         }
                         _ => {}
                     }
-                    // Remove the ephemeral FP32 buffer (it's at the end of tensors)
-                    self.tensors.pop(); // drops the CudaSlice → cudaFree
+                    self.tensors.pop(); 
                 }
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
@@ -301,7 +299,6 @@ impl Graph {
     }
 
     pub fn matmul_trans_b(&mut self, a_id: usize, b_id: usize) -> usize {
-        // 1. Streaming dispatch (consistent with matmul)
         let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
         #[cfg(feature = "bf16")]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
@@ -333,7 +330,6 @@ impl Graph {
             Device::Gpu(_, stream) => {
                 let stream_clone = stream.clone();
 
-                // Resolve kernels (sticking to the naming convention)
                 let f_fwd = self.functions.get("matmul_trans_b_f32").expect("matmul_trans_b_f32 kernel not found").clone();
                 let f_bwd_a = self.functions.get("matmul_f32").expect("matmul_f32 kernel not found").clone();
                 let f_bwd_b = self.functions.get("matmul_trans_a_f32").expect("matmul_trans_a_f32 kernel not found").clone();
@@ -342,7 +338,6 @@ impl Graph {
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
 
                 let mut out_shape = a_shape.clone();
                 *out_shape.last_mut().unwrap() = n;
@@ -377,7 +372,6 @@ impl Graph {
                 let k_u64 = k as u64;
                 let n_u64 = n as u64;
 
-                // --- FORWARD ---
                 {
                     #[cfg(feature = "bf16")]
                     let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
@@ -415,9 +409,11 @@ impl Graph {
                     unsafe { builder.launch(cfg) }.unwrap_or_else(|err| {
                         panic!("matmul_trans_b forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg.grid_dim, cfg.block_dim)
                     });
+                    
+                    // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
+                    stream.synchronize().expect("matmul_trans_b forward sync failed");
                 }
 
-                // --- BACKWARD ---
                 if !self.no_grad {
                     let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                         let out_grad = match &tensors[out_id].grad {
@@ -454,7 +450,7 @@ impl Graph {
                             _ => unreachable!(),
                         };
 
-                        // 1. dA = dC * B  (Standard Matmul)
+                        // 1. dA = dC * B  (Standard Matmul: M x N @ N x K -> M x K)
                         let mut b1 = stream_clone.launch_builder(&f_bwd_a);
                         b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
                         let cfg_a = LaunchConfig {
@@ -462,18 +458,13 @@ impl Graph {
                             block_dim: (16, 16, 1),
                             shared_mem_bytes: 0,
                         };
-
                         unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                             panic!("matmul_trans_b backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
                         });
-                        // Sync to ensure kernels finish reading local temp buffers before they drop!
-                        stream_clone.synchronize().unwrap_or_else(|err| {
-                            panic!("matmul_trans_b backward sync failed: {:?}", err)
-                        });
 
-                        // 2. dB = dC^T * A (Transposed A Matmul)
+                        // 2. dB = dC^T * A (Transposed A Matmul: N x M @ M x K -> N x K)
                         let mut b2 = stream_clone.launch_builder(&f_bwd_b);
-                        b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                        b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&n_u64).arg(&m_u64).arg(&k_u64);
                         let cfg_b = LaunchConfig {
                             grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
                             block_dim: (16, 16, 1),
@@ -483,7 +474,6 @@ impl Graph {
                             panic!("matmul_trans_b backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
                         });
 
-                        // Sync to ensure kernels finish reading local temp buffers before they drop!
                         stream_clone.synchronize().unwrap_or_else(|err| {
                             panic!("matmul_trans_b backward sync failed: {:?}", err)
                         });
@@ -521,26 +511,13 @@ impl Graph {
                 out_id
             }
             Device::Cpu => {
-                // ... (existing CPU logic would go here)
                 unimplemented!("CPU matmul_trans_b not implemented yet")
             }
         }
     }
 
-    /// Mixed-precision matrix multiplication.
-    ///
-    /// Forward:  A_fp32 → BF16  |  B_fp32 → BF16  |  BF16 × BF16 → FP32 out
-    /// Backward: standard FP32 matmul gradients (no loss scaling required for BF16)
-    ///
-    /// Master weights (B) always stay FP32, so the AdamW optimizer and the
-    /// rest of the graph are completely unmodified.
-    ///
-    /// BF16 quantization happens on-the-fly in the forward kernel, so
-    /// no full-size BF16 staging tensors are allocated in VRAM.
     #[cfg(feature = "bf16")]
     pub fn matmul_bf16(&mut self, a_id: usize, b_id: usize) -> usize {
-        // Streaming dispatch: if b is CPU-homed (weight streaming), use the
-        // streaming path which htods b on demand and frees it immediately.
         let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
 
@@ -573,7 +550,6 @@ impl Graph {
                     .get("matmul_f32_bf16rhsaccum_f32")
                     .unwrap()
                     .clone();
-                // Backward uses the existing tiled FP32 kernels — no new kernel needed.
                 let f_bwd_a_f32 = self.functions.get("matmul_backward_a_f32").unwrap().clone();
                 let f_bwd_a_bf16 = self
                     .functions
@@ -583,8 +559,6 @@ impl Graph {
                 let f_bwd_b = self.functions.get("matmul_backward_b_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
-                // Allocate output first to avoid aliasing immutable tensor borrows
-                // with a mutable borrow of `self`.
                 let out_id = self.alloc_pooled(vec![m, n]);
 
                 #[cfg(feature = "bf16")]
@@ -624,7 +598,6 @@ impl Graph {
                     _ => unreachable!("matmul_bf16: a_id must be Gpu or GpuBf16"),
                 };
 
-                // ── BF16-style compute (on-the-fly quantization) → FP32 output ─────
                 let o_fp32 = match &self.tensors[compute_target_id].data {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
@@ -667,11 +640,10 @@ impl Graph {
                     }
                     _ => unreachable!(),
                 }
+                
+                // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
+                stream.synchronize().expect("matmul_bf16 forward sync failed");
 
-                // ── Backward closure ─────────────────────────────────────────────────
-                //
-                // Gradients are computed entirely in FP32 using the existing tiled
-                // kernels (matmul_backward_a_f32 / matmul_backward_b_f32).
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad {
                         Storage::Gpu(s) => s,
@@ -697,7 +669,6 @@ impl Graph {
                         _ => unreachable!("matmul_bf16 backward: a_id must be Gpu or GpuBf16"),
                     };
 
-                    // grad_a = grad_out @ B^T
                     let cfg_a = LaunchConfig {
                         grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                         block_dim: (16, 16, 1),
@@ -731,7 +702,6 @@ impl Graph {
                         _ => unreachable!(),
                     }
 
-                    // grad_b = A^T @ grad_out
                     let cfg_b = LaunchConfig {
                         grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
                         block_dim: (16, 16, 1),
@@ -748,7 +718,6 @@ impl Graph {
                         panic!("matmul_bf16 backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
                     });
 
-                    // Sync to ensure kernels finish reading local temp buffers before they drop!
                     stream_clone.synchronize().unwrap_or_else(|err| {
                         panic!("matmul_bf16 backward sync failed: {:?}", err)
                     });
@@ -785,9 +754,6 @@ impl Graph {
                 }
                 out_id
             }
-
-            // CPU fallback: BF16 is a GPU-only optimisation.
-            // On CPU we silently use the standard FP32 path so tests still pass.
             Device::Cpu => self.matmul(a_id, b_id),
         }
     }
@@ -823,9 +789,7 @@ impl Graph {
             &self.tensors[b_id].data,
         );
         let stream_bwd = stream.clone();
-        let gpu_device_clone = gpu_device.clone();
 
-        // ── Forward: htod b → kernel → SYNC → FREE ─────────────────────────────
         let b_f32_fwd = self.tensors[b_id].data.to_f32_vec();
         let b_temp_fwd = stream.clone_htod(b_f32_fwd.as_slice()).unwrap_or_else(|err| {
             panic!("matmul_streamed: forward htod failed for size {}: {:?}", b_f32_fwd.len(), err)
@@ -893,13 +857,11 @@ impl Graph {
             panic!("matmul_streamed forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_fwd.grid_dim, cfg_fwd.block_dim)
         });
 
-        // Sync before free: guarantees the matmul kernel has finished reading
         stream
             .synchronize()
             .unwrap_or_else(|err| panic!("matmul_streamed: forward sync failed: {:?}", err));
-        drop(b_temp_fwd); // cudaFree — now safe
+        drop(b_temp_fwd); 
 
-        // ── Backward closure ────────────────────────────────────────────────────
         let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
             let b_f32_bwd = tensors[b_id].data.to_f32_vec();
             let b_temp_bwd = stream_bwd.clone_htod(b_f32_bwd.as_slice()).unwrap_or_else(|err| {
@@ -926,7 +888,6 @@ impl Graph {
                 _ => unreachable!("matmul_streamed: a_data must be GPU"),
             };
 
-            // grad_a = grad_out @ b^T   (GPU → GPU, accumulate in-place)
             let cfg_a = LaunchConfig {
                 grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                 block_dim: (16, 16, 1),
@@ -943,12 +904,10 @@ impl Graph {
                 panic!("matmul_streamed backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
             });
 
-            // Safe, immediate closure-bound VRAM allocation
             let mut grad_b_temp = stream_bwd.alloc_zeros::<f32>(k * n).unwrap_or_else(|err| {
                 panic!("matmul_streamed grad_b_temp allocation failed for size {}: {:?}", k * n, err)
             });
 
-            // grad_b = a^T @ grad_out  (GPU temp → dtoh → accumulate into CPU grad)
             let cfg_b = LaunchConfig {
                 grid_dim: ((n as u32 + 15) / 16, (k as u32 + 15) / 16, 1),
                 block_dim: (16, 16, 1),
@@ -965,7 +924,6 @@ impl Graph {
                 panic!("matmul_streamed backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
             });
 
-            // Sync before dtoh: the backward kernel must be done before we read
             stream_bwd
                 .synchronize()
                 .unwrap_or_else(|err| panic!("matmul_streamed: backward sync failed: {:?}", err));
@@ -974,9 +932,7 @@ impl Graph {
                 .clone_dtoh(&grad_b_temp)
                 .unwrap_or_else(|err| panic!("matmul_streamed: grad dtoh failed: {:?}", err));
 
-            // Free GPU temporaries now that data is on CPU
             drop(b_temp_bwd);
-            // Accumulate into the CPU grad buffer 
             let b_grad = tensors[b_id].grad.as_cpu_mut();
             for (acc, delta) in b_grad.iter_mut().zip(grad_b_gpu.iter()) {
                 *acc += delta;
@@ -1009,7 +965,7 @@ impl Graph {
                 }
                 _ => {}
             }
-            self.tensors.pop(); // Safely pops compute_target_id!
+            self.tensors.pop();
         }
 
         out_id
@@ -1040,9 +996,7 @@ impl Graph {
         let f_bwd_a = self.functions.get("matmul_f32").expect("matmul_f32 kernel not found").clone();
         let f_bwd_b = self.functions.get("matmul_trans_a_f32").expect("matmul_trans_a_f32 kernel not found").clone();
         let stream_bwd = stream.clone();
-        let gpu_device_clone = gpu_device.clone();
 
-        // ── Forward: htod b → kernel → SYNC → FREE ─────────────────────────────
         let b_f32_fwd = self.tensors[b_id].data.to_f32_vec();
         let b_temp_fwd = stream.clone_htod(b_f32_fwd.as_slice()).unwrap_or_else(|err| {
             panic!("matmul_trans_b_streamed: forward htod failed for size {}: {:?}", b_f32_fwd.len(), err)
@@ -1112,13 +1066,11 @@ impl Graph {
             panic!("matmul_trans_b_streamed forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_fwd.grid_dim, cfg_fwd.block_dim)
         });
 
-        // Sync before free: guarantees the matmul kernel has finished reading
         stream
             .synchronize()
             .unwrap_or_else(|err| panic!("matmul_trans_b_streamed: forward sync failed: {:?}", err));
-        drop(b_temp_fwd); // cudaFree — now safe
+        drop(b_temp_fwd);
 
-        // ── Backward closure ────────────────────────────────────────────────────
         let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
             let b_f32_bwd = tensors[b_id].data.to_f32_vec();
             let b_temp_bwd = stream_bwd.clone_htod(b_f32_bwd.as_slice()).unwrap_or_else(|err| {
@@ -1145,7 +1097,7 @@ impl Graph {
                 _ => unreachable!("matmul_trans_b_streamed: a_data must be GPU"),
             };
 
-            // grad_a = grad_out @ b^T   (GPU → GPU, accumulate in-place)
+            // 1. dA = dC * B  (Standard Matmul: M x N @ N x K -> M x K)
             let cfg_a = LaunchConfig {
                 grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                 block_dim: (16, 16, 1),
@@ -1162,12 +1114,11 @@ impl Graph {
                 panic!("matmul_trans_b_streamed backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
             });
 
-            // Safe, immediate closure-bound VRAM allocation
             let mut grad_b_temp = stream_bwd.alloc_zeros::<f32>(n * k).unwrap_or_else(|err| {
                 panic!("matmul_trans_b_streamed grad_b_temp allocation failed for size {}: {:?}", n * k, err)
             });
 
-            // grad_b = a^T @ grad_out  (GPU temp → dtoh → accumulate into CPU grad)
+            // 2. dB = dC^T * A (Transposed A Matmul: N x M @ M x K -> N x K)
             let cfg_b = LaunchConfig {
                 grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
                 block_dim: (16, 16, 1),
@@ -1177,8 +1128,8 @@ impl Graph {
             b2.arg(out_grad)
                 .arg(a_data)
                 .arg(&mut grad_b_temp)
-                .arg(&m_u64)
                 .arg(&n_u64)
+                .arg(&m_u64)
                 .arg(&k_u64);
             unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                 panic!("matmul_trans_b_streamed backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
@@ -1223,7 +1174,7 @@ impl Graph {
                 }
                 _ => {}
             }
-            self.tensors.pop(); // Safely pops compute_target_id!
+            self.tensors.pop();
         }
 
         out_id
@@ -1268,7 +1219,6 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    // allocate a ephemeral FP32 compute buffer (not pooled, owned by this scope)
                     let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
                     let f32_slice = self.safe_alloc_zeros::<f32>(&stream, batch * m * n);
                     let tmp_id = self.tensors.len();
@@ -1345,6 +1295,9 @@ impl Graph {
                 unsafe { builder.launch(cfg_fwd) }.unwrap_or_else(|err| {
                     panic!("bmm forward kernel launch failed: {:?} (batch={}, m={}, k={}, n={}, trans_b={}, grid={:?}, block={:?})", err, batch, m, k, n, trans_b, cfg_fwd.grid_dim, cfg_fwd.block_dim)
                 });
+                
+                // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
+                stream.synchronize().expect("bmm forward sync failed");
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = match &tensors[out_id].grad {
@@ -1423,7 +1376,6 @@ impl Graph {
                         panic!("bmm backward b kernel launch failed: {:?} (batch={}, m={}, k={}, n={}, trans_b={}, grid={:?}, block={:?})", err, batch, m, k, n, trans_b, cfg_b.grid_dim, cfg_b.block_dim)
                     });
 
-                    // Sync to ensure kernels finish reading local temp buffers before they drop!
                     stream_clone.synchronize().unwrap_or_else(|err| {
                         panic!("bmm backward sync failed: {:?}", err)
                     });
@@ -1447,8 +1399,7 @@ impl Graph {
                         }
                         _ => {}
                     }
-                    // Remove the ephemeral FP32 buffer (it's at the end of tensors)
-                    self.tensors.pop(); // drops the CudaSlice → cudaFree
+                    self.tensors.pop();
                 }
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {

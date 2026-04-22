@@ -64,6 +64,9 @@ pub struct Graph {
 
     /// Protects active node tensors from being evicted
     pub active_node_tensors: Vec<usize>,
+
+    /// Allowd VRAM budget provided by the user
+    pub vram_budget_bytes: Option<usize>,
 }
 
 impl Default for Graph {
@@ -269,6 +272,11 @@ impl Graph {
         #[cfg(not(feature = "bf16"))]
         let precision_mode = PrecisionMode::Fp32;
 
+        let vram_budget_bytes = env::var("EISEN_VRAM_BUDGET_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb * 1024 * 1024);
+
         Self {
             tensors: Vec::new(),
             tape: Tape::default(),
@@ -283,6 +291,7 @@ impl Graph {
             precision_mode,
 
             active_node_tensors: Vec::new(),
+            vram_budget_bytes,
         }
     }
 
@@ -318,14 +327,26 @@ impl Graph {
             let t = self.tensors.pop().unwrap();
             if t.is_pooled {
                 let size = if t.shape.is_empty() { 1 } else { t.shape.iter().product() };
-                self.vram_pool.entry(size).or_default().push(t.grad);
+                
+                // 1. Only recycle valid GPU gradient buffers!
+                // Discard Storage::Cpu (which includes the empty vec![] placeholders)
+                if matches!(t.grad, Storage::Gpu(_)) {
+                    self.vram_pool.entry(size).or_default().push(t.grad);
+                }
+                
+                // 2. Safely route data buffers by their exact type
                 match t.data {
                     #[cfg(feature = "bf16")]
                     Storage::GpuBf16(slice) => {
                         self.vram_pool_bf16.entry(size).or_default().push(slice);
                     }
-                    other => {
-                        self.vram_pool.entry(size).or_default().push(other);
+                    Storage::Gpu(slice) => {
+                        // Re-wrap the slice before pushing
+                        self.vram_pool.entry(size).or_default().push(Storage::Gpu(slice));
+                    }
+                    _ => {
+                        // Discard Storage::Cpu and Storage::CpuBf16 entirely.
+                        // They don't belong in the VRAM pools.
                     }
                 }
             }
@@ -687,8 +708,14 @@ impl Graph {
 
             // Lazy eviction logic without global pipeline halts
             if let Some(context) = &ctx {
-                let (free_vram, _) = context.mem_get_info().unwrap();
-                let scratch_budget = 1024 * 1024 * 1024; // Lowered to 64MB buffer
+                let scratch_budget = 64 * 1024 * 1024; // Fixed: lowered to true 64MB buffer
+
+                // Calculate free VRAM based on the user budget if provided, else fall back to driver info
+                let free_vram = if let Some(budget) = self.vram_budget_bytes {
+                    budget.saturating_sub(self.current_vram_usage())
+                } else {
+                    context.mem_get_info().unwrap().0
+                };
 
                 if free_vram < scratch_budget {
                     // Evict unused pooled tensors directly to CPU
@@ -714,10 +741,10 @@ impl Graph {
                         self.print_vram_state("backward pass error");
                     }
                 }
-                //else {
-                //    println!("Currently available: {}, attempting to reclaim: {}", current_free, scratch_budget);
-                //    self.print_vram_state("backward pass");
-                //}
+                else {
+                    println!("Currently available: {}, attempting to reclaim: {}", free_vram / 1024 / 1024, scratch_budget);
+                    self.print_vram_state("backward pass");
+                }
             }
             // 3. LAZY ALLOCATION: Do this BEFORE the closure runs.
             // We know exactly which tensors this backward step needs!
@@ -733,6 +760,11 @@ impl Graph {
             }
             // Execute the backward closure safely
             (node.backward_fn)(&mut self.tensors);
+            if let Some(stream) = &stream_opt {
+                stream.synchronize().unwrap_or_else(|err| {
+                    panic!("backward post-call synchronize failed: {:?}", err)
+                });
+            }
 
 
         }

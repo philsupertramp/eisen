@@ -191,17 +191,32 @@ impl Graph {
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         size: usize,
     ) -> cudarc::driver::CudaSlice<T> {
-        if let Ok(slice) = stream.alloc_zeros::<T>(size) {
-            return slice;
+        let alloc_bytes = size * std::mem::size_of::<T>();
+        
+        // Pass `&Graph` explicitly so the borrow drops immediately after evaluation
+        let check_budget = |g: &Graph| {
+            g.vram_budget_bytes.map_or(true, |budget| {
+                g.current_vram_usage() + alloc_bytes <= budget
+            })
+        };
+
+        // 1. Initial attempt
+        if check_budget(self) {
+            if let Ok(slice) = stream.alloc_zeros::<T>(size) {
+                return slice;
+            }
         }
 
+        // 2. Try again after dropping the cache pool
         self.vram_pool.clear();
         #[cfg(feature = "bf16")]
         self.vram_pool_bf16.clear();
         stream.synchronize().unwrap();
 
-        if let Ok(slice) = stream.alloc_zeros::<T>(size) {
-            return slice;
+        if check_budget(self) {
+            if let Ok(slice) = stream.alloc_zeros::<T>(size) {
+                return slice;
+            }
         }
 
         let protected_ids: HashSet<usize> = if self.active_node_tensors.is_empty() {
@@ -228,11 +243,16 @@ impl Graph {
             .map(|t| t.id)
             .collect();
 
+        // 3. Fallback: Evict candidates to CPU sequentially until we fit in the budget
         for id in candidate_ids {
             self.demote_tensor_to_cpu(id);
             stream.synchronize().unwrap();
-            if let Ok(slice) = stream.alloc_zeros::<T>(size) {
-                return slice;
+            
+            // Re-evaluate budget safely
+            if check_budget(self) {
+                if let Ok(slice) = stream.alloc_zeros::<T>(size) {
+                    return slice;
+                }
             }
         }
 
@@ -240,7 +260,7 @@ impl Graph {
         let requested_mb = (size * std::mem::size_of::<T>()) as f64 / 1024.0 / 1024.0;
         panic!(
             "FATAL OOM: Exhausted VRAM even after full activation eviction! \n\
-            Attempted to allocate {:.2} MB ({} elements). Driver state likely corrupted by a previous kernel error.", 
+            Attempted to allocate {:.2} MB ({} elements).", 
             requested_mb, size
         );
     }
@@ -336,20 +356,45 @@ impl Graph {
         }
 
         self.tensors[tensor_id].grad = Storage::Cpu(vec![0.0; size]);
+        println!("EVICTION!");
 
         if let Some(st) = stream {
             st.synchronize().expect("demote: stream sync failed");
         }
     }
 
+    pub fn current_vram_usage(&self) -> usize {
+        let mut used = 0;
+        for t in &self.tensors {
+            match &t.data {
+                Storage::Gpu(s) => used += s.len() * 4,
+                #[cfg(feature = "bf16")]
+                Storage::GpuBf16(s) => used += s.len() * 2,
+                _ => {}
+            }
+            match &t.grad {
+                Storage::Gpu(s) => used += s.len() * 4,
+                _ => {}
+            }
+        }
+        for (size, blocks) in &self.vram_pool {
+            used += size * 4 * blocks.len();
+        }
+        #[cfg(feature = "bf16")]
+        for (size, blocks) in &self.vram_pool_bf16 {
+            used += size * 2 * blocks.len();
+        }
+        used
+    }
+
     /// Ensures that a tensor's gradient is allocated on the GPU.
     /// This should be called inside backward closures right before writing to a gradient.
     pub fn ensure_grad_allocated(&mut self, id: usize) {
-        let (size, is_pooled) = {
+        let size = {
             let t = &self.tensors[id];
             // Already allocated?
             if matches!(t.grad, Storage::Gpu(_)) { return; }
-            (t.shape.iter().product::<usize>(), t.is_pooled)
+            t.shape.iter().product::<usize>()
         };
 
         let stream = match &self.device {
