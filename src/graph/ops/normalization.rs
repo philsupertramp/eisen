@@ -21,7 +21,7 @@ impl Graph {
                     match (x_bf, w_bf) {
                         (true, true) => (
                             self.functions.get("rmsnorm_bf16").unwrap().clone(),
-                            self.functions.get("rmsnorm_backward_bf16in_f32").unwrap().clone(),
+                            self.functions.get("rmsnorm_backward_bf16").unwrap().clone(),
                         ),
                         (false, true) => (
                             self.functions.get("rmsnorm_f32_bf16w").unwrap().clone(),
@@ -89,35 +89,26 @@ impl Graph {
                 }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let x_grad = match &tensors[x_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let w_grad = match &tensors[weight_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
                     let mut builder = stream_clone.launch_builder(&f_bwd);
-                    match (&tensors[x_id].data, &tensors[weight_id].data) {
-                        (Storage::Gpu(x_s), Storage::Gpu(w_s)) => {
+                    match (
+                        &tensors[x_id].data,
+                        &tensors[weight_id].data,
+                        &tensors[out_id].grad,
+                        &tensors[x_id].grad,
+                        &tensors[weight_id].grad,
+                    ) {
+                        (Storage::Gpu(x_s), Storage::Gpu(w_s), Storage::Gpu(out_grad), Storage::Gpu(x_grad), Storage::Gpu(w_grad)) => {
                             builder.arg(x_s).arg(w_s).arg(out_grad)
                                 .arg(x_grad).arg(w_grad)
                                 .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
-                        (Storage::Gpu(x_s), Storage::GpuBf16(w_s)) => {
+                        (Storage::GpuBf16(x_s), Storage::GpuBf16(w_s), Storage::GpuBf16(out_grad), Storage::GpuBf16(x_grad), Storage::GpuBf16(w_grad)) => {
                             builder.arg(x_s).arg(w_s).arg(out_grad)
                                 .arg(x_grad).arg(w_grad)
                                 .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
                         }
-                        #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(x_s), Storage::GpuBf16(w_s)) => {
-                            builder.arg(x_s).arg(w_s).arg(out_grad)
-                                .arg(x_grad).arg(w_grad)
-                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
-                        }
-                        _ => panic!("rms_norm backward: unsupported storage"),
+                        (s1, s2, s3, s4, s5) => panic!("rms_norm backward: unsupported storage [{:?}, {:?}, {:?}, {:?}, {:?}]", s1, s2, s3, s4, s5),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(num_vecs as u32)) }.unwrap();
                 });

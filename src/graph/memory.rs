@@ -412,8 +412,19 @@ impl Graph {
         };
 
         // Pull from the appropriate pool
-        let grad_slice = self.safe_alloc_zeros::<f32>(&stream, size);
-        self.tensors[id].grad = Storage::Gpu(grad_slice);
+        match self.tensors[id].data {
+            Storage::Gpu(_) => {
+                let grad_slice = self.safe_alloc_zeros::<f32>(&stream, size);
+                self.tensors[id].grad = Storage::Gpu(grad_slice);
+            },
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(_) => {
+                let grad_slice = self.safe_alloc_zeros::<u16>(&stream, size);
+                self.tensors[id].grad = Storage::GpuBf16(grad_slice);
+            },
+            _ => panic!("ensure_grad_allocated only supported on GPU")
+        }
+
     }
 
     pub fn get_used_vram(&self) -> usize {
@@ -547,7 +558,7 @@ impl Graph {
 
         println!("--- Top GPU Tensor Consumers ---");
         println!("  TOTAL MEM   |  DATA MEM   |  GRAD MEM   | G/D | COUNT | IDENTITY");
-        for (name, usage) in sorted.into_iter().take(25) {
+        for (name, usage) in sorted.into_iter() {
             let total_mb = (usage.data_bytes + usage.grad_bytes) as f32 / 1024.0 / 1024.0;
             let data_mb = usage.data_bytes as f32 / 1024.0 / 1024.0;
             let grad_mb = usage.grad_bytes as f32 / 1024.0 / 1024.0;

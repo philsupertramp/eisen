@@ -146,6 +146,22 @@ impl Tensor {
         let size: usize = if shape.is_empty() { 1 } else { shape.iter().product() };
         let strides = Self::compute_strides(&shape);
 
+        #[cfg(feature = "bf16")]
+        let (data_storage, grad_storage) = match &device {
+            Device::Cpu => (
+                Storage::CpuBf16(data.iter().map(|f: &f32| f32_to_bf16u(*f)).collect::<Vec<u16>>()),
+                Storage::CpuBf16(vec![0; size]),
+            ),
+            Device::Gpu(_ctx, stream) => {
+                let d_data = stream.clone_htod(&data.iter().map(|f: &f32| f32_to_bf16u(*f)).collect::<Vec<u16>>())
+                    .expect("Failed to copy data to VRAM");
+                let d_grad = stream.alloc_zeros::<u16>(size)
+                    .expect("Failed to allocate gradients in VRAM");
+                (Storage::GpuBf16(d_data), Storage::GpuBf16(d_grad))
+            }
+        };
+
+        #[cfg(not(feature = "bf16"))]
         let (data_storage, grad_storage) = match &device {
             Device::Cpu => (
                 Storage::Cpu(data),
@@ -169,6 +185,44 @@ impl Tensor {
             device,
             name: None,
             is_pooled: false,
+        }
+    }
+
+    pub fn sync_to_gpu(&self) {
+        let stream = match &self.device {
+            Device::Gpu(_ctx, stream) => stream,
+            Device::Cpu => panic!("No GPU!"),
+        };
+
+        match &self.data {
+            Storage::Cpu(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(s) => {},
+            Storage::Gpu(s) => {},
+            _ => unreachable!("sync_to_gpu: data must be Gpu or GpuBf16"),
+        }
+        match &self.grad {
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(s) => {},
+            Storage::Gpu(s) => {},
+            Storage::Cpu(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            _ => unreachable!("sync_to_gpu: data must be Gpu or GpuBf16"),
         }
     }
 

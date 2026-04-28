@@ -13,9 +13,9 @@ fn matmul_kernels(
     #[cfg(feature = "bf16")]
     match (is_bf16(a), is_bf16(b)) {
         (true, true) => (
-            functions["matmul_bf16_f32"].clone(),
-            functions["matmul_backward_a_bf16b_f32"].clone(),
-            functions["matmul_backward_b_f32"].clone(),
+            functions["matmul_bf16"].clone(),
+            functions["matmul_backward_a_bf16"].clone(),
+            functions["matmul_backward_b_bf16"].clone(),
         ),
         _ => (
             functions["matmul_f32"].clone(),
@@ -40,6 +40,7 @@ impl Graph {
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_));
 
         if a_is_gpu && b_is_cpu {
+            println!("STREAMING!");
             return self.matmul_streamed(a_id, b_id);
         }
 
@@ -58,6 +59,9 @@ impl Graph {
 
         match &device {
             Device::Gpu(_, stream) => {
+                // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
+                stream.synchronize().expect("matmul forward sync failed");
+
                 let (f_fwd, f_bwd_a, f_bwd_b) = matmul_kernels(
                     &self.functions,
                     &self.tensors[a_id].data,
@@ -66,72 +70,39 @@ impl Graph {
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(vec![m, n]);
-
-                #[cfg(feature = "bf16")]
-                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
-                    let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
-                    self.tensors.push(Tensor {
-                        id: tmp_id, shape: vec![m, n],
-                        strides: Tensor::compute_strides(&[m, n]),
-                        data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice), 
-                        device: self.device.clone(), name: None, is_pooled: false,
-                    });
-                    (tmp_id, true)
-                } else {
-                    (out_id, false)
-                };
-                #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-                
-                self.name_tensor(compute_target_id, "tmp_matmul_out");
-
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
-                #[cfg(feature = "bf16")]
-                let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
-                #[cfg(not(feature = "bf16"))]
-                let a_temp_fwd: Option<()> = None;
-
-                #[cfg(feature = "bf16")]
-                let b_temp_fwd = safe_bf16_temp!(self, b_id, k * n, &stream, &f_cast_to_f32);
-                #[cfg(not(feature = "bf16"))]
-                let b_temp_fwd: Option<()> = None;
-
-                let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
-                    (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                    _ => unreachable!(),
-                };
-                let b_s = match (&self.tensors[b_id].data, &b_temp_fwd) {
-                    (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                    _ => unreachable!(),
-                };
-                let o_s = match &self.tensors[compute_target_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
+                self.name_tensor(out_id, "tmp_matmul_out");
 
                 let m_u64 = m as u64;
                 let k_u64 = k as u64;
                 let n_u64 = n as u64;
 
                 let mut builder = stream.launch_builder(&f_fwd);
-                builder
-                    .arg(a_s)
-                    .arg(b_s)
-                    .arg(o_s)
-                    .arg(&m_u64)
-                    .arg(&k_u64)
-                    .arg(&n_u64);
+                match (
+                    &self.tensors[a_id].data,
+                    &self.tensors[b_id].data,
+                    &self.tensors[out_id].data
+                ) {
+                    (Storage::Gpu(a_s), Storage::Gpu(b_s), Storage::Gpu(o_s)) => {
+                        builder
+                            .arg(a_s)
+                            .arg(b_s)
+                            .arg(o_s)
+                            .arg(&m_u64)
+                            .arg(&k_u64)
+                            .arg(&n_u64);
+                    },
+                    #[cfg(feature = "bf16")]
+                    (Storage::GpuBf16(a_s), Storage::GpuBf16(b_s), Storage::GpuBf16(o_s)) => {
+                        builder
+                            .arg(a_s)
+                            .arg(b_s)
+                            .arg(o_s)
+                            .arg(&n_u64)
+                            .arg(&k_u64)
+                            .arg(&m_u64);
+                    },
+                    (s1, s2, s3) => unreachable!("matmul: wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+                }
 
                 let cfg = LaunchConfig {
                     grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
@@ -146,52 +117,36 @@ impl Graph {
                 stream.synchronize().expect("matmul forward sync failed");
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    let b_grad = match &tensors[b_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    
-                    #[cfg(feature = "bf16")]
-                    let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, m * k, &stream_clone, &f_cast_to_f32_bwd);
-                    #[cfg(not(feature = "bf16"))]
-                    let a_temp_bwd: Option<()> = None;
-
-                    #[cfg(feature = "bf16")]
-                    let b_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[b_id].data, k * n, &stream_clone, &f_cast_to_f32_bwd);
-                    #[cfg(not(feature = "bf16"))]
-                    let b_temp_bwd: Option<()> = None;
-
-                    let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!(),
-                    };
-                    let b_data = match (&tensors[b_id].data, &b_temp_bwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!(),
-                    };
-
                     let cfg_a = LaunchConfig {
                         grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                         block_dim: (16, 16, 1),
                         shared_mem_bytes: 0,
                     };
                     let mut b1 = stream_clone.launch_builder(&f_bwd_a);
-                    b1.arg(out_grad)
-                        .arg(b_data)
-                        .arg(a_grad)
-                        .arg(&m_u64)
-                        .arg(&k_u64)
-                        .arg(&n_u64);
+                    match (
+                        &tensors[a_id].grad,
+                        &tensors[b_id].data,
+                        &tensors[out_id].grad
+                    ) {
+                        (Storage::Gpu(a_grad), Storage::Gpu(b_data), Storage::Gpu(out_grad)) => {
+                            b1.arg(out_grad)
+                                .arg(b_data)
+                                .arg(a_grad)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        }
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a_grad), Storage::GpuBf16(b_data), Storage::GpuBf16(out_grad)) => {
+                            b1.arg(out_grad)
+                                .arg(b_data)
+                                .arg(a_grad)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        }
+                        (s1, s2, s3) => unreachable!("matmul backward: wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+                    }
                     unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                         panic!("matmul backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
                     });
@@ -202,12 +157,31 @@ impl Graph {
                         shared_mem_bytes: 0,
                     };
                     let mut b2 = stream_clone.launch_builder(&f_bwd_b);
-                    b2.arg(a_data)
-                        .arg(out_grad)
-                        .arg(b_grad)
-                        .arg(&m_u64)
-                        .arg(&k_u64)
-                        .arg(&n_u64);
+                    match (
+                        &tensors[a_id].data,
+                        &tensors[b_id].grad,
+                        &tensors[out_id].grad
+                    ) {
+                        (Storage::Gpu(a_data), Storage::Gpu(b_grad), Storage::Gpu(out_grad)) => {
+                            b2.arg(a_data)
+                                .arg(out_grad)
+                                .arg(b_grad)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        }
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a_data), Storage::GpuBf16(b_grad), Storage::GpuBf16(out_grad)) => {
+                            b2.arg(a_data)
+                                .arg(out_grad)
+                                .arg(b_grad)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        }
+                        (s1, s2, s3) => unreachable!("matmul backward: wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+                    }
+
                     unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                         panic!("matmul backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
                     });
@@ -216,28 +190,6 @@ impl Graph {
                         panic!("matmul backward sync failed: {:?}", err)
                     });
                 });
-                
-                #[cfg(feature = "bf16")]
-                if cast_to_bf16_after {
-                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let n_elem = (m * n) as u64;
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                            let mut b = stream.launch_builder(&f_cast);
-                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            let cfg_cast = LaunchConfig::for_num_elems((m * n) as u32);
-                            unsafe { b.launch(cfg_cast) }.unwrap_or_else(|err| {
-                                panic!("matmul cast_f32_to_bf16 kernel launch failed: {:?} (m={}, n={}, grid={:?}, block={:?})", err, m, n, cfg_cast.grid_dim, cfg_cast.block_dim)
-                            });
-                            stream.synchronize().unwrap_or_else(|err| {
-                                panic!("matmul post-cast synchronize failed: {:?}", err)
-                            });
-                        }
-                        _ => {}
-                    }
-                    self.tensors.pop(); 
-                }
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
                         inputs: vec![a_id, b_id],
@@ -330,74 +282,45 @@ impl Graph {
             Device::Gpu(_, stream) => {
                 let stream_clone = stream.clone();
 
+                #[cfg(feature = "bf16")]
+                let f_fwd = self.functions.get("matmul_trans_b_bf16").expect("matmul_trans_b_bf16 kernel not found").clone();
+                #[cfg(not(feature = "bf16"))]
                 let f_fwd = self.functions.get("matmul_trans_b_f32").expect("matmul_trans_b_f32 kernel not found").clone();
+                #[cfg(feature = "bf16")]
+                let f_bwd_a = self.functions.get("matmul_bf16").expect("matmul_bf16 kernel not found").clone();
+                #[cfg(not(feature = "bf16"))]
                 let f_bwd_a = self.functions.get("matmul_f32").expect("matmul_f32 kernel not found").clone();
+                #[cfg(feature = "bf16")]
+                let f_bwd_b = self.functions.get("matmul_trans_a_bf16").expect("matmul_trans_a_bf16 kernel not found").clone();
+                #[cfg(not(feature = "bf16"))]
                 let f_bwd_b = self.functions.get("matmul_trans_a_f32").expect("matmul_trans_a_f32 kernel not found").clone();
-
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32_bwd = f_cast_to_f32.clone();
 
                 let mut out_shape = a_shape.clone();
                 *out_shape.last_mut().unwrap() = n;
-                let out_id = self.alloc_pooled(out_shape);
 
-                #[cfg(feature = "bf16")]
-                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
-                    let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
-                    self.tensors.push(Tensor {
-                        id: tmp_id, shape: vec![m, n],
-                        strides: Tensor::compute_strides(&[m, n]),
-                        data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
-                    });
-                    (tmp_id, true)
-                } else {
-                    (out_id, false)
-                };
-                #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-                
-                self.name_tensor(compute_target_id, "tmp_matmul_trans_b_out");
+                let out_id = self.alloc_pooled(out_shape);
+                self.name_tensor(out_id, "tmp_matmul_trans_b_out");
 
                 let m_u64 = m as u64;
                 let k_u64 = k as u64;
                 let n_u64 = n as u64;
 
                 {
-                    #[cfg(feature = "bf16")]
-                    let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
-                    #[cfg(not(feature = "bf16"))]
-                    let a_temp_fwd: Option<()> = None;
-
-                    #[cfg(feature = "bf16")]
-                    let b_temp_fwd = safe_bf16_temp!(self, b_id, k * n, &stream, &f_cast_to_f32);
-                    #[cfg(not(feature = "bf16"))]
-                    let b_temp_fwd: Option<()> = None;
-
-                    let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!(),
-                    };
-                    let b_s = match (&self.tensors[b_id].data, &b_temp_fwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!(),
-                    };
-                    let o_s = match &self.tensors[compute_target_id].data {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!("matmul_trans_b: compute target must be GPU FP32"),
-                    };
-
                     let mut builder = stream.launch_builder(&f_fwd);
-                    builder.arg(a_s).arg(b_s).arg(o_s).arg(&m_u64).arg(&k_u64).arg(&n_u64);
+                    match (
+                        &self.tensors[a_id].data,
+                        &self.tensors[b_id].data,
+                        &self.tensors[out_id].data
+                    ) {
+                        (Storage::Gpu(a_s), Storage::Gpu(b_s), Storage::Gpu(o_s)) => {
+                            builder.arg(a_s).arg(b_s).arg(o_s).arg(&m_u64).arg(&k_u64).arg(&n_u64);
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a_s), Storage::GpuBf16(b_s), Storage::GpuBf16(o_s)) => {
+                            builder.arg(a_s).arg(b_s).arg(o_s).arg(&m_u64).arg(&k_u64).arg(&n_u64);
+                        },
+                        (s1, s2, s3) => unreachable!("matmul_trans_b: wrong precision [{:?}, {:?}, {:?}]", s1, s2, s3)
+                    }
 
                     let cfg = LaunchConfig {
                         grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
@@ -419,48 +342,28 @@ impl Graph {
                             panic!("matmul_trans_b PRE backward sync failed: {:?}", err)
                         });
 
-                        let out_grad = match &tensors[out_id].grad {
-                            Storage::Gpu(s) => s,
-                            _ => unreachable!(),
-                        };
-                        let a_grad = match &tensors[a_id].grad {
-                            Storage::Gpu(s) => s,
-                            _ => unreachable!(),
-                        };
-                        let b_grad = match &tensors[b_id].grad {
-                            Storage::Gpu(s) => s,
-                            _ => unreachable!(),
-                        };
-                        
-                        #[cfg(feature = "bf16")]
-                        let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, m * k, &stream_clone, &f_cast_to_f32_bwd);
-                        #[cfg(not(feature = "bf16"))]
-                        let a_temp_bwd: Option<()> = None;
-
-                        #[cfg(feature = "bf16")]
-                        let b_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[b_id].data, k * n, &stream_clone, &f_cast_to_f32_bwd);
-                        #[cfg(not(feature = "bf16"))]
-                        let b_temp_bwd: Option<()> = None;
-
-                        let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
-                            (Storage::Gpu(s), _) => s,
-                            #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                            _ => unreachable!(),
-                        };
-                        let b_data = match (&tensors[b_id].data, &b_temp_bwd) {
-                            (Storage::Gpu(s), _) => s,
-                            #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                            _ => unreachable!(),
-                        };
-
                         // 1. dA = dC * B  (Standard Matmul: M x N @ N x K -> M x K)
                         let mut b1 = stream_clone.launch_builder(&f_bwd_a);
-                        b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
                         let cfg_a = LaunchConfig {
                             grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                             block_dim: (16, 16, 1),
                             shared_mem_bytes: 0,
                         };
+
+                        match (
+                            &tensors[out_id].grad,
+                            &tensors[a_id].grad,
+                            &tensors[b_id].data
+                        ) {
+                            (Storage::Gpu(out_grad), Storage::Gpu(a_grad), Storage::Gpu(b_data)) => {
+                                b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                            },
+                            #[cfg(feature = "bf16")]
+                            (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad), Storage::GpuBf16(b_data)) => {
+                                b1.arg(out_grad).arg(b_data).arg(a_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                            },
+                            (s1, s2, s3) => unreachable!("Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+                        }
                         unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                             panic!("matmul_trans_b backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
                         });
@@ -470,12 +373,27 @@ impl Graph {
 
                         // 2. dB = dC^T * A (Transposed A Matmul: N x M @ M x K -> N x K)
                         let mut b2 = stream_clone.launch_builder(&f_bwd_b);
-                        b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
                         let cfg_b = LaunchConfig {
                             grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, 1),
                             block_dim: (16, 16, 1),
                             shared_mem_bytes: 0,
                         };
+                        
+                        match (
+                            &tensors[out_id].grad,
+                            &tensors[a_id].data,
+                            &tensors[b_id].grad
+                        ) {
+                            (Storage::Gpu(out_grad), Storage::Gpu(a_data), Storage::Gpu(b_grad)) => {
+                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                            },
+                            #[cfg(feature = "bf16")]
+                            (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_data), Storage::GpuBf16(b_grad)) => {
+                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                            },
+                            (s1, s2, s3) => unreachable!("Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+                        }
+
                         unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                             panic!("matmul_trans_b backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
                         });
@@ -490,28 +408,6 @@ impl Graph {
                         output: out_id,
                         backward_fn,
                     });
-                }
-
-                #[cfg(feature = "bf16")]
-                if cast_to_bf16_after {
-                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let n_elem = (m * n) as u64;
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                            let mut b = stream.launch_builder(&f_cast);
-                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            let cfg_cast = LaunchConfig::for_num_elems((m * n) as u32);
-                            unsafe { b.launch(cfg_cast) }.unwrap_or_else(|err| {
-                                panic!("matmul_trans_b cast_f32_to_bf16 kernel launch failed: {:?} (m={}, n={}, grid={:?}, block={:?})", err, m, n, cfg_cast.grid_dim, cfg_cast.block_dim)
-                            });
-                            stream.synchronize().unwrap_or_else(|err| {
-                                panic!("matmul_trans_b post-cast synchronize failed: {:?}", err)
-                            });
-                        }
-                        _ => {}
-                    }
-                    self.tensors.pop();
                 }
 
                 out_id
@@ -807,48 +703,8 @@ impl Graph {
         });
 
         let out_id = self.alloc_pooled(vec![m, n]);
+        self.name_tensor(out_id, "tmp_matmul_streamed_out");
 
-        #[cfg(feature = "bf16")]
-        let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-            let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
-            let tmp_id = self.tensors.len();
-            let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
-            self.tensors.push(Tensor {
-                id: tmp_id, shape: vec![m, n],
-                strides: Tensor::compute_strides(&[m, n]),
-                data: Storage::Gpu(f32_slice),
-                grad: Storage::Gpu(grad_slice),
-                device: self.device.clone(), name: None, is_pooled: false,
-            });
-            (tmp_id, true)
-        } else {
-            (out_id, false)
-        };
-        #[cfg(not(feature = "bf16"))]
-        #[allow(unused_variables)]
-        let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-                
-        self.name_tensor(compute_target_id, "tmp_matmul_streamed_out");
-
-        #[cfg(feature = "bf16")]
-        let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
-        #[cfg(feature = "bf16")]
-        let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
-        #[cfg(feature = "bf16")]
-        let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
-        #[cfg(not(feature = "bf16"))]
-        let a_temp_fwd: Option<()> = None;
-
-        let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
-            (Storage::Gpu(s), _) => s,
-            #[cfg(feature = "bf16")] (_, Some(t)) => t,
-            _ => unreachable!("matmul_streamed: input a must be GPU storage"),
-        };
-        let o_s = match &self.tensors[compute_target_id].data {
-            Storage::Gpu(s) => s,
-            _ => unreachable!(),
-        };
         let m_u64 = m as u64;
         let k_u64 = k as u64;
         let n_u64 = n as u64;
@@ -859,13 +715,32 @@ impl Graph {
             shared_mem_bytes: 0,
         };
         let mut builder = stream.launch_builder(&f_fwd);
-        builder
-            .arg(a_s)
-            .arg(&b_temp_fwd)
-            .arg(o_s)
-            .arg(&m_u64)
-            .arg(&k_u64)
-            .arg(&n_u64);
+        match (
+            &self.tensors[a_id].data,
+            &self.tensors[b_id].data,
+            &self.tensors[out_id].data,
+        ) {
+            (Storage::Gpu(a_s), Storage::Gpu(b_temp_fwd), Storage::Gpu(o_s)) => {
+                builder
+                    .arg(a_s)
+                    .arg(b_temp_fwd)
+                    .arg(o_s)
+                    .arg(&m_u64)
+                    .arg(&k_u64)
+                    .arg(&n_u64);
+            }
+            #[cfg(feature = "bf16")]
+            (Storage::GpuBf16(a_s), Storage::GpuBf16(b_temp_fwd), Storage::GpuBf16(o_s)) => {
+                builder
+                    .arg(a_s)
+                    .arg(b_temp_fwd)
+                    .arg(o_s)
+                    .arg(&m_u64)
+                    .arg(&k_u64)
+                    .arg(&n_u64);
+            }
+            (s1, s2, s3) => unreachable!("matmul_streamed: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+        }
         unsafe { builder.launch(cfg_fwd) }.unwrap_or_else(|err| {
             panic!("matmul_streamed forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_fwd.grid_dim, cfg_fwd.block_dim)
         });
@@ -873,52 +748,40 @@ impl Graph {
         stream
             .synchronize()
             .unwrap_or_else(|err| panic!("matmul_streamed: forward sync failed: {:?}", err));
-        drop(b_temp_fwd); 
 
         let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-            let b_f32_bwd = tensors[b_id].sync_to_cpu();
-            let b_temp_bwd = stream_bwd.clone_htod(b_f32_bwd.as_slice()).unwrap_or_else(|err| {
-                panic!("matmul_streamed: backward htod failed for size {}: {:?}", b_f32_bwd.len(), err)
-            });
-
-            let out_grad = match &tensors[out_id].grad {
-                Storage::Gpu(s) => s,
-                _ => unreachable!(),
-            };
-            let a_grad = match &tensors[a_id].grad {
-                Storage::Gpu(s) => s,
-                _ => unreachable!(),
-            };
-            
-            #[cfg(feature = "bf16")]
-            let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, m * k, &stream_bwd, &f_cast_to_f32_bwd);
-            #[cfg(not(feature = "bf16"))]
-            let a_temp_bwd: Option<()> = None;
-
-            let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
-                (Storage::Gpu(s), _) => s,
-                #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                _ => unreachable!("matmul_streamed: a_data must be GPU"),
-            };
-
             let cfg_a = LaunchConfig {
                 grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
                 block_dim: (16, 16, 1),
                 shared_mem_bytes: 0,
             };
             let mut b1 = stream_bwd.launch_builder(&f_bwd_a);
-            b1.arg(out_grad)
-                .arg(&b_temp_bwd)
-                .arg(a_grad)
-                .arg(&m_u64)
-                .arg(&k_u64)
-                .arg(&n_u64);
+            match (
+                &tensors[a_id].grad,
+                &tensors[out_id].grad,
+                &tensors[b_id].data,
+            ) {
+                (Storage::Gpu(a_grad), Storage::Gpu(out_grad), Storage::Gpu(b_temp_bwd)) => {
+                    b1.arg(out_grad)
+                        .arg(b_temp_bwd)
+                        .arg(a_grad)
+                        .arg(&m_u64)
+                        .arg(&k_u64)
+                        .arg(&n_u64);
+                }
+                #[cfg(feature = "bf16")]
+                (Storage::GpuBf16(a_grad), Storage::GpuBf16(out_grad), Storage::GpuBf16(b_temp_bwd)) => {
+                    b1.arg(out_grad)
+                        .arg(b_temp_bwd)
+                        .arg(a_grad)
+                        .arg(&m_u64)
+                        .arg(&k_u64)
+                        .arg(&n_u64);
+                }
+                (s1, s2, s3) => unreachable!("matmul_streamed: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+            }
             unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                 panic!("matmul_streamed backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
-            });
-
-            let mut grad_b_temp = stream_bwd.alloc_zeros::<f32>(k * n).unwrap_or_else(|err| {
-                panic!("matmul_streamed grad_b_temp allocation failed for size {}: {:?}", k * n, err)
             });
 
             let cfg_b = LaunchConfig {
@@ -927,12 +790,31 @@ impl Graph {
                 shared_mem_bytes: 0,
             };
             let mut b2 = stream_bwd.launch_builder(&f_bwd_b);
-            b2.arg(a_data)
-                .arg(out_grad)
-                .arg(&mut grad_b_temp)
-                .arg(&m_u64)
-                .arg(&k_u64)
-                .arg(&n_u64);
+            match (
+                &tensors[a_id].data,
+                &tensors[out_id].grad,
+                &tensors[b_id].grad,
+            ) {
+                (Storage::Gpu(a_data), Storage::Gpu(out_grad), Storage::Gpu(grad_b_temp)) => {
+                    b2.arg(a_data)
+                        .arg(out_grad)
+                        .arg(grad_b_temp)
+                        .arg(&m_u64)
+                        .arg(&k_u64)
+                        .arg(&n_u64);
+                }
+                #[cfg(feature = "bf16")]
+                (Storage::GpuBf16(a_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(grad_b_temp)) => {
+                    b2.arg(a_data)
+                        .arg(out_grad)
+                        .arg(grad_b_temp)
+                        .arg(&m_u64)
+                        .arg(&k_u64)
+                        .arg(&n_u64);
+                }
+                (s1, s2, s3) => unreachable!("matmul_streamed: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+            }
+
             unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                 panic!("matmul_streamed backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
             });
@@ -941,15 +823,6 @@ impl Graph {
                 .synchronize()
                 .unwrap_or_else(|err| panic!("matmul_streamed: backward sync failed: {:?}", err));
 
-            let grad_b_gpu = stream_bwd
-                .clone_dtoh(&grad_b_temp)
-                .unwrap_or_else(|err| panic!("matmul_streamed: grad dtoh failed: {:?}", err));
-
-            drop(b_temp_bwd);
-            let mut b_grad = tensors[b_id].sync_grad_to_cpu();
-            for (acc, delta) in b_grad.iter_mut().zip(grad_b_gpu.iter()) {
-                *acc += delta;
-            }
         });
 
         if !self.no_grad {
@@ -958,27 +831,6 @@ impl Graph {
                 output: out_id,
                 backward_fn,
             });
-        }
-
-        #[cfg(feature = "bf16")]
-        if cast_to_bf16_after {
-            let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-            let n_elem = (m * n) as u64;
-            match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                    let mut b = stream.launch_builder(&f_cast);
-                    b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                    let cfg_cast = LaunchConfig::for_num_elems((m * n) as u32);
-                    unsafe { b.launch(cfg_cast) }.unwrap_or_else(|err| {
-                        panic!("matmul_streamed cast_f32_to_bf16 kernel launch failed: {:?} (m={}, n={}, grid={:?}, block={:?})", err, m, n, cfg_cast.grid_dim, cfg_cast.block_dim)
-                    });
-                    stream.synchronize().unwrap_or_else(|err| {
-                        panic!("matmul_streamed post-cast synchronize failed: {:?}", err)
-                    });
-                }
-                _ => {}
-            }
-            self.tensors.pop();
         }
 
         out_id
@@ -1005,61 +857,25 @@ impl Graph {
             Device::Cpu => unreachable!("matmul_trans_b_streamed called on CPU graph"),
         };
 
+        #[cfg(feature = "bf16")]
+        let f_fwd = self.functions.get("matmul_trans_b_bf16").expect("matmul_trans_b_f32 kernel not found").clone();
+        #[cfg(not(feature = "bf16"))]
         let f_fwd = self.functions.get("matmul_trans_b_f32").expect("matmul_trans_b_f32 kernel not found").clone();
+        #[cfg(feature = "bf16")]
+        let f_bwd_a = self.functions.get("matmul_bf16").expect("matmul_f32 kernel not found").clone();
+        #[cfg(not(feature = "bf16"))]
         let f_bwd_a = self.functions.get("matmul_f32").expect("matmul_f32 kernel not found").clone();
+        #[cfg(feature = "bf16")]
+        let f_bwd_b = self.functions.get("matmul_trans_a_bf16").expect("matmul_trans_a_f32 kernel not found").clone();
+        #[cfg(not(feature = "bf16"))]
         let f_bwd_b = self.functions.get("matmul_trans_a_f32").expect("matmul_trans_a_f32 kernel not found").clone();
         let stream_bwd = stream.clone();
-
-        let b_f32_fwd = self.tensors[b_id].data.to_f32_vec();
-        let b_temp_fwd = stream.clone_htod(b_f32_fwd.as_slice()).unwrap_or_else(|err| {
-            panic!("matmul_trans_b_streamed: forward htod failed for size {}: {:?}", b_f32_fwd.len(), err)
-        });
 
         let mut out_shape = a_shape.clone();
         *out_shape.last_mut().unwrap() = n;
         let out_id = self.alloc_pooled(out_shape);
+        self.name_tensor(out_id, "tmp_matmul_trans_b_streamed_out");
 
-        #[cfg(feature = "bf16")]
-        let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-            let f32_slice = self.safe_alloc_zeros::<f32>(&stream, m * n);
-            let tmp_id = self.tensors.len();
-            let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
-            self.tensors.push(Tensor {
-                id: tmp_id, shape: vec![m, n],
-                strides: Tensor::compute_strides(&[m, n]),
-                data: Storage::Gpu(f32_slice),
-                grad: Storage::Gpu(grad_slice),
-                device: self.device.clone(), name: None, is_pooled: false,
-            });
-            (tmp_id, true)
-        } else {
-            (out_id, false)
-        };
-        #[cfg(not(feature = "bf16"))]
-        #[allow(unused_variables)]
-        let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-                
-        self.name_tensor(compute_target_id, "tmp_matmul_trans_b_streamed_out");
-
-        #[cfg(feature = "bf16")]
-        let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
-        #[cfg(feature = "bf16")]
-        let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
-        #[cfg(feature = "bf16")]
-        let a_temp_fwd = safe_bf16_temp!(self, a_id, m * k, &stream, &f_cast_to_f32);
-        #[cfg(not(feature = "bf16"))]
-        let a_temp_fwd: Option<()> = None;
-
-        let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
-            (Storage::Gpu(s), _) => s,
-            #[cfg(feature = "bf16")] (_, Some(t)) => t,
-            _ => unreachable!("matmul_trans_b_streamed: input a must be GPU storage"),
-        };
-        let o_s = match &self.tensors[compute_target_id].data {
-            Storage::Gpu(s) => s,
-            _ => unreachable!(),
-        };
         let m_u64 = m as u64;
         let k_u64 = k as u64;
         let n_u64 = n as u64;
@@ -1070,13 +886,32 @@ impl Graph {
             shared_mem_bytes: 0,
         };
         let mut builder = stream.launch_builder(&f_fwd);
-        builder
-            .arg(a_s)
-            .arg(&b_temp_fwd)
-            .arg(o_s)
-            .arg(&m_u64)
-            .arg(&k_u64)
-            .arg(&n_u64);
+        match (
+            &self.tensors[a_id].data,
+            &self.tensors[b_id].data,
+            &self.tensors[out_id].data
+        ) {
+            (Storage::Gpu(a_s), Storage::Gpu(b_s), Storage::Gpu(o_s)) => {
+                builder
+                    .arg(a_s)
+                    .arg(b_s)
+                    .arg(o_s)
+                    .arg(&m_u64)
+                    .arg(&k_u64)
+                    .arg(&n_u64);
+            }
+            #[cfg(feature = "bf16")]
+            (Storage::GpuBf16(a_s), Storage::GpuBf16(b_s), Storage::GpuBf16(o_s)) => {
+                builder
+                    .arg(a_s)
+                    .arg(b_s)
+                    .arg(o_s)
+                    .arg(&m_u64)
+                    .arg(&k_u64)
+                    .arg(&n_u64);
+            }
+            (s1, s2, s3) => unreachable!("matmul_trans_b_streamed: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+        }
         unsafe { builder.launch(cfg_fwd) }.unwrap_or_else(|err| {
             panic!("matmul_trans_b_streamed forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_fwd.grid_dim, cfg_fwd.block_dim)
         });
@@ -1084,34 +919,8 @@ impl Graph {
         stream
             .synchronize()
             .unwrap_or_else(|err| panic!("matmul_trans_b_streamed: forward sync failed: {:?}", err));
-        drop(b_temp_fwd);
 
         let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-            let b_f32_bwd = tensors[b_id].data.to_f32_vec();
-            let b_temp_bwd = stream_bwd.clone_htod(b_f32_bwd.as_slice()).unwrap_or_else(|err| {
-                panic!("matmul_trans_b_streamed: backward htod failed for size {}: {:?}", b_f32_bwd.len(), err)
-            });
-
-            let out_grad = match &tensors[out_id].grad {
-                Storage::Gpu(s) => s,
-                _ => unreachable!(),
-            };
-            let a_grad = match &tensors[a_id].grad {
-                Storage::Gpu(s) => s,
-                _ => unreachable!(),
-            };
-            
-            #[cfg(feature = "bf16")]
-            let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, m * k, &stream_bwd, &f_cast_to_f32_bwd);
-            #[cfg(not(feature = "bf16"))]
-            let a_temp_bwd: Option<()> = None;
-
-            let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
-                (Storage::Gpu(s), _) => s,
-                #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                _ => unreachable!("matmul_trans_b_streamed: a_data must be GPU"),
-            };
-
             // 1. dA = dC * B  (Standard Matmul: M x N @ N x K -> M x K)
             let cfg_a = LaunchConfig {
                 grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
@@ -1119,18 +928,32 @@ impl Graph {
                 shared_mem_bytes: 0,
             };
             let mut b1 = stream_bwd.launch_builder(&f_bwd_a);
-            b1.arg(out_grad)
-                .arg(&b_temp_bwd)
-                .arg(a_grad)
-                .arg(&m_u64)
-                .arg(&n_u64)
-                .arg(&k_u64);
+            match (
+                &tensors[a_id].grad,
+                &tensors[b_id].data,
+                &tensors[out_id].grad
+            ) {
+                (Storage::Gpu(a_grad), Storage::Gpu(b_data), Storage::Gpu(out_grad)) => {
+                    b1.arg(out_grad)
+                        .arg(b_data)
+                        .arg(a_grad)
+                        .arg(&m_u64)
+                        .arg(&n_u64)
+                        .arg(&k_u64);
+                },
+                #[cfg(feature = "bf16")]
+                (Storage::GpuBf16(a_grad), Storage::GpuBf16(b_data), Storage::GpuBf16(out_grad)) => {
+                    b1.arg(out_grad)
+                        .arg(b_data)
+                        .arg(a_grad)
+                        .arg(&m_u64)
+                        .arg(&n_u64)
+                        .arg(&k_u64);
+                },
+                (s1, s2, s3) => unreachable!("matmul_trans_b_streamed backward: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+            }
             unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                 panic!("matmul_trans_b_streamed backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
-            });
-
-            let mut grad_b_temp = stream_bwd.alloc_zeros::<f32>(n * k).unwrap_or_else(|err| {
-                panic!("matmul_trans_b_streamed grad_b_temp allocation failed for size {}: {:?}", n * k, err)
             });
 
             // 2. dB = dC^T * A (Transposed A Matmul: N x M @ M x K -> N x K)
@@ -1140,27 +963,34 @@ impl Graph {
                 shared_mem_bytes: 0,
             };
             let mut b2 = stream_bwd.launch_builder(&f_bwd_b);
-            b2.arg(out_grad)
-                .arg(a_data)
-                .arg(&mut grad_b_temp)
-                .arg(&n_u64)
-                .arg(&m_u64)
-                .arg(&k_u64);
+            match (
+                &tensors[a_id].data,
+                &tensors[b_id].grad,
+                &tensors[out_id].grad
+            ) {
+                (Storage::Gpu(a_data), Storage::Gpu(b_grad), Storage::Gpu(out_grad)) => {
+                    b2.arg(out_grad)
+                        .arg(a_data)
+                        .arg(b_grad)
+                        .arg(&n_u64)
+                        .arg(&m_u64)
+                        .arg(&k_u64);
+                }
+                #[cfg(feature = "bf16")]
+                (Storage::GpuBf16(a_data), Storage::GpuBf16(b_grad), Storage::GpuBf16(out_grad)) => {
+                    b2.arg(out_grad)
+                        .arg(a_data)
+                        .arg(b_grad)
+                        .arg(&n_u64)
+                        .arg(&m_u64)
+                        .arg(&k_u64);
+                }
+                (s1, s2, s3) => unreachable!("matmul_trans_b_streamed backward: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+            }
+
             unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                 panic!("matmul_trans_b_streamed backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
             });
-
-            stream_bwd.synchronize().unwrap_or_else(|err| panic!("matmul_trans_b_streamed: backward sync failed: {:?}", err));
-
-            let grad_b_gpu = stream_bwd
-                .clone_dtoh(&grad_b_temp)
-                .unwrap_or_else(|err| panic!("matmul_trans_b_streamed: grad dtoh failed: {:?}", err));
-
-            drop(b_temp_bwd);
-            let b_grad = tensors[b_id].grad.as_cpu_mut();
-            for (acc, delta) in b_grad.iter_mut().zip(grad_b_gpu.iter()) {
-                *acc += delta;
-            }
         });
 
         if !self.no_grad {
@@ -1170,28 +1000,6 @@ impl Graph {
                 backward_fn,
             });
         }
-
-        #[cfg(feature = "bf16")]
-        if cast_to_bf16_after {
-            let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-            let n_elem = (m * n) as u64;
-            match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                    let mut b = stream.launch_builder(&f_cast);
-                    b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                    let cfg_cast = LaunchConfig::for_num_elems((m * n) as u32);
-                    unsafe { b.launch(cfg_cast) }.unwrap_or_else(|err| {
-                        panic!("matmul_trans_b_streamed cast_f32_to_bf16 kernel launch failed: {:?} (m={}, n={}, grid={:?}, block={:?})", err, m, n, cfg_cast.grid_dim, cfg_cast.block_dim)
-                    });
-                    stream.synchronize().unwrap_or_else(|err| {
-                        panic!("matmul_trans_b_streamed post-cast synchronize failed: {:?}", err)
-                    });
-                }
-                _ => {}
-            }
-            self.tensors.pop();
-        }
-
         out_id
     }
     
@@ -1207,11 +1015,22 @@ impl Graph {
         match &device {
             Device::Gpu(_, stream) => {
                 let f_fwd = if self.uses_bf16_mixed_precision() {
-                    self.functions.get("bmm_f32_bf16accum_f32").unwrap().clone()
+                    self.functions.get("bmm_bf16").unwrap().clone()
                 } else {
                     self.functions.get("bmm_f32").unwrap().clone()
                 };
-                let f_bwd_a = self
+                let f_bwd_a = if self.uses_bf16_mixed_precision() {
+                    self
+                    .functions
+                    .get(if trans_b {
+                        "bmm_backward_a_transb_bf16"
+                    } else {
+                        "bmm_backward_a_bf16"
+                    })
+                    .unwrap()
+                    .clone()
+                } else {
+                    self
                     .functions
                     .get(if trans_b {
                         "bmm_backward_a_transb_f32"
@@ -1219,8 +1038,20 @@ impl Graph {
                         "bmm_backward_a_f32"
                     })
                     .unwrap()
-                    .clone();
-                let f_bwd_b = self
+                    .clone()
+                };
+                let f_bwd_b = if self.uses_bf16_mixed_precision() {
+                    self
+                    .functions
+                    .get(if trans_b {
+                        "bmm_backward_b_transb_bf16"
+                    } else {
+                        "bmm_backward_b_bf16"
+                    })
+                    .unwrap()
+                    .clone()
+                } else {
+                    self
                     .functions
                     .get(if trans_b {
                         "bmm_backward_b_transb_f32"
@@ -1228,61 +1059,11 @@ impl Graph {
                         "bmm_backward_b_f32"
                     })
                     .unwrap()
-                    .clone();
+                    .clone()
+                };
                 let stream_clone = stream.clone();
                 let out_id = self.alloc_pooled(vec![batch, m, n]);
-
-                #[cfg(feature = "bf16")]
-                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, batch * m * n);
-                    let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
-                    self.tensors.push(Tensor {
-                        id: tmp_id, shape: vec![batch, m, n],
-                        strides: Tensor::compute_strides(&[batch, m, n]),
-                        data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
-                    });
-                    (tmp_id, true)
-                } else {
-                    (out_id, false)
-                };
-                #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-                self.name_tensor(compute_target_id, "tmp_bmm_out");
-
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
-                #[cfg(feature = "bf16")]
-                let a_temp_fwd = safe_bf16_temp!(self, a_id, batch * m * k, &stream, &f_cast_to_f32);
-                #[cfg(not(feature = "bf16"))]
-                let a_temp_fwd: Option<()> = None;
-
-                #[cfg(feature = "bf16")]
-                let b_temp_fwd = safe_bf16_temp!(self, b_id, batch * k * n, &stream, &f_cast_to_f32);
-                #[cfg(not(feature = "bf16"))]
-                let b_temp_fwd: Option<()> = None;
-
-                let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
-                    (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                    _ => unreachable!(),
-                };
-                let b_s = match (&self.tensors[b_id].data, &b_temp_fwd) {
-                    (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                    _ => unreachable!(),
-                };
-                let o_s = match &self.tensors[compute_target_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
+                self.name_tensor(out_id, "tmp_bmm_out");
 
                 let batch_u64 = batch as u64;
                 let m_u64 = m as u64;
@@ -1290,15 +1071,40 @@ impl Graph {
                 let n_u64 = n as u64;
 
                 let mut builder = stream.launch_builder(&f_fwd);
-                builder
-                    .arg(a_s)
-                    .arg(b_s)
-                    .arg(o_s)
-                    .arg(&batch_u64)
-                    .arg(&m_u64)
-                    .arg(&k_u64)
-                    .arg(&n_u64)
-                    .arg(&trans_b);
+                match (
+                    &self.tensors[a_id].data,
+                    &self.tensors[b_id].data,
+                    &self.tensors[out_id].data,
+                ) {
+                    (Storage::Gpu(a_s), Storage::Gpu(b_s), Storage::Gpu(o_s)) => {
+                        builder
+                            .arg(a_s)
+                            .arg(b_s)
+                            .arg(o_s)
+                            .arg(&batch_u64)
+                            .arg(&m_u64)
+                            .arg(&k_u64)
+                            .arg(&n_u64)
+                            .arg(&trans_b);
+                    },
+                    #[cfg(feature = "bf16")]
+                    (Storage::GpuBf16(a_s), Storage::GpuBf16(b_s), Storage::GpuBf16(o_s)) => {
+                        builder
+                            .arg(a_s)
+                            .arg(b_s)
+                            .arg(o_s)
+                            .arg(&batch_u64)
+                            .arg(&n_u64)
+                            .arg(&k_u64)
+                            .arg(&m_u64)
+                            .arg(&trans_b);
+                    },
+                    (p1, p2, p3) => panic!(
+                        "bmm: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
+                        p1, p2, p3
+                    ),
+
+                }
                 let cfg_fwd = LaunchConfig {
                     grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, batch as u32),
                     block_dim: (16, 16, 1),
@@ -1312,48 +1118,38 @@ impl Graph {
                 stream.synchronize().expect("bmm forward sync failed");
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    let b_grad = match &tensors[b_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!(),
-                    };
-                    
-                    #[cfg(feature = "bf16")]
-                    let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, batch * m * k, &stream_clone, &f_cast_to_f32_bwd);
-                    #[cfg(not(feature = "bf16"))]
-                    let a_temp_bwd: Option<()> = None;
-
-                    #[cfg(feature = "bf16")]
-                    let b_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[b_id].data, batch * k * n, &stream_clone, &f_cast_to_f32_bwd);
-                    #[cfg(not(feature = "bf16"))]
-                    let b_temp_bwd: Option<()> = None;
-
-                    let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!(),
-                    };
-                    let b_data = match (&tensors[b_id].data, &b_temp_bwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!(),
-                    };
 
                     let mut b1 = stream_clone.launch_builder(&f_bwd_a);
-                    b1.arg(out_grad)
-                        .arg(b_data)
-                        .arg(a_grad)
-                        .arg(&batch_u64)
-                        .arg(&m_u64)
-                        .arg(&k_u64)
-                        .arg(&n_u64);
+                    match (
+                        &tensors[a_id].grad,
+                        &tensors[out_id].grad,
+                        &tensors[b_id].data
+                    ) {
+                        (Storage::Gpu(a_grad), Storage::Gpu(out_grad), Storage::Gpu(b_data)) => {
+                            b1.arg(out_grad)
+                                .arg(b_data)
+                                .arg(a_grad)
+                                .arg(&batch_u64)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a_grad), Storage::GpuBf16(out_grad), Storage::GpuBf16(b_data)) => {
+                            b1.arg(out_grad)
+                                .arg(b_data)
+                                .arg(a_grad)
+                                .arg(&batch_u64)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        },
+                        (p1, p2, p3) => panic!(
+                            "bmm backward: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
+                            p1, p2, p3
+                        ),
+                    }
+
                     let cfg_a = LaunchConfig {
                         grid_dim: ((k as u32 + 15) / 16, (m as u32 + 15) / 16, batch as u32),
                         block_dim: (16, 16, 1),
@@ -1364,13 +1160,35 @@ impl Graph {
                     });
 
                     let mut b2 = stream_clone.launch_builder(&f_bwd_b);
-                    b2.arg(a_data)
-                        .arg(out_grad)
-                        .arg(b_grad)
-                        .arg(&batch_u64)
-                        .arg(&m_u64)
-                        .arg(&k_u64)
-                        .arg(&n_u64);
+                    match (
+                        &tensors[a_id].data,
+                        &tensors[out_id].grad,
+                        &tensors[b_id].grad
+                    ) {
+                        (Storage::Gpu(a_data), Storage::Gpu(out_grad), Storage::Gpu(b_grad)) => {
+                            b2.arg(a_data)
+                                .arg(out_grad)
+                                .arg(b_grad)
+                                .arg(&batch_u64)
+                                .arg(&m_u64)
+                                .arg(&k_u64)
+                                .arg(&n_u64);
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(b_grad)) => {
+                            b2.arg(a_data)
+                                .arg(out_grad)
+                                .arg(b_grad)
+                                .arg(&batch_u64)
+                                .arg(&n_u64)
+                                .arg(&k_u64)
+                                .arg(&m_u64);
+                        },
+                        (p1, p2, p3) => panic!(
+                            "bmm backward: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
+                            p1, p2, p3
+                        ),
+                    }
                     let cfg_b = if trans_b {
                         LaunchConfig {
                             grid_dim: ((k as u32 + 15) / 16, (n as u32 + 15) / 16, batch as u32),
@@ -1392,27 +1210,6 @@ impl Graph {
                         panic!("bmm backward sync failed: {:?}", err)
                     });
                 });
-                #[cfg(feature = "bf16")]
-                if cast_to_bf16_after {
-                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let n_elem = (batch * m * n) as u64;
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                            let mut b = stream.launch_builder(&f_cast);
-                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            let cfg_cast = LaunchConfig::for_num_elems((batch * m * n) as u32);
-                            unsafe { b.launch(cfg_cast) }.unwrap_or_else(|err| {
-                                panic!("bmm cast_f32_to_bf16 kernel launch failed: {:?} (batch={}, m={}, n={}, grid={:?}, block={:?})", err, batch, m, n, cfg_cast.grid_dim, cfg_cast.block_dim)
-                            });
-                            stream.synchronize().unwrap_or_else(|err| {
-                                panic!("bmm post-cast synchronize failed: {:?}", err)
-                            });
-                        }
-                        _ => {}
-                    }
-                    self.tensors.pop();
-                }
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
                         inputs: vec![a_id, b_id],

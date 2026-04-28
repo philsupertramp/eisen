@@ -25,8 +25,7 @@ impl Graph {
                 let (f_fwd, f_bwd) = if is_bf16(&self.tensors[a_id].data) {
                     (
                         self.functions.get("transpose_0213_bf16").unwrap().clone(),
-                        // backward still FP32: transpose_0213_backward_f32 reads FP32 grad
-                        self.functions.get("transpose_0213_backward_f32").unwrap().clone(),
+                        self.functions.get("transpose_0213_backward_bf16").unwrap().clone(),
                     )
                 } else {
                     (
@@ -54,22 +53,29 @@ impl Graph {
                         (Storage::GpuBf16(a_s), Storage::GpuBf16(o_s)) => {
                             builder.arg(a_s).arg(o_s).arg(&b_u64).arg(&s_u64).arg(&h_u64).arg(&d_u64);
                         }
-                        _ => panic!("transpose_0213: mismatched storage"),
+                        (s1, s2) => panic!("transpose_0213: mismatched storage [{:?}, {:?}]", s1, s2),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
                 }
 
                 // Backward: FP32 grad_out -> FP32 grad_src (transpose_0213_backward_f32 unchanged)
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(out_grad).arg(a_grad)
-                        .arg(&b_u64).arg(&s_u64).arg(&h_u64).arg(&d_u64);
+                    match (
+                        &tensors[out_id].grad,
+                        &tensors[a_id].grad,
+                    ) {
+                        (Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
+                            b1.arg(out_grad).arg(a_grad)
+                                .arg(&b_u64).arg(&s_u64).arg(&h_u64).arg(&d_u64);
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad)) => {
+                            b1.arg(out_grad).arg(a_grad)
+                                .arg(&b_u64).arg(&s_u64).arg(&h_u64).arg(&d_u64);
+                        }
+                        (s1, s2) => panic!("transpose_0213 backward: mismatched storage [{:?}, {:?}]", s1, s2),
+                    }
                     unsafe { b1.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
                 });
 
@@ -142,34 +148,19 @@ impl Graph {
                 let mut out_shape = idx.shape.clone();
                 out_shape.push(hidden_dim);
 
+                #[cfg(feature="bf16")]
+                let f_fwd_f32 = self.functions.get("gather_bf16_bf16out").unwrap().clone();
+                #[cfg(not(feature="bf16"))]
                 let f_fwd_f32 = self.functions.get("gather_f32").unwrap().clone();
-                #[allow(unused_variables)]
+
+                #[cfg(feature="bf16")]
+                let f_bwd = self.functions.get("gather_backward_bf16").unwrap().clone();
+                #[cfg(not(feature="bf16"))]
                 let f_bwd = self.functions.get("gather_backward_f32").unwrap().clone();
                 let stream_clone = stream.clone();
 
                 let out_id = self.alloc_pooled(out_shape.clone());
                 self.name_tensor(out_id, "gather_output");
-
-                #[cfg(feature = "bf16")]
-                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() && !is_bf16(&self.tensors[weights_id].data) {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
-                    let f32_slice = self.safe_alloc_zeros::<f32>(&stream, out_size);
-                    let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
-                    self.tensors.push(Tensor {
-                        id: tmp_id, shape: out_shape.clone(),
-                        strides: Tensor::compute_strides(&out_shape),
-                        data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
-                    });
-                    (tmp_id, true)
-                } else {
-                    (out_id, false)
-                };
-                #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
 
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
@@ -192,7 +183,7 @@ impl Graph {
 
                 match (
                     &self.tensors[weights_id].data,
-                    &self.tensors[compute_target_id].data,
+                    &self.tensors[out_id].data,
                 ) {
                     #[cfg(feature = "bf16")]
                     (Storage::GpuBf16(w_s), Storage::GpuBf16(o_s)) => {
@@ -230,50 +221,31 @@ impl Graph {
                 }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    #[cfg(feature = "bf16")]
-                    let idx_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[indices_id].data, num_indices, &stream_clone, &f_cast_to_f32_bwd);
-                    #[cfg(not(feature = "bf16"))]
-                    let idx_temp_bwd: Option<()> = None;
-
-                    let idx_data = match (&tensors[indices_id].data, &idx_temp_bwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!("gather: indices must be GPU FP32"),
-                    };
-
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!("gather: out_grad must be GPU FP32"),
-                    };
-                    let w_grad = match &tensors[weights_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!("gather: w_grad must be GPU FP32"),
-                    };
-
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(idx_data)
-                        .arg(out_grad)
-                        .arg(w_grad)
-                        .arg(&hidden_u64)
-                        .arg(&out_size_u64);
+                    match(
+                        &tensors[indices_id].data,
+                        &tensors[out_id].grad,
+                        &tensors[weights_id].grad
+                    ) {
+                        (Storage::Gpu(idx_data), Storage::Gpu(out_grad), Storage::Gpu(w_grad)) => {
+                            b1.arg(idx_data)
+                                .arg(out_grad)
+                                .arg(w_grad)
+                                .arg(&hidden_u64)
+                                .arg(&out_size_u64);
+                        }
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(idx_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(w_grad)) => {
+                            b1.arg(idx_data)
+                                .arg(out_grad)
+                                .arg(w_grad)
+                                .arg(&hidden_u64)
+                                .arg(&out_size_u64);
+                        },
+                        (s1, s2, s3) => panic!("Gather backward: wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+                    }
                     unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
-
-                #[cfg(feature = "bf16")]
-                if cast_to_bf16_after {
-                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                    let n_elem = out_size as u64;
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                            let mut b = stream.launch_builder(&f_cast);
-                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            unsafe { b.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
-                            stream.synchronize().unwrap();
-                        }
-                        _ => {}
-                    }
-                    self.tensors.pop();
-                }
 
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
@@ -343,6 +315,9 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 let f_fwd = self.functions.get("copy_f32").unwrap().clone();
 
+                #[cfg(feature = "bf16")]
+                let f_bwd = self.functions.get("accumulate_bf16").unwrap().clone();
+                #[cfg(not(feature = "bf16"))]
                 let f_bwd = self.functions.get("accumulate_f32").unwrap().clone();
 
                 let out_id = self.alloc_pooled(new_shape);
@@ -355,27 +330,35 @@ impl Graph {
                         (Storage::Gpu(s), Storage::Gpu(d)) => { builder.arg(s).arg(d).arg(&n); }
                         #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(s), Storage::GpuBf16(d)) => { builder.arg(s).arg(d).arg(&n); }
-                        _ => panic!("reshape: mismatched storage types"),
+                        (s1, s2) => panic!("reshape: mismatched storage [{:?}, {:?}]", s1, s2),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(old_size as u32)) }.unwrap();
                 }
                 stream.synchronize().unwrap();
 
-                // Backward: grad is always FP32 — accumulate_f32 unchanged
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
                     let rank = 1u64; let s0 = n; let s1 = 1u64; let s2 = 1u64;
                     let t0 = 1u64;   let t1 = 1u64; let t2 = 1u64;
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(a_grad).arg(out_grad)
-                        .arg(&n).arg(&rank)
-                        .arg(&s0).arg(&s1).arg(&s2)
-                        .arg(&t0).arg(&t1).arg(&t2);
+                    match (
+                        &tensors[out_id].grad,
+                        &tensors[a_id].grad,
+                    ) {
+                        (Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
+                            b1.arg(a_grad).arg(out_grad)
+                                .arg(&n).arg(&rank)
+                                .arg(&s0).arg(&s1).arg(&s2)
+                                .arg(&t0).arg(&t1).arg(&t2);
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad)) => {
+                            b1.arg(a_grad).arg(out_grad)
+                                .arg(&n).arg(&rank)
+                                .arg(&s0).arg(&s1).arg(&s2)
+                                .arg(&t0).arg(&t1).arg(&t2);
+                        },
+                        (s1, s2) => unreachable!("reshape backward: precision mismatch between gradients [{:?}, {:?}]", s1, s2),
+                    }
                     unsafe { b1.launch(LaunchConfig::for_num_elems(old_size as u32)) }.unwrap();
                 });
 
@@ -480,7 +463,7 @@ impl Graph {
                 let (f_fwd, f_bwd) = if is_bf16(&self.tensors[a_id].data) {
                     (
                         self.functions.get("rope_bf16").unwrap().clone(),
-                        self.functions.get("rope_backward_f32").unwrap().clone(),
+                        self.functions.get("rope_backward_bf16").unwrap().clone(),
                     )
                 } else {
                     (
@@ -512,22 +495,29 @@ impl Graph {
                             builder.arg(a_s).arg(o_s)
                                 .arg(&s_u64).arg(&hd_u64).arg(&hdim_u64).arg(&np_u64);
                         }
-                        _ => panic!("rope: mismatched storage"),
+                        (s1, s2) => panic!("rope: mismatched storage [{:?}, {:?}]", s1, s2),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(num_pairs as u32)) }.unwrap();
                 }
 
                 // rope_backward recomputes cos/sin — no saved activation, FP32 grad only
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(out_grad).arg(a_grad)
-                        .arg(&s_u64).arg(&hd_u64).arg(&hdim_u64).arg(&np_u64);
+                    match (
+                        &tensors[out_id].grad,
+                        &tensors[a_id].grad
+                    ) {
+                        (Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
+                            b1.arg(out_grad).arg(a_grad)
+                                .arg(&s_u64).arg(&hd_u64).arg(&hdim_u64).arg(&np_u64);
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad)) => {
+                            b1.arg(out_grad).arg(a_grad)
+                                .arg(&s_u64).arg(&hd_u64).arg(&hdim_u64).arg(&np_u64);
+                        },
+                        (s1, s2) => panic!("rope: mismatched storage [{:?}, {:?}]", s1, s2),
+                    }
                     unsafe { b1.launch(LaunchConfig::for_num_elems(num_pairs as u32)) }.unwrap();
                 });
 

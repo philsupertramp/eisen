@@ -57,6 +57,9 @@ impl Graph {
                 #[cfg(not(feature = "bf16"))]
                 let (f_fwd, _) = (self.functions.get("add_f32").unwrap().clone(), ());
 
+                #[cfg(feature = "bf16")]
+                let f_accumulate = self.functions.get("accumulate_bf16").unwrap().clone();
+                #[cfg(not(feature = "bf16"))]
                 let f_accumulate = self.functions.get("accumulate_f32").unwrap().clone();
                 let b_u16_slice: CudaSlice<u16>;
 
@@ -114,26 +117,37 @@ impl Graph {
 
                 // Backward: grads are always FP32 — use accumulate_f32 unchanged
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let b_grad = match &tensors[b_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
+                    let mut b1 = stream_clone.launch_builder(&f_accumulate);
+                    match (
+                        &tensors[out_id].grad,
+                        &tensors[a_id].grad,
+                        &tensors[b_id].grad
+                    ) {
+                        (Storage::Gpu(out_grad), Storage::Gpu(a_grad), Storage::Gpu(b_grad)) => {
+                            b1.arg(a_grad).arg(out_grad).arg(&n).arg(&rank)
+                                .arg(&s[0]).arg(&s[1]).arg(&s[2])
+                                .arg(&a_str[0]).arg(&a_str[1]).arg(&a_str[2]);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
 
-                    // accumulate_f32 signature: (grad_target, grad_out, n, rank, s*, t*)
-                    let launch_accum = |tgt: &CudaSlice<f32>, t_str: [u64; 3]| {
-                        let mut b1 = stream_clone.launch_builder(&f_accumulate);
-                        b1.arg(tgt).arg(out_grad).arg(&n).arg(&rank)
-                            .arg(&s[0]).arg(&s[1]).arg(&s[2])
-                            .arg(&t_str[0]).arg(&t_str[1]).arg(&t_str[2]);
-                        unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
-                    };
-                    launch_accum(a_grad, a_str);
-                    launch_accum(b_grad, b_str);
+                            b1.arg(b_grad).arg(out_grad).arg(&n).arg(&rank)
+                                .arg(&s[0]).arg(&s[1]).arg(&s[2])
+                                .arg(&b_str[0]).arg(&b_str[1]).arg(&b_str[2]);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                        },
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad), Storage::GpuBf16(b_grad)) => {
+                            b1.arg(a_grad).arg(out_grad).arg(&n).arg(&rank)
+                                .arg(&s[0]).arg(&s[1]).arg(&s[2])
+                                .arg(&a_str[0]).arg(&a_str[1]).arg(&a_str[2]);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+
+                            b1.arg(b_grad).arg(out_grad).arg(&n).arg(&rank)
+                                .arg(&s[0]).arg(&s[1]).arg(&s[2])
+                                .arg(&b_str[0]).arg(&b_str[1]).arg(&b_str[2]);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                        },
+                        (s1, s2, s3) => unreachable!("add backward: wrong storage type: {:?} {:?} {:?}", s1, s2, s3)
+                    }
                 });
 
                 if !self.no_grad {
@@ -204,7 +218,7 @@ impl Graph {
                     match (a_bf, b_bf) {
                         (true, true)  => (
                             self.functions.get("mul_bf16").unwrap().clone(),
-                            self.functions.get("mul_backward_bf16in_f32").unwrap().clone(),
+                            self.functions.get("mul_backward_bf16").unwrap().clone(),
                         ),
                         (true, false) => (
                             self.functions.get("mul_bf16lhs_f32rhs_bf16out").unwrap().clone(),
@@ -254,31 +268,24 @@ impl Graph {
                 }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let b_grad = match &tensors[b_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
                     let mut builder = stream_clone.launch_builder(&f_bwd);
-                    match (&tensors[a_id].data, &tensors[b_id].data) {
-                        (Storage::Gpu(a), Storage::Gpu(b)) => {
+                    match (
+                        &tensors[a_id].data,
+                        &tensors[b_id].data,
+                        &tensors[a_id].grad,
+                        &tensors[b_id].grad,
+                        &tensors[out_id].grad
+                    ) {
+                        (Storage::Gpu(a), Storage::Gpu(b), Storage::Gpu(a_grad), Storage::Gpu(b_grad), Storage::Gpu(out_grad)) => {
                             builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
                         }
                         #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(a), Storage::GpuBf16(b)) => {
+                        (Storage::GpuBf16(a), Storage::GpuBf16(b), Storage::GpuBf16(a_grad), Storage::GpuBf16(b_grad), Storage::GpuBf16(out_grad)) => {
                             builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
                         }
-                        #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(a), Storage::Gpu(b)) => {
-                            builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
-                        }
-                        (p1, p2) => panic!(
-                            "mul_backward: unsupported storage combination. Received: ({:?}, {:?})",
-                            p1, p2
+                        (p1, p2, p3, p4, p5) => panic!(
+                            "mul_backward: unsupported storage combination. Received: ({:?}, {:?}, {:?}, {:?}, {:?})",
+                            p1, p2, p3, p4, p5
                         ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
@@ -349,7 +356,7 @@ impl Graph {
                 let (f_fwd, f_bwd) = if bf16_mode {
                     (
                         self.functions.get("silu_bf16").unwrap().clone(),
-                        self.functions.get("silu_backward_bf16in_f32").unwrap().clone(),
+                        self.functions.get("silu_backward_bf16").unwrap().clone(),
                     )
                 } else {
                     (
@@ -385,48 +392,23 @@ impl Graph {
                 }
 
                 // ── Capture kernel handles for backward ────────────────────────
-                #[cfg(feature = "bf16")]
-                let f_cast = if bf16_mode {
-                    Some(self.functions.get("cast_bf16_to_f32").unwrap().clone())
-                } else { None };
-                #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let _f_cast: Option<()> = None;
-
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let n = out_size as u64;
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-
-                    // If activation stored as BF16, cast to FP32 temp for backward kernel
-                    #[cfg(feature = "bf16")]
-                    let a_temp = f_cast.as_ref().and_then(|fc| {
-                        crate::bf16_util::bf16_to_f32_temp(
-                            &tensors[a_id].data, out_size, &stream_clone, fc,
-                        )
-                    });
-                    #[cfg(not(feature = "bf16"))]
-                    let a_temp: Option<()> = None;
 
                     let mut builder = stream_clone.launch_builder(&f_bwd);
-                    match (&tensors[a_id].data, &a_temp) {
+                    match (&tensors[a_id].data, &tensors[out_id].grad, &tensors[a_id].grad) {
                         #[cfg(feature = "bf16")]
-                        (_, Some(t)) => {
+                        (Storage::GpuBf16(a_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad)) => {
                             // silu_backward_bf16in_f32 already consumed — but we're in the
                             // FP32 backward kernel path after the cast
-                            builder.arg(t).arg(out_grad).arg(a_grad).arg(&n);
+                            builder.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
                         }
-                        (Storage::Gpu(s), _) => {
-                            builder.arg(s).arg(out_grad).arg(a_grad).arg(&n);
+                        (Storage::Gpu(a_data), Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
+                            builder.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
                         }
                         _ => unreachable!(),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
-                    // a_temp dropped here → cudaFree
                 });
 
                 if !self.no_grad {

@@ -92,13 +92,13 @@ impl TransformerLM {
         let mut blocks = Vec::with_capacity(num_layers);
         for _ in 0..num_layers {
             let block = TransformerBlock::new(g, hidden_dim, num_heads, num_kv_heads, ffn_dim);
-            for pid in block.params() {
-                // Keep tiny 1D norm scales resident; stream only matrix weights.
-                // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
-                if g.tensors[pid].shape.len() == 2 {
-                    g.demote_tensor_to_cpu(pid);
-                }
-            }
+            //for pid in block.params() {
+            //    // Keep tiny 1D norm scales resident; stream only matrix weights.
+            //    // This avoids hitting GPU-only RMSNorm kernels with CPU weights.
+            //    if g.tensors[pid].shape.len() == 2 {
+            //        g.demote_tensor_to_cpu(pid);
+            //    }
+            //}
             blocks.push(block);
         }
 

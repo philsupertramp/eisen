@@ -132,13 +132,6 @@ impl AdamW {
                         total_sq += xf * xf;
                     }
                 }
-                #[cfg(feature = "bf16")]
-                Storage::CpuBf16(v) => {
-                    for &x in v {
-                        let xf = x as f64;
-                        total_sq += xf * xf;
-                    }
-                }
                 Storage::Gpu(s) => {
                     let stream = stream_opt
                         .as_ref()
@@ -150,7 +143,25 @@ impl AdamW {
                     }
                 }
                 #[cfg(feature = "bf16")]
-                Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
+                Storage::CpuBf16(v) => {
+                    for &x in v {
+                        // Upcast u16 -> f32 for precision during sum of squares
+                        let xf = f32::from_bits((x as u32) << 16) as f64;
+                        total_sq += xf * xf;
+                    }
+                }
+                #[cfg(feature = "bf16")]
+                Storage::GpuBf16(s) => {
+                    let stream = stream_opt
+                        .as_ref()
+                        .expect("GPU grad but graph has no GPU stream");
+                    let host: Vec<u16> = stream.clone_dtoh(s).expect("AdamW clip: bf16 dtoh failed");
+                    for &x in &host {
+                        // Upcast u16 -> f32 for precision during sum of squares
+                        let xf = f32::from_bits((x as u32) << 16) as f64;
+                        total_sq += xf * xf;
+                    }
+                }
             }
         }
 
@@ -171,6 +182,11 @@ impl AdamW {
         let scale_fn_opt = stream_opt
             .as_ref()
             .map(|_| g.functions.get("scale_f32").unwrap().clone());
+            
+        #[cfg(feature = "bf16")]
+        let scale_bf16_fn_opt = stream_opt
+            .as_ref()
+            .map(|_| g.functions.get("scale_bf16").expect("scale_bf16 kernel not found").clone());
 
         for &p_id in &self.params {
             let size = g.tensors[p_id].shape.iter().product::<usize>();
@@ -192,11 +208,30 @@ impl AdamW {
                         .unwrap();
                 }
                 #[cfg(feature = "bf16")]
-                Storage::GpuBf16(_) => panic!("AdamW clip: BF16 grad storage is unsupported"),
+                Storage::CpuBf16(v) => {
+                    for x in v.iter_mut() {
+                        let mut f = f32::from_bits((*x as u32) << 16);
+                        f *= scale;
+                        *x = (f.to_bits() >> 16) as u16;
+                    }
+                }
                 #[cfg(feature = "bf16")]
-                Storage::CpuBf16(_) => panic!("AdamW clip: BF16 grad storage is not supported."),
+                Storage::GpuBf16(s) => {
+                    let stream = stream_opt
+                        .as_ref()
+                        .expect("GPU grad but graph has no GPU stream");
+                    let f = scale_bf16_fn_opt.as_ref().unwrap().clone();
+                    let mut builder = stream.launch_builder(&f);
+                    let n = size as u64;
+                    builder.arg(s).arg(&scale).arg(&n);
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                        .unwrap();
+                    stream.synchronize().expect("optim maybe_clip_gradients sync failed");
+
+                }
             }
         }
+
     }
 
     /// Zero all parameter gradients.
@@ -211,27 +246,40 @@ impl AdamW {
             Device::Gpu(_, s) => Some(s.clone()),
             Device::Cpu => None,
         };
+        #[cfg(not(feature = "bf16"))]
         let fill_fn_opt = stream_opt
             .as_ref()
             .map(|_| g.functions.get("fill_f32").unwrap().clone());
+        #[cfg(feature = "bf16")]
+        let fill_fn_opt = stream_opt
+            .as_ref()
+            .map(|_| g.functions.get("fill_bf16").unwrap().clone());
 
         for &p_id in &self.params {
             let size = g.tensors[p_id].shape.iter().product::<usize>();
 
             // Inspect storage variant to decide which path to take
+            #[cfg(feature = "bf16")]
+            let is_gpu_grad = matches!(&g.tensors[p_id].grad, Storage::Gpu(_) | Storage::GpuBf16(_));
+            #[cfg(not(feature = "bf16"))]
             let is_gpu_grad = matches!(&g.tensors[p_id].grad, Storage::Gpu(_));
 
             if is_gpu_grad {
                 let stream = stream_opt.as_ref().expect("GPU grad but no GPU stream");
                 let f = fill_fn_opt.as_ref().unwrap().clone();
-                let grad = match &g.tensors[p_id].grad {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
                 let n = size as u64;
                 let val = 0.0f32;
                 let mut builder = stream.launch_builder(&f);
-                builder.arg(grad).arg(&val).arg(&n);
+                match &g.tensors[p_id].grad {
+                    Storage::Gpu(grad) => {
+                        builder.arg(grad).arg(&val).arg(&n);
+                    },
+                    #[cfg(feature = "bf16")]
+                    Storage::GpuBf16(grad) => {
+                        builder.arg(grad).arg(&val).arg(&n);
+                    }
+                    _ => unreachable!()
+                }
                 unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
             } else {
                 // CPU-homed param (streaming) — fill directly
@@ -255,6 +303,7 @@ impl AdamW {
             Device::Cpu => None,
         };
 
+        // 1. Calculate the L2 Norm across all parameter gradients
         for &p_id in &self.params {
             match &g.tensors[p_id].grad {
                 Storage::Cpu(v) => {
@@ -274,9 +323,25 @@ impl AdamW {
                     }
                 }
                 #[cfg(feature = "bf16")]
-                Storage::GpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
+                Storage::CpuBf16(v) => {
+                    for &x in v {
+                        // Fast bitwise upcast from u16 (bf16) to f32
+                        let xf = f32::from_bits((x as u32) << 16) as f64;
+                        sum_sq += xf * xf;
+                    }
+                }
                 #[cfg(feature = "bf16")]
-                Storage::CpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
+                Storage::GpuBf16(s) => {
+                    let stream = stream_opt.as_ref().expect("GPU grad but no GPU stream");
+                    // cudarc handles bf16 buffers as u16 on the host
+                    let host: Vec<u16> = stream
+                        .clone_dtoh(s)
+                        .expect("Failed to copy bf16 gradient from VRAM");
+                    for &x in &host {
+                        let xf = f32::from_bits((x as u32) << 16) as f64;
+                        sum_sq += xf * xf;
+                    }
+                }
             };
         }
 
@@ -287,10 +352,16 @@ impl AdamW {
             1.0
         };
 
+        // 2. Scale the gradients if the norm exceeds max_norm
         if clip_coef < 1.0 {
             let scale_fn_opt = stream_opt
                 .as_ref()
                 .map(|_| g.functions.get("scale_f32").unwrap().clone());
+                
+            #[cfg(feature = "bf16")]
+            let scale_bf16_fn_opt = stream_opt
+                .as_ref()
+                .map(|_| g.functions.get("scale_bf16").expect("scale_bf16 kernel not loaded").clone());
 
             for &p_id in &self.params {
                 let size = g.tensors[p_id].shape.iter().product::<usize>();
@@ -310,9 +381,24 @@ impl AdamW {
                             .unwrap();
                     }
                     #[cfg(feature = "bf16")]
-                    Storage::GpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
+                    Storage::CpuBf16(v) => {
+                        for val in v.iter_mut() {
+                            let mut f = f32::from_bits((*val as u32) << 16);
+                            f *= clip_coef;
+                            // Truncate back to bf16
+                            *val = (f.to_bits() >> 16) as u16;
+                        }
+                    }
                     #[cfg(feature = "bf16")]
-                    Storage::CpuBf16(_) => unreachable!("Gradient buffers are FP32 in Eisen"),
+                    Storage::GpuBf16(s) => {
+                        let stream = stream_opt.as_ref().expect("GPU grad but no GPU stream");
+                        let f = scale_bf16_fn_opt.as_ref().unwrap().clone();
+                        let n = size as u64;
+                        let mut builder = stream.launch_builder(&f);
+                        builder.arg(s).arg(&clip_coef).arg(&n);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                            .unwrap();
+                    }
                 }
             }
         }
@@ -348,7 +434,7 @@ impl AdamW {
         let adamw_bf16mom_fn_opt = if g.uses_bf16_mixed_precision() {
             stream_opt
                 .as_ref()
-                .map(|_| g.functions.get("adamw_step_bf16mom_f32").unwrap().clone())
+                .map(|_| g.functions.get("adamw_step_bf16mom").unwrap().clone())
         } else {
             None
         };
@@ -417,7 +503,7 @@ impl AdamW {
                         }
                         Storage::GpuBf16(weights) => {
                             let grads = match &g.tensors[p_id].grad {
-                                Storage::Gpu(s) => s,
+                                Storage::GpuBf16(s) => s,
                                 _ => unreachable!(),
                             };
                             let f = adamw_bf16w_fn_opt.as_ref().unwrap().clone();
@@ -478,6 +564,7 @@ impl AdamW {
                         .arg(&bc2)
                         .arg(&n);
                     unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                    stream.synchronize().expect("optim step sync failed");
                 }
                 #[cfg(not(feature = "bf16"))]
                 {

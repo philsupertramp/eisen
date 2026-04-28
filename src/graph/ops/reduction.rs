@@ -408,7 +408,7 @@ impl Graph {
                 let (f_fwd, f_bwd) = if is_bf16(&self.tensors[a_id].data) {
                     (
                         self.functions.get("softmax_bf16").unwrap().clone(),
-                        self.functions.get("softmax_backward_bf16in_f32").unwrap().clone(),
+                        self.functions.get("softmax_backward_bf16").unwrap().clone(),
                     )
                 } else {
                     (
@@ -444,21 +444,19 @@ impl Graph {
                 }
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
-                    let a_grad = match &tensors[a_id].grad {
-                        Storage::Gpu(s) => s, _ => unreachable!()
-                    };
                     let mut builder = stream_clone.launch_builder(&f_bwd);
                     // softmax_backward_bf16in_f32: (bf16 out_data, f32 grad_out, f32 grad_x, B, N)
                     // softmax_backward_f32:        (f32  out_data, f32 grad_out, f32 grad_x, B, N)
-                    match &tensors[out_id].data {
-                        Storage::Gpu(out_data) => {
+                    match (
+                        &tensors[out_id].data,
+                        &tensors[out_id].grad,
+                        &tensors[a_id].grad
+                    ) {
+                        (Storage::Gpu(out_data), Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
                             builder.arg(out_data).arg(out_grad).arg(a_grad).arg(&b).arg(&n);
                         }
                         #[cfg(feature = "bf16")]
-                        Storage::GpuBf16(out_data) => {
+                        (Storage::GpuBf16(out_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad)) => {
                             builder.arg(out_data).arg(out_grad).arg(a_grad).arg(&b).arg(&n);
                         }
                         _ => unreachable!(),
@@ -525,7 +523,6 @@ impl Graph {
         }
     }
 
-
     pub fn cross_entropy(&mut self, logits_id: usize, targets: &[usize]) -> usize {
         let device = self.device.clone();
         match &device {
@@ -533,52 +530,37 @@ impl Graph {
                 let logits = &self.tensors[logits_id];
                 let batch_size = logits.shape[0];
                 let num_classes = logits.shape[1];
+                
+                // The loss is a scalar. It is perfectly fine (and preferred) 
+                // for it to stay purely as f32 in VRAM.
                 let out_id = self.alloc_pooled(vec![]);
                 self.name_tensor(out_id, "cross_entropy_output");
+
                 #[cfg(feature = "bf16")]
-                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);
-                    let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(stream, 1);
-                    self.tensors.push(Tensor {
-                        id: tmp_id, shape: vec![],
-                        strides: vec![],
-                        data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
-                    });
-                    (tmp_id, true)
+                let f_fwd = if self.uses_bf16_mixed_precision() {
+                    self.functions.get("cross_entropy_bf16").unwrap().clone()
                 } else {
-                    (out_id, false)
+                    self.functions.get("cross_entropy_f32").unwrap().clone()
                 };
                 #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-
                 let f_fwd = self.functions.get("cross_entropy_f32").unwrap().clone();
-                let f_bwd = self
-                    .functions
-                    .get("cross_entropy_backward_f32")
-                    .unwrap()
-                    .clone();
+
+                #[cfg(feature = "bf16")]
+                let f_bwd = if self.uses_bf16_mixed_precision() {
+                    self.functions.get("cross_entropy_backward_bf16").unwrap().clone()
+                } else {
+                    self.functions.get("cross_entropy_backward_f32").unwrap().clone()
+                };
+                #[cfg(not(feature = "bf16"))]
+                let f_bwd = self.functions.get("cross_entropy_backward_f32").unwrap().clone();
+
                 let stream_clone = stream.clone();
 
                 let targets_f32: Vec<f32> = targets.iter().map(|&x| x as f32).collect();
                 let targets_d = stream.clone_htod(targets_f32.as_slice()).unwrap();
 
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
-                #[cfg(feature = "bf16")]
-                let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-
-                #[cfg(feature = "bf16")]
-                let l_temp_fwd = safe_bf16_temp!(self, logits_id, batch_size * num_classes, stream, &f_cast_to_f32);
-                #[cfg(not(feature = "bf16"))]
-                let l_temp_fwd: Option<()> = None;
-
-                if let (Storage::Gpu(s), Device::Gpu(_, stream)) =
-                    (&self.tensors[compute_target_id].data, &self.device)
-                {
+                // Zero out the f32 scalar loss buffer
+                if let Storage::Gpu(s) = &self.tensors[out_id].data {
                     let f_fill = self.functions.get("fill_f32").unwrap().clone();
                     let n = 1u64;
                     let val = 0.0f32;
@@ -587,74 +569,49 @@ impl Graph {
                     unsafe { builder.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
                 }
 
-                let l_s = match (&self.tensors[logits_id].data, &l_temp_fwd) {
-                    (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                    _ => unreachable!("cross_entropy: logits must be Gpu or GpuBf16"),
-                };
-                let o_s = match &self.tensors[compute_target_id].data {
-                    Storage::Gpu(s) => s,
-                    _ => unreachable!(),
-                };
-
                 let b_u64 = batch_size as u64;
                 let c_u64 = num_classes as u64;
 
+                // --- FORWARD PASS (No temp allocations!) ---
                 let mut builder = stream.launch_builder(&f_fwd);
-                builder
-                    .arg(l_s)
-                    .arg(&targets_d)
-                    .arg(o_s)
-                    .arg(&b_u64)
-                    .arg(&c_u64);
+                match (&self.tensors[logits_id].data, &self.tensors[out_id].data) {
+                    (Storage::Gpu(l_s), Storage::Gpu(o_s)) => {
+                        builder.arg(l_s).arg(&targets_d).arg(o_s).arg(&b_u64).arg(&c_u64);
+                    }
+                    #[cfg(feature = "bf16")]
+                    (Storage::GpuBf16(l_s), Storage::GpuBf16(o_s)) => {
+                        // Notice `o_s` is still Gpu (f32) - matching the float* out_loss signature
+                        builder.arg(l_s).arg(&targets_d).arg(o_s).arg(&b_u64).arg(&c_u64);
+                    }
+                    (s1, s2) => unreachable!("cross_entropy: Invalid storage types [{:?} {:?}]", s1, s2),
+                }
                 unsafe { builder.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
 
+                // --- BACKWARD PASS ---
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    #[cfg(feature = "bf16")]
-                    let l_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[logits_id].data, batch_size * num_classes, &stream_clone, &f_cast_to_f32_bwd);
-                    #[cfg(not(feature = "bf16"))]
-                    let l_temp_bwd: Option<()> = None;
-
-                    let l_data = match (&tensors[logits_id].data, &l_temp_bwd) {
-                        (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
-                        _ => unreachable!("cross_entropy backward: logits must be Gpu or GpuBf16"),
-                    };
-
-                    let out_grad = match &tensors[out_id].grad {
-                        Storage::Gpu(s) => s,
-                        _ => unreachable!("cross_entropy backward: out_grad must be Gpu"),
-                    };
-                    let l_grad = match &tensors[logits_id].grad {
-                        Storage::Gpu(s) => s,
-                        s => unreachable!("cross_entropy backward: l_grad must be Gpu [{:?}]", s),
-                    };
-
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    b1.arg(l_data)
-                        .arg(&targets_d)
-                        .arg(out_grad)
-                        .arg(l_grad)
-                        .arg(&b_u64)
-                        .arg(&c_u64);
+                    
+                    tensors[out_id].sync_to_gpu();
+                    tensors[logits_id].sync_to_gpu();
+                    // Safely match the entire state vector to guarantee pointer type alignment
+                    match (
+                        &tensors[logits_id].data, 
+                        &tensors[out_id].grad, 
+                        &tensors[logits_id].grad
+                    ) {
+                        (Storage::Gpu(l_data), Storage::Gpu(out_grad), Storage::Gpu(l_grad)) => {
+                            // F32 Path -> calls cross_entropy_backward_f32
+                            b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
+                        }
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(l_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(l_grad)) => {
+                            // BF16 Path -> calls cross_entropy_backward_bf16
+                            b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
+                        }
+                        (s1, s2, s3) => unreachable!("cross_entropy backward: precision mismatch between logits and gradients [{:?}, {:?}, {:?}", s1, s2, s3),
+                    }
                     unsafe { b1.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
                 });
-
-                #[cfg(feature = "bf16")]
-                if cast_to_bf16_after {
-                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                            let mut b = stream.launch_builder(&f_cast);
-                            let n_elem = 1u64;
-                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            unsafe { b.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
-                            stream.synchronize().unwrap();
-                        }
-                        _ => {}
-                    }
-                    self.tensors.pop();
-                }
 
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
