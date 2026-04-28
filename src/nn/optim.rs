@@ -259,7 +259,11 @@ impl AdamW {
             .as_ref()
             .map(|_| g.functions.get("fill_f32").unwrap().clone());
         #[cfg(feature = "bf16")]
-        let fill_fn_opt = stream_opt
+        let fill_f32_fn_opt = stream_opt
+            .as_ref()
+            .map(|_| g.functions.get("fill_f32").unwrap().clone());
+        #[cfg(feature = "bf16")]
+        let fill_bf16_fn_opt = stream_opt
             .as_ref()
             .map(|_| g.functions.get("fill_bf16").unwrap().clone());
 
@@ -275,21 +279,31 @@ impl AdamW {
 
             if is_gpu_grad {
                 let stream = stream_opt.as_ref().expect("GPU grad but no GPU stream");
-                let f = fill_fn_opt.as_ref().unwrap().clone();
                 let n = size as u64;
                 let val = 0.0f32;
-                let mut builder = stream.launch_builder(&f);
+                #[cfg(feature = "bf16")]
+                let val_bf16 = 0u16;
                 match &g.tensors[p_id].grad {
                     Storage::Gpu(grad) => {
+                        #[cfg(not(feature = "bf16"))]
+                        let f = fill_fn_opt.as_ref().unwrap().clone();
+                        #[cfg(feature = "bf16")]
+                        let f = fill_f32_fn_opt.as_ref().unwrap().clone();
+                        let mut builder = stream.launch_builder(&f);
                         builder.arg(grad).arg(&val).arg(&n);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                            .unwrap();
                     }
                     #[cfg(feature = "bf16")]
                     Storage::GpuBf16(grad) => {
-                        builder.arg(grad).arg(&val).arg(&n);
+                        let f = fill_bf16_fn_opt.as_ref().unwrap().clone();
+                        let mut builder = stream.launch_builder(&f);
+                        builder.arg(grad).arg(&val_bf16).arg(&n);
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
+                            .unwrap();
                     }
                     _ => unreachable!(),
                 }
-                unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
             } else {
                 // CPU-homed param (streaming) — fill directly
                 let tensor = &mut g.tensors[p_id];
