@@ -1,6 +1,7 @@
 use crate::graph::Graph;
 use crate::nn::linear::Linear;
 use crate::nn::Module;
+use crate::tensor::Storage;
 
 /// Attention module.
 /// Configured for Single-Head Attention (num_heads=1) to fit our 3D tensor limits
@@ -279,7 +280,7 @@ impl GroupedQueryAttention {
             head_dim,
             hidden_dim,
             q_proj: Linear::new(g, hidden_dim, hidden_dim, false),
-            // Look here: Projections are drastically smaller!
+
             k_proj: Linear::new(g, hidden_dim, kv_dim, false),
             v_proj: Linear::new(g, hidden_dim, kv_dim, false),
             out_proj: Linear::new(g, hidden_dim, hidden_dim, false),
@@ -291,6 +292,9 @@ impl GroupedQueryAttention {
         assert_eq!(shape.len(), 3, "GQA requires [Batch, Seq, Dim]");
         let batch = shape[0];
         let seq_len = shape[1];
+
+        #[cfg(feature = "bf16")]
+        assert_eq!(match g.tensors[self.q_proj.weight_id].data { Storage::Gpu(_) => "GPU", Storage::GpuBf16(_) => "GpuBf16", _ => "Other" }, "GpuBf16" );
 
         // 1. Projections -> Q is [B, S, HDim], K/V are [B, S, KVDim]
         let q_id = self.q_proj.forward(g, x_id);
