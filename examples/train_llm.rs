@@ -188,6 +188,27 @@ fn write_run_manifest(path: &str, content: &str) {
     println!("Run manifest written to {}", path);
 }
 
+fn finite_stats(v: &[f32]) -> (usize, usize, f32, f32) {
+    let mut finite = 0usize;
+    let mut non_finite = 0usize;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for &x in v {
+        if x.is_finite() {
+            finite += 1;
+            min_v = min_v.min(x);
+            max_v = max_v.max(x);
+        } else {
+            non_finite += 1;
+        }
+    }
+    if finite == 0 {
+        (finite, non_finite, f32::NAN, f32::NAN)
+    } else {
+        (finite, non_finite, min_v, max_v)
+    }
+}
+
 // ─── Checkpoint I/O ───────────────────────────────────────────────────────────
 
 fn save_weights(g: &Graph, path: &str) {
@@ -325,9 +346,10 @@ fn main() {
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
-    let log_interval = 50_usize;
+    let log_interval = env_usize("EISEN_LOG_INTERVAL", 50);
     let board_interval = 1_usize;
     let log_cfg = TrainLogConfig::from_env();
+    let fail_on_nonfinite = env_bool("EISEN_FAIL_ON_NONFINITE", true);
     println!(
         "Logging: level={:?} data=[loss={}, graph_memory={}, computation_graph={}]",
         log_cfg.level, log_cfg.loss, log_cfg.graph_memory, log_cfg.computation_graph
@@ -563,7 +585,27 @@ fn main() {
                 g.cross_entropy(flat_logits, &batch.targets)
             };
 
-            step_loss += g.tensors[loss_id].sync_to_cpu()[0];
+            let micro_loss = g.tensors[loss_id].sync_to_cpu()[0];
+            if fail_on_nonfinite && !micro_loss.is_finite() {
+                let logits_host = g.tensors[flat_logits].sync_to_cpu();
+                let (finite, non_finite, min_v, max_v) = finite_stats(&logits_host);
+                eprintln!(
+                    "\n[NON-FINITE] loss={} at epoch={} step={} micro={}",
+                    micro_loss, current_epoch, step, m_step
+                );
+                eprintln!(
+                    "[NON-FINITE] logits stats: finite={} non_finite={} min={:.6} max={:.6}",
+                    finite, non_finite, min_v, max_v
+                );
+                eprintln!(
+                    "[NON-FINITE] first targets: {:?}",
+                    &batch.targets.iter().take(16).collect::<Vec<_>>()
+                );
+                panic!(
+                    "Aborting due to non-finite loss (set EISEN_FAIL_ON_NONFINITE=0 to continue)"
+                );
+            }
+            step_loss += micro_loss;
             micro_count += 1;
             log_cfg.log_graph_memory(&g, "FORWARD pass");
 
