@@ -1,5 +1,5 @@
-use crate::graph::{Graph};
-use crate::tensor::{Device, Storage, f32_to_bf16u, bf16u_to_f32};
+use crate::graph::Graph;
+use crate::tensor::{bf16u_to_f32, f32_to_bf16u, Device, Storage};
 use std::collections::HashSet;
 
 // ── StreamingReport ────────────────────────────────────────────────────────────
@@ -15,8 +15,12 @@ pub struct StreamingReport {
 
 impl std::fmt::Display for StreamingReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        fn gb(b: usize) -> f64 { b as f64 / 1024f64.powi(3) }
-        fn mb(b: usize) -> f64 { b as f64 / 1024f64.powi(2) }
+        fn gb(b: usize) -> f64 {
+            b as f64 / 1024f64.powi(3)
+        }
+        fn mb(b: usize) -> f64 {
+            b as f64 / 1024f64.powi(2)
+        }
         writeln!(f, "=== Streaming Layout ===")?;
         writeln!(
             f,
@@ -31,8 +35,8 @@ impl std::fmt::Display for StreamingReport {
             f,
             "  CPU-streamed params:   {} tensors  ({:.2} GB BF16 weights + {:.2} GB FP32 moments)",
             self.streamed_param_ids.len(),
-            gb(self.streamed_bytes / 2),  // BF16 = 2 bytes per element
-            gb(self.streamed_bytes * 3),  // moments still FP32
+            gb(self.streamed_bytes / 2), // BF16 = 2 bytes per element
+            gb(self.streamed_bytes * 3), // moments still FP32
         )?;
         #[cfg(not(feature = "bf16"))]
         writeln!(
@@ -71,7 +75,10 @@ impl Graph {
             matches!(&self.device, Device::Gpu(_, _)),
             "plan_streaming requires a GPU graph"
         );
-        assert!(self.num_params > 0, "call mark_params() before plan_streaming()");
+        assert!(
+            self.num_params > 0,
+            "call mark_params() before plan_streaming()"
+        );
 
         let pinned_set: HashSet<usize> = pinned_ids.iter().cloned().collect();
 
@@ -84,8 +91,9 @@ impl Graph {
             .saturating_sub(activation_reserve_bytes)
             .saturating_sub(pinned_vram);
 
-        let candidate_ids: Vec<usize> =
-            (0..self.num_params).filter(|id| !pinned_set.contains(id)).collect();
+        let candidate_ids: Vec<usize> = (0..self.num_params)
+            .filter(|id| !pinned_set.contains(id))
+            .collect();
 
         let mut resident: Vec<usize> = Vec::new();
         let mut streamed: Vec<usize> = Vec::new();
@@ -192,7 +200,7 @@ impl Graph {
         size: usize,
     ) -> cudarc::driver::CudaSlice<T> {
         let alloc_bytes = size * std::mem::size_of::<T>();
-        
+
         // Pass `&Graph` explicitly so the borrow drops immediately after evaluation
         let check_budget = |g: &Graph| {
             g.vram_budget_bytes.map_or(true, |budget| {
@@ -231,13 +239,17 @@ impl Graph {
         };
 
         #[cfg(feature = "bf16")]
-        let candidate_ids: Vec<usize> = self.tensors.iter()
+        let candidate_ids: Vec<usize> = self
+            .tensors
+            .iter()
             .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)))
             .filter(|t| !protected_ids.contains(&t.id))
             .map(|t| t.id)
             .collect();
         #[cfg(not(feature = "bf16"))]
-        let candidate_ids: Vec<usize> = self.tensors.iter()
+        let candidate_ids: Vec<usize> = self
+            .tensors
+            .iter()
             .filter(|t| t.is_pooled && matches!(t.data, Storage::Gpu(_)))
             .filter(|t| !protected_ids.contains(&t.id))
             .map(|t| t.id)
@@ -247,7 +259,7 @@ impl Graph {
         for id in candidate_ids {
             self.demote_tensor_to_cpu(id);
             stream.synchronize().unwrap();
-            
+
             // Re-evaluate budget safely
             if check_budget(self) {
                 if let Ok(slice) = stream.alloc_zeros::<T>(size) {
@@ -260,7 +272,7 @@ impl Graph {
         let requested_mb = (size * std::mem::size_of::<T>()) as f64 / 1024.0 / 1024.0;
         panic!(
             "FATAL OOM: Exhausted VRAM even after full activation eviction! \n\
-            Attempted to allocate {:.2} MB ({} elements).", 
+            Attempted to allocate {:.2} MB ({} elements).",
             requested_mb, size
         );
     }
@@ -277,9 +289,8 @@ impl Graph {
                 let cpu_data_clone = cpu_data.clone();
                 #[cfg(feature = "bf16")]
                 if self.uses_bf16_mixed_precision() && self.tensors[tensor_id].is_pooled {
-                    let u16_data: Vec<u16> = cpu_data_clone.iter()
-                        .map(|&f| f32_to_bf16u(f))
-                        .collect();
+                    let u16_data: Vec<u16> =
+                        cpu_data_clone.iter().map(|&f| f32_to_bf16u(f)).collect();
                     let mut gpu_slice = self.safe_alloc_zeros::<u16>(&stream, u16_data.len());
                     stream.memcpy_htod(&u16_data, &mut gpu_slice).unwrap();
                     self.tensors[tensor_id].data = Storage::GpuBf16(gpu_slice);
@@ -310,10 +321,14 @@ impl Graph {
 
         // ── Restore gradients (always FP32) ───────────────────────────────────
         if let Storage::Cpu(cpu_grad) = &self.tensors[tensor_id].grad {
-            if !cpu_grad.is_empty() { // Prevent zero-size allocations
+            if !cpu_grad.is_empty() {
+                // Prevent zero-size allocations
                 let cpu_grad_clone = cpu_grad.clone();
-                let mut gpu_grad_slice = self.safe_alloc_zeros::<f32>(&stream, cpu_grad_clone.len());
-                stream.memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice).unwrap();
+                let mut gpu_grad_slice =
+                    self.safe_alloc_zeros::<f32>(&stream, cpu_grad_clone.len());
+                stream
+                    .memcpy_htod(&cpu_grad_clone, &mut gpu_grad_slice)
+                    .unwrap();
                 self.tensors[tensor_id].grad = Storage::Gpu(gpu_grad_slice);
             } else {
                 println!("IS EMPTY TENSOR!");
@@ -402,7 +417,14 @@ impl Graph {
         let size = {
             let t = &self.tensors[id];
             // Already allocated?
-            if matches!(t.grad, Storage::Gpu(_)) { return; }
+            #[cfg(feature = "bf16")]
+            if matches!(t.grad, Storage::Gpu(_) | Storage::GpuBf16(_)) {
+                return;
+            }
+            #[cfg(not(feature = "bf16"))]
+            if matches!(t.grad, Storage::Gpu(_)) {
+                return;
+            }
             t.shape.iter().product::<usize>()
         };
 
@@ -416,15 +438,14 @@ impl Graph {
             Storage::Gpu(_) => {
                 let grad_slice = self.safe_alloc_zeros::<f32>(&stream, size);
                 self.tensors[id].grad = Storage::Gpu(grad_slice);
-            },
+            }
             #[cfg(feature = "bf16")]
             Storage::GpuBf16(_) => {
                 let grad_slice = self.safe_alloc_zeros::<u16>(&stream, size);
                 self.tensors[id].grad = Storage::GpuBf16(grad_slice);
-            },
-            _ => panic!("ensure_grad_allocated only supported on GPU")
+            }
+            _ => panic!("ensure_grad_allocated only supported on GPU"),
         }
-
     }
 
     pub fn get_used_vram(&self) -> usize {
@@ -475,23 +496,54 @@ impl Graph {
             }
 
             let mut idle_pool_bytes = 0usize;
-            for (size, blocks) in &self.vram_pool { idle_pool_bytes += size * 4 * blocks.len(); }
+            for (size, blocks) in &self.vram_pool {
+                idle_pool_bytes += size * 4 * blocks.len();
+            }
             #[cfg(feature = "bf16")]
-            for (size, blocks) in &self.vram_pool_bf16 { idle_pool_bytes += size * 2 * blocks.len(); }
+            for (size, blocks) in &self.vram_pool_bf16 {
+                idle_pool_bytes += size * 2 * blocks.len();
+            }
 
-            let total_accounted = param_data_bytes + param_grad_bytes + pooled_data_bytes + pooled_grad_bytes + idle_pool_bytes;
+            let total_accounted = param_data_bytes
+                + param_grad_bytes
+                + pooled_data_bytes
+                + pooled_grad_bytes
+                + idle_pool_bytes;
             let unaccounted = device_used as i64 - total_accounted as i64;
 
             println!("--- VRAM STATE [{}] ---", context);
-            println!("Driver Used:   {:>8.2} MB / {:.2} MB", used as f32 / 1024.0 / 1024.0, total as f32 / 1024.0 / 1024.0);
-            println!("Params (D+G):  {:>8.2} MB (Data: {:.1}, Grad: {:.1})", (param_data_bytes+param_grad_bytes) as f32/1024./1024., param_data_bytes as f32/1024./1024., param_grad_bytes as f32/1024./1024.);
-            println!("Pooled (D+G):  {:>8.2} MB (Data: {:.1}, Grad: {:.1})", (pooled_data_bytes+pooled_grad_bytes) as f32/1024./1024., pooled_data_bytes as f32/1024./1024., pooled_grad_bytes as f32/1024./1024.);
-            println!("Idle Pool:     {:>8.2} MB", idle_pool_bytes as f32 / 1024.0 / 1024.0);
-            println!("Unaccounted:   {:>8.2} MB (Fragmentation / Workspace / Overhead)", unaccounted as f32 / 1024.0 / 1024.0);
-            
+            println!(
+                "Driver Used:   {:>8.2} MB / {:.2} MB",
+                used as f32 / 1024.0 / 1024.0,
+                total as f32 / 1024.0 / 1024.0
+            );
+            println!(
+                "Params (D+G):  {:>8.2} MB (Data: {:.1}, Grad: {:.1})",
+                (param_data_bytes + param_grad_bytes) as f32 / 1024. / 1024.,
+                param_data_bytes as f32 / 1024. / 1024.,
+                param_grad_bytes as f32 / 1024. / 1024.
+            );
+            println!(
+                "Pooled (D+G):  {:>8.2} MB (Data: {:.1}, Grad: {:.1})",
+                (pooled_data_bytes + pooled_grad_bytes) as f32 / 1024. / 1024.,
+                pooled_data_bytes as f32 / 1024. / 1024.,
+                pooled_grad_bytes as f32 / 1024. / 1024.
+            );
+            println!(
+                "Idle Pool:     {:>8.2} MB",
+                idle_pool_bytes as f32 / 1024.0 / 1024.0
+            );
+            println!(
+                "Unaccounted:   {:>8.2} MB (Fragmentation / Workspace / Overhead)",
+                unaccounted as f32 / 1024.0 / 1024.0
+            );
+
             // Efficiency warning for researchers
             if pooled_grad_bytes > (pooled_data_bytes / 2) && pooled_data_bytes > 0 {
-                println!("⚠️ WARNING: High Pooled Grad/Data Ratio ({:.2}).", pooled_grad_bytes as f32 / pooled_data_bytes as f32);
+                println!(
+                    "⚠️ WARNING: High Pooled Grad/Data Ratio ({:.2}).",
+                    pooled_grad_bytes as f32 / pooled_data_bytes as f32
+                );
                 println!("   Intermediate activations are carrying gradients during forward pass.");
             }
             println!("---------------------------------");
@@ -502,7 +554,7 @@ impl Graph {
 
     pub fn print_tensor_breakdown(&self) {
         use std::collections::HashMap;
-        
+
         struct Usage {
             data_bytes: usize,
             grad_bytes: usize,
@@ -520,13 +572,13 @@ impl Graph {
                 Storage::GpuBf16(s) => d_bytes += s.len() * 2,
                 _ => {}
             }
-            
+
             let mut g_bytes = 0;
             match &t.grad {
                 Storage::Gpu(s) => g_bytes += s.len() * 4,
                 _ => {}
             }
-            
+
             if d_bytes > 0 || g_bytes > 0 {
                 let pool_tag = if t.is_pooled { "[P]" } else { "[S]" };
                 let device_tag = match &t.data {
@@ -538,9 +590,12 @@ impl Graph {
                     Storage::CpuBf16(_) => "CpuBf16",
                 };
                 let tag = format!("{} @ {}: ", pool_tag, device_tag);
-                let identity = t.name.clone().unwrap_or_else(|| format!("ID {} {:?}", t.id, t.shape));
+                let identity = t
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| format!("ID {} {:?}", t.id, t.shape));
                 let key = format!("{} {}", tag, identity);
-                
+
                 let entry = stats.entry(key).or_insert(Usage {
                     data_bytes: 0,
                     grad_bytes: 0,
@@ -554,7 +609,9 @@ impl Graph {
         }
 
         let mut sorted: Vec<_> = stats.into_iter().collect();
-        sorted.sort_by(|a, b| (b.1.data_bytes + b.1.grad_bytes).cmp(&(a.1.data_bytes + a.1.grad_bytes))); 
+        sorted.sort_by(|a, b| {
+            (b.1.data_bytes + b.1.grad_bytes).cmp(&(a.1.data_bytes + a.1.grad_bytes))
+        });
 
         println!("--- Top GPU Tensor Consumers ---");
         println!("  TOTAL MEM   |  DATA MEM   |  GRAD MEM   | G/D | COUNT | IDENTITY");
@@ -562,13 +619,13 @@ impl Graph {
             let total_mb = (usage.data_bytes + usage.grad_bytes) as f32 / 1024.0 / 1024.0;
             let data_mb = usage.data_bytes as f32 / 1024.0 / 1024.0;
             let grad_mb = usage.grad_bytes as f32 / 1024.0 / 1024.0;
-            
+
             let ratio = if usage.data_bytes > 0 {
                 format!("{:.1}", grad_mb / data_mb)
             } else {
                 "inf".to_string()
             };
-            
+
             println!(
                 "  {:>8.2} MB | {:>8.2} MB | {:>8.2} MB | {:>3} | {:>5} | {}",
                 total_mb, data_mb, grad_mb, ratio, usage.count, name
