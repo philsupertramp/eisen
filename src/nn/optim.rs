@@ -457,29 +457,18 @@ impl AdamW {
             .as_ref()
             .map(|_| g.functions.get("adamw_step_f32").unwrap().clone());
         #[cfg(feature = "bf16")]
-        let adamw_bf16mom_fn_opt = if g.uses_bf16_mixed_precision() {
-            stream_opt
-                .as_ref()
-                .map(|_| g.functions.get("adamw_step_bf16mom").unwrap().clone())
-        } else {
-            None
-        };
-        #[cfg(feature = "bf16")]
-        let adamw_bf16w_fn_opt = if g.uses_bf16_mixed_precision() {
-            stream_opt.as_ref().map(|_| {
-                g.functions
-                    .get("adamw_step_bf16w_bf16mom_f32")
-                    .unwrap()
-                    .clone()
-            })
-        } else {
-            None
-        };
-        #[cfg(feature = "bf16")]
         let cast_bf16_to_f32_fn_opt = if g.uses_bf16_mixed_precision() {
             stream_opt
                 .as_ref()
                 .map(|_| g.functions.get("cast_bf16_to_f32").unwrap().clone())
+        } else {
+            None
+        };
+        #[cfg(feature = "bf16")]
+        let cast_f32_to_bf16_fn_opt = if g.uses_bf16_mixed_precision() {
+            stream_opt
+                .as_ref()
+                .map(|_| g.functions.get("cast_f32_to_bf16").unwrap().clone())
         } else {
             None
         };
@@ -497,38 +486,47 @@ impl AdamW {
 
                 let n = size as u64;
                 #[cfg(feature = "bf16")]
-                if adamw_bf16mom_fn_opt.is_some()
-                    && matches!(&g.tensors[p_id].data, Storage::GpuBf16(_))
-                {
-                    // Lazy-init BF16 moment buffers (if init_moments wasn't called)
-                    if !self.m_gpu_bf16.contains_key(&p_id) {
-                        self.m_gpu_bf16
-                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
-                        self.v_gpu_bf16
-                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                if matches!(&g.tensors[p_id].data, Storage::GpuBf16(_)) {
+                    // Stable path for BF16 weights:
+                    // 1) cast weights/grads to FP32
+                    // 2) update with FP32 AdamW + FP32 moments
+                    // 3) cast updated weights back to BF16
+                    if !self.m_gpu.contains_key(&p_id) {
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
-                    let m_s = self.m_gpu_bf16.get(&p_id).unwrap();
-                    let v_s = self.v_gpu_bf16.get(&p_id).unwrap();
-                    let weights = match &g.tensors[p_id].data {
+                    let m_s = self.m_gpu.get(&p_id).unwrap();
+                    let v_s = self.v_gpu.get(&p_id).unwrap();
+                    let weights_bf16 = match &g.tensors[p_id].data {
                         Storage::GpuBf16(s) => s,
                         _ => unreachable!(),
                     };
-                    let grads = match &g.tensors[p_id].grad {
+                    let grads_bf16 = match &g.tensors[p_id].grad {
                         Storage::GpuBf16(s) => s,
                         _ => unreachable!(),
                     };
+                    let weights_f32 = stream
+                        .alloc_zeros::<f32>(size)
+                        .expect("AdamW bf16 path: alloc weights_f32 failed");
                     let grads_f32 = stream
                         .alloc_zeros::<f32>(size)
-                        .expect("AdamW bf16 grad cast: alloc grads_f32 failed");
-                    let f_cast = cast_bf16_to_f32_fn_opt.as_ref().unwrap().clone();
-                    let mut cast_builder = stream.launch_builder(&f_cast);
-                    cast_builder.arg(grads).arg(&grads_f32).arg(&n);
-                    unsafe { cast_builder.launch(LaunchConfig::for_num_elems(size as u32)) }
-                        .unwrap();
-                    let f = adamw_bf16w_fn_opt.as_ref().unwrap().clone();
+                        .expect("AdamW bf16 path: alloc grads_f32 failed");
+
+                    let f_cast_to_f32 = cast_bf16_to_f32_fn_opt.as_ref().unwrap().clone();
+                    let mut cast_w = stream.launch_builder(&f_cast_to_f32);
+                    cast_w.arg(weights_bf16).arg(&weights_f32).arg(&n);
+                    unsafe { cast_w.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+
+                    let mut cast_g = stream.launch_builder(&f_cast_to_f32);
+                    cast_g.arg(grads_bf16).arg(&grads_f32).arg(&n);
+                    unsafe { cast_g.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+
+                    let f = adamw_fn_opt.as_ref().unwrap().clone();
                     let mut builder = stream.launch_builder(&f);
                     builder
-                        .arg(weights)
+                        .arg(&weights_f32)
                         .arg(&grads_f32)
                         .arg(m_s)
                         .arg(v_s)
@@ -541,7 +539,15 @@ impl AdamW {
                         .arg(&bc2)
                         .arg(&n);
                     unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
-                    stream.synchronize().expect("optim bf16 step sync failed");
+
+                    let f_cast_to_bf16 = cast_f32_to_bf16_fn_opt.as_ref().unwrap().clone();
+                    let mut cast_back = stream.launch_builder(&f_cast_to_bf16);
+                    cast_back.arg(&weights_f32).arg(weights_bf16).arg(&n);
+                    unsafe { cast_back.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+
+                    stream
+                        .synchronize()
+                        .expect("optim bf16->fp32->bf16 step sync failed");
                 } else {
                     // Lazy-init FP32 moment buffers (if init_moments wasn't called)
                     if !self.m_gpu.contains_key(&p_id) {
