@@ -1,10 +1,10 @@
-pub mod ops;
 pub mod memory;
+pub mod ops;
 
 use crate::tape::{Tape, TapeNode};
 use crate::tensor::{Device, Storage, Tensor};
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
-use std::collections::{HashMap};
+use std::collections::HashMap;
 use std::env;
 
 fn env_usize(name: &str, default: usize) -> usize {
@@ -21,17 +21,18 @@ fn is_bf16(s: &crate::tensor::Storage) -> bool {
 }
 #[cfg(not(feature = "bf16"))]
 #[inline]
-fn is_bf16(_s: &crate::tensor::Storage) -> bool { false }
+fn is_bf16(_s: &crate::tensor::Storage) -> bool {
+    false
+}
 
-
-#[macro_export] macro_rules! safe_bf16_temp {
+#[macro_export]
+macro_rules! safe_bf16_temp {
     ($self:ident, $id:expr, $size:expr, $stream:expr, $cast_fn:expr) => {{
         // 1. Check if it's BF16 (short immutable borrow, drops immediately)
         if is_bf16(&$self.tensors[$id].data) {
-            
             // 2. Safely allocate the temp buffer (mutable borrow of self)
             let tmp = $self.safe_alloc_zeros::<f32>($stream, $size);
-            
+
             // 3. Borrow the tensor again to run the cast
             if let Storage::GpuBf16(s) = &$self.tensors[$id].data {
                 let n = $size as u64;
@@ -221,39 +222,32 @@ impl Graph {
                     "cast_f32_to_bf16",
                     "cast_bf16_to_f32",
                     "cast_bf16_to_f32_accumulate",
-
                     "scale_bf16",
-                    
                     "matmul_bf16_f32",
                     "matmul_f32_bf16accum_f32",
                     "matmul_f32_bf16rhsaccum_f32",
                     "matmul_backward_a_bf16b_f32",
                     "matmul_trans_b_bf16",
                     "matmul_trans_a_bf16",
-
                     // matmul pure bf16
                     "matmul_bf16",
                     "matmul_backward_a_bf16",
                     "matmul_backward_b_bf16",
-
                     "bmm_bf16",
                     "bmm_f32_bf16accum_f32",
                     "bmm_backward_a_bf16",
                     "bmm_backward_a_transb_bf16",
                     "bmm_backward_b_bf16",
                     "bmm_backward_b_transb_bf16",
-                    
                     "gather_bf16_f32",
                     "gather_bf16_bf16out",
                     "gather_backward_bf16",
-
                     // RMS Norm
                     "rmsnorm_f32_bf16w",
                     "rmsnorm_backward_bf16w_f32",
                     "rmsnorm_bf16",
                     "rmsnorm_backward_bf16in_f32",
                     "rmsnorm_backward_bf16",
-
                     "adamw_step_bf16mom_f32",
                     "adamw_step_bf16w_bf16mom_f32",
                     "adamw_step_bf16mom",
@@ -261,27 +255,21 @@ impl Graph {
                     "add_bf16lhs_f32rhs_bf16out",
                     "accumulate_bf16out",
                     "accumulate_bf16",
-
                     "mul_bf16",
                     "mul_bf16lhs_f32rhs_bf16out",
                     "mul_backward_bf16in_f32",
                     "mul_backward_bf16lhs_f32rhs",
                     "mul_backward_bf16",
-
                     "silu_bf16",
                     "silu_backward_bf16in_f32",
                     "silu_backward_bf16",
-
                     "sum_bf16",
                     "sum_backward_bf16",
-
                     "max_bf16",
                     "max_backward_bf16",
-
                     "softmax_bf16",
                     "softmax_backward_bf16in_f32",
                     "softmax_backward_bf16",
-
                     "copy_bf16",
                     "transpose_0213_bf16",
                     "transpose_0213_backward_bf16",
@@ -293,7 +281,6 @@ impl Graph {
                     "repeat_kv_backward_bf16",
                     "cross_entropy_bf16",
                     "cross_entropy_backward_bf16",
-
                     "fill_bf16",
                 ];
 
@@ -378,14 +365,18 @@ impl Graph {
         while self.tensors.len() > save_point {
             let t = self.tensors.pop().unwrap();
             if t.is_pooled {
-                let size = if t.shape.is_empty() { 1 } else { t.shape.iter().product() };
-                
+                let size = if t.shape.is_empty() {
+                    1
+                } else {
+                    t.shape.iter().product()
+                };
+
                 // 1. Only recycle valid GPU gradient buffers!
                 // Discard Storage::Cpu (which includes the empty vec![] placeholders)
                 if matches!(t.grad, Storage::Gpu(_)) {
                     self.vram_pool.entry(size).or_default().push(t.grad);
                 }
-                
+
                 // 2. Safely route data buffers by their exact type
                 match t.data {
                     #[cfg(feature = "bf16")]
@@ -394,7 +385,10 @@ impl Graph {
                     }
                     Storage::Gpu(slice) => {
                         // Re-wrap the slice before pushing
-                        self.vram_pool.entry(size).or_default().push(Storage::Gpu(slice));
+                        self.vram_pool
+                            .entry(size)
+                            .or_default()
+                            .push(Storage::Gpu(slice));
                     }
                     _ => {
                         // Discard Storage::Cpu and Storage::CpuBf16 entirely.
@@ -476,7 +470,11 @@ impl Graph {
     }
 
     pub fn alloc_pooled(&mut self, shape: Vec<usize>) -> usize {
-        let size = if shape.is_empty() { 1 } else { shape.iter().product::<usize>() };
+        let size = if shape.is_empty() {
+            1
+        } else {
+            shape.iter().product::<usize>()
+        };
         let device = self.device.clone();
 
         // ── Data buffer: BF16 in Bf16Mixed mode, FP32 otherwise ───────────────
@@ -491,7 +489,8 @@ impl Graph {
                     }
 
                     // 2. Allocate if nothing was found (borrows self mutably, totally safe now!)
-                    let slice = cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
+                    let slice =
+                        cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
                     Storage::GpuBf16(slice)
                 }
                 Device::Cpu => Storage::Cpu(vec![0.0; size]), // CPU always FP32
@@ -504,13 +503,17 @@ impl Graph {
                 } else {
                     match &device {
                         Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                        Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                        Device::Gpu(_, stream) => {
+                            Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                        }
                     }
                 }
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Gpu(_, stream) => {
+                        Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                    }
                 }
             }
         };
@@ -518,17 +521,22 @@ impl Graph {
         #[cfg(not(feature = "bf16"))]
         let data_storage: Storage = {
             if let Some(blocks) = self.vram_pool.get_mut(&size) {
-                if let Some(block) = blocks.pop() { block }
-                else {
+                if let Some(block) = blocks.pop() {
+                    block
+                } else {
                     match &device {
                         Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                        Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                        Device::Gpu(_, stream) => {
+                            Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                        }
                     }
                 }
             } else {
                 match &device {
                     Device::Cpu => Storage::Cpu(vec![0.0; size]),
-                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Gpu(_, stream) => {
+                        Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size))
+                    }
                 }
             }
         };
@@ -634,7 +642,7 @@ impl Graph {
                 });
                 id
             }
-            _ => panic!("Only supports GPU!")
+            _ => panic!("Only supports GPU!"),
         }
     }
 
@@ -700,8 +708,7 @@ impl Graph {
                     Device::Gpu(_, s) => (None::<f32>, s),
                     _ => unreachable!(),
                 };
-                s
-                    .into_iter()
+                s.into_iter()
                     .map(|b| f32::from_bits((*b as u32) << 16))
                     .collect()
             }
@@ -716,33 +723,46 @@ impl Graph {
         self.ensure_grad_allocated(loss_id);
         // --- 1. INITIALIZE LOSS GRADIENT TO 1.0 ---
         match &self.device {
-            Device::Cpu => {
-                if let Storage::Cpu(g) = &mut self.tensors[loss_id].grad {
-                    g.iter_mut().for_each(|x| *x = 1.0);
-                }
-            }
+            Device::Cpu => match &mut self.tensors[loss_id].grad {
+                Storage::Cpu(g) => g.iter_mut().for_each(|x| *x = 1.0),
+                #[cfg(feature = "bf16")]
+                Storage::CpuBf16(g) => g.iter_mut().for_each(|x| *x = 0x3f80),
+                _ => {}
+            },
             Device::Gpu(_, stream) => {
-                if let Storage::Gpu(g) = &mut self.tensors[loss_id].grad {
-                    // Use an asynchronous kernel fill rather than blocking Host-to-Device transfer
-                    let f = self.functions.get("fill_f32").unwrap().clone();
-                    let val = 1.0f32;
-                    let n = g.len() as u64;
-                    let mut b = stream.launch_builder(&f);
-                    let num_elems = g.len() as u32;
-                    b.arg(g).arg(&val).arg(&n);
-                    unsafe { b.launch(LaunchConfig::for_num_elems(num_elems)) }.unwrap();
+                match &mut self.tensors[loss_id].grad {
+                    Storage::Gpu(g) => {
+                        // Use an asynchronous kernel fill rather than blocking Host-to-Device transfer
+                        let f = self.functions.get("fill_f32").unwrap().clone();
+                        let val = 1.0f32;
+                        let n = g.len() as u64;
+                        let mut b = stream.launch_builder(&f);
+                        let num_elems = g.len() as u32;
+                        b.arg(g).arg(&val).arg(&n);
+                        unsafe { b.launch(LaunchConfig::for_num_elems(num_elems)) }.unwrap();
+                    }
+                    #[cfg(feature = "bf16")]
+                    Storage::GpuBf16(g) => {
+                        let f = self.functions.get("fill_bf16").unwrap().clone();
+                        let val = 0x3f80u16; // bf16(1.0)
+                        let n = g.len() as u64;
+                        let mut b = stream.launch_builder(&f);
+                        let num_elems = g.len() as u32;
+                        b.arg(g).arg(&val).arg(&n);
+                        unsafe { b.launch(LaunchConfig::for_num_elems(num_elems)) }.unwrap();
+                    }
+                    _ => {}
                 }
             }
         }
 
-
-        // Note: Removed stream.synchronize() entirely! 
-        // We now rely on stream-ordered execution. 
+        // Note: Removed stream.synchronize() entirely!
+        // We now rely on stream-ordered execution.
         // VRAM Pool remains intact to prevent Driver Malloc bottlenecks.
         let nodes = std::mem::take(&mut self.tape.nodes);
         let (ctx, stream_opt) = match &self.device {
             Device::Gpu(ctx, s) => (Some(ctx.clone()), Some(s.clone())),
-            _ => (None, None)
+            _ => (None, None),
         };
 
         for node in nodes.iter().rev() {
@@ -759,7 +779,6 @@ impl Graph {
                     self.ensure_grad_allocated(input_id);
                 }
 
-
                 // Calculate free VRAM based on the user budget if provided, else fall back to driver info
                 let mut free_vram = if let Some(budget) = self.vram_budget_bytes {
                     budget.saturating_sub(self.current_vram_usage())
@@ -770,16 +789,25 @@ impl Graph {
                 if free_vram < scratch_budget {
                     // FIX 1: Only target tensors that are ACTUALLY currently taking up VRAM
                     #[cfg(feature = "bf16")]
-                    let candidate_ids: Vec<usize> = self.tensors.iter()
+                    let candidate_ids: Vec<usize> = self
+                        .tensors
+                        .iter()
                         .filter(|t| t.is_pooled && !self.active_node_tensors.contains(&t.id))
-                        .filter(|t| matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_)) || matches!(t.grad, Storage::Gpu(_)))
+                        .filter(|t| {
+                            matches!(t.data, Storage::Gpu(_) | Storage::GpuBf16(_))
+                                || matches!(t.grad, Storage::Gpu(_))
+                        })
                         .map(|t| t.id)
                         .collect();
 
                     #[cfg(not(feature = "bf16"))]
-                    let candidate_ids: Vec<usize> = self.tensors.iter()
+                    let candidate_ids: Vec<usize> = self
+                        .tensors
+                        .iter()
                         .filter(|t| t.is_pooled && !self.active_node_tensors.contains(&t.id))
-                        .filter(|t| matches!(t.data, Storage::Gpu(_)) || matches!(t.grad, Storage::Gpu(_)))
+                        .filter(|t| {
+                            matches!(t.data, Storage::Gpu(_)) || matches!(t.grad, Storage::Gpu(_))
+                        })
                         .map(|t| t.id)
                         .collect();
 
@@ -827,8 +855,6 @@ impl Graph {
                     panic!("backward post-call synchronize failed: {:?}", err)
                 });
             }
-
-
         }
 
         // --- 4. CLEANUP ---
