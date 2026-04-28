@@ -20,26 +20,126 @@ use cudarc::driver::CudaContext;
 use eisen::data::dataloader::BinaryDataLoader;
 use eisen::data::tokenizer::BPETokenizer;
 use eisen::graph::Graph;
-use eisen::nn::Module;
 use eisen::nn::optim::AdamW;
 use eisen::nn::scheduler::CosineScheduler;
 use eisen::nn::transformer::TransformerLM;
+use eisen::nn::Module;
 use eisen::tensor::Device;
-use eisen::tools::huggingface::{LlamaConfig, write_llama_config, write_safetensors};
- 
-use eisen::data::fim::{FimConfig, FimTokens};
+use eisen::tools::huggingface::{write_llama_config, write_safetensors, LlamaConfig};
+
 use eisen::data::dataloader::BatchResult;
+use eisen::data::fim::{FimConfig, FimTokens};
 
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::sync::{Arc, RwLock};
-use std::time::{Instant, UNIX_EPOCH, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use eisenboard::{StepRecord, TrainStats, spawn_eisenboard, get_rss_bytes};
+use eisenboard::{get_rss_bytes, spawn_eisenboard, StepRecord, TrainStats};
 
 // ─── GPU setup ────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    fn from_env() -> Self {
+        match env::var("EISEN_LOG_LEVEL")
+            .unwrap_or_else(|_| "info".to_string())
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "error" => Self::Error,
+            "warn" | "warning" => Self::Warn,
+            "debug" => Self::Debug,
+            "trace" => Self::Trace,
+            _ => Self::Info,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct TrainLogConfig {
+    level: LogLevel,
+    loss: bool,
+    graph_memory: bool,
+    computation_graph: bool,
+    graph_node_limit: usize,
+}
+
+impl TrainLogConfig {
+    fn from_env() -> Self {
+        let level = LogLevel::from_env();
+        let data = env::var("EISEN_LOG_DATA").unwrap_or_else(|_| "loss".to_string());
+        let parts: Vec<String> = data
+            .split(',')
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let all = parts.iter().any(|p| p == "all");
+
+        let has = |name: &str| all || parts.iter().any(|p| p == name);
+        Self {
+            level,
+            loss: has("loss"),
+            graph_memory: has("graph_memory") || has("memory") || has("vram"),
+            computation_graph: has("computation_graph") || has("graph") || has("tape"),
+            graph_node_limit: env_usize("EISEN_LOG_GRAPH_NODE_LIMIT", 16),
+        }
+    }
+
+    fn enabled(&self, level: LogLevel) -> bool {
+        self.level >= level
+    }
+
+    fn log_graph_memory(&self, g: &Graph, context: &str) {
+        if self.graph_memory && self.enabled(LogLevel::Debug) {
+            g.print_vram_state(context);
+        }
+    }
+
+    fn log_computation_graph(&self, g: &Graph, context: &str) {
+        if !(self.computation_graph && self.enabled(LogLevel::Trace)) {
+            return;
+        }
+        let total = g.tape.nodes.len();
+        println!(
+            "[TRACE] Computation graph @ {}: {} tape nodes",
+            context, total
+        );
+        for (i, node) in g.tape.nodes.iter().take(self.graph_node_limit).enumerate() {
+            let out = &g.tensors[node.output];
+            let out_name = out.name.as_deref().unwrap_or("unnamed");
+            let inputs = node
+                .inputs
+                .iter()
+                .map(|&tid| {
+                    let t = &g.tensors[tid];
+                    format!("{}:{}", t.name.as_deref().unwrap_or("unnamed"), tid)
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!(
+                "  [{:03}] out={}#{} shape={:?} <- [{}]",
+                i, out_name, node.output, out.shape, inputs
+            );
+        }
+        if total > self.graph_node_limit {
+            println!(
+                "  ... {} more nodes omitted (set EISEN_LOG_GRAPH_NODE_LIMIT to adjust)",
+                total - self.graph_node_limit
+            );
+        }
+    }
+}
 
 fn setup_gpu() -> Device {
     let ctx = CudaContext::new(0).expect("CUDA GPU required for 1B training");
@@ -86,6 +186,27 @@ fn apply_reproducibility_controls(deterministic: bool, seed: u64) {
 fn write_run_manifest(path: &str, content: &str) {
     fs::write(path, content).expect("Failed to write run manifest");
     println!("Run manifest written to {}", path);
+}
+
+fn finite_stats(v: &[f32]) -> (usize, usize, f32, f32) {
+    let mut finite = 0usize;
+    let mut non_finite = 0usize;
+    let mut min_v = f32::INFINITY;
+    let mut max_v = f32::NEG_INFINITY;
+    for &x in v {
+        if x.is_finite() {
+            finite += 1;
+            min_v = min_v.min(x);
+            max_v = max_v.max(x);
+        } else {
+            non_finite += 1;
+        }
+    }
+    if finite == 0 {
+        (finite, non_finite, f32::NAN, f32::NAN)
+    } else {
+        (finite, non_finite, min_v, max_v)
+    }
 }
 
 // ─── Checkpoint I/O ───────────────────────────────────────────────────────────
@@ -170,17 +291,19 @@ fn main() {
     // FIM adds 4 special tokens; the model vocab must be trained-aware of them.
     let fim_overhead = FimTokens::vocab_overhead(); // = 4
     let vocab_size = base_vocab_size + fim_overhead;
-    println!("Base vocab: {}  FIM overhead: {}  Total vocab: {}",
-             base_vocab_size, fim_overhead, vocab_size);
+    println!(
+        "Base vocab: {}  FIM overhead: {}  Total vocab: {}",
+        base_vocab_size, fim_overhead, vocab_size
+    );
 
     // ----- FIM config ----
-    let fim_rate    = env_f32("EISEN_FIM_RATE",     0.0);
-    let fim_spm     = env_f32("EISEN_FIM_SPM_RATE", 0.0);
-    let use_fim     = fim_rate > 0.0;
-    let fim_config  = FimConfig::new(base_vocab_size)
+    let fim_rate = env_f32("EISEN_FIM_RATE", 0.0);
+    let fim_spm = env_f32("EISEN_FIM_SPM_RATE", 0.0);
+    let use_fim = fim_rate > 0.0;
+    let fim_config = FimConfig::new(base_vocab_size)
         .with_rate(fim_rate)
         .with_spm_rate(fim_spm);
- 
+
     if use_fim {
         println!(
             "FIM enabled — rate={:.0}%, SPM={:.0}%, special tokens: prefix={} suffix={} middle={} pad={}",
@@ -188,7 +311,7 @@ fn main() {
             fim_config.tokens.prefix, fim_config.tokens.suffix,
             fim_config.tokens.middle, fim_config.tokens.pad,
         );
-    } 
+    }
     // ── Architecture ─────────────────────────────────────────────────────────
     let hidden_dim = env_usize("EISEN_HIDDEN_DIM", 32);
     let num_heads = env_usize("EISEN_NUM_HEADS", 4);
@@ -207,8 +330,7 @@ fn main() {
     let mut current_epoch = 1;
 
     let mut dataloader = {
-        let dl = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size)
-            .with_seed(seed);
+        let dl = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size).with_seed(seed);
         if use_fim {
             dl.with_fim(fim_config.clone())
         } else {
@@ -224,14 +346,20 @@ fn main() {
     let scheduler = CosineScheduler::new(lr_max, lr_min, warmup_steps, total_steps);
 
     let save_interval = 2_500_usize;
-    let log_interval = 50_usize;
+    let log_interval = env_usize("EISEN_LOG_INTERVAL", 50);
     let board_interval = 1_usize;
+    let log_cfg = TrainLogConfig::from_env();
+    let fail_on_nonfinite = env_bool("EISEN_FAIL_ON_NONFINITE", true);
+    println!(
+        "Logging: level={:?} data=[loss={}, graph_memory={}, computation_graph={}]",
+        log_cfg.level, log_cfg.loss, log_cfg.graph_memory, log_cfg.computation_graph
+    );
 
     // ── Model + streaming layout ──────────────────────────────────────────────
     println!("\nBuilding model…");
     let mut g = Graph::new(device);
     let model = TransformerLM::new(
-        &mut g, vocab_size, hidden_dim, num_heads, 4, ffn_dim, num_layers, true
+        &mut g, vocab_size, hidden_dim, num_heads, 4, ffn_dim, num_layers, true,
     );
     model.tag_parameters(&mut g);
 
@@ -256,7 +384,7 @@ fn main() {
     );
     println!("{}", report);
 
-    g.print_vram_state("Model init.");
+    log_cfg.log_graph_memory(&g, "Model init.");
 
     // ── Optimizer ────────────────────────────────────────────────────────────
     let mut optim = AdamW::new(model.params(), scheduler.get_lr(0));
@@ -269,7 +397,10 @@ fn main() {
     println!("Pre-allocating optimizer moment buffers...");
     optim.init_moments(&mut g);
 
-    let total_params = g.tensors[0..g.num_params].iter().map(|t| t.size()).sum::<usize>();
+    let total_params = g.tensors[0..g.num_params]
+        .iter()
+        .map(|t| t.size())
+        .sum::<usize>();
     println!("\nArchitecture summary:");
     println!("Trainable parameters: {}", total_params);
     println!(
@@ -373,7 +504,7 @@ fn main() {
     let mut last_clip_coef = 1.0_f32;
     let mut best_loss = f32::MAX;
 
-    g.print_vram_state("Optimizer init");
+    log_cfg.log_graph_memory(&g, "Optimizer init");
 
     'training: loop {
         if step >= total_steps {
@@ -392,9 +523,14 @@ fn main() {
             // --- NEW: Inline progress indicator ---
             // Update every 10 steps to avoid excessive I/O overhead
             if accum_steps > 100 && m_step % 10 == 0 {
-                print!("\x1b[2K\rEpoch {} | Step {:06} | Accumulating {}/{} ({:.1}%)", 
-                       current_epoch, step, m_step, accum_steps, 
-                       (m_step as f32 / accum_steps as f32) * 100.0);
+                print!(
+                    "\x1b[2K\rEpoch {} | Step {:06} | Accumulating {}/{} ({:.1}%)",
+                    current_epoch,
+                    step,
+                    m_step,
+                    accum_steps,
+                    (m_step as f32 / accum_steps as f32) * 100.0
+                );
                 let _ = io::stdout().flush();
             }
             let batch: BatchResult = match dataloader.next_batch() {
@@ -402,16 +538,25 @@ fn main() {
                 None => {
                     if current_epoch < epochs {
                         current_epoch += 1;
-                        println!("\nEpoch {}/{} starting at step {}…",
-                                 current_epoch, epochs, step);
+                        println!(
+                            "\nEpoch {}/{} starting at step {}…",
+                            current_epoch, epochs, step
+                        );
                         dataloader = {
                             let dl = BinaryDataLoader::new(bin_path, seq_len, micro_batch_size)
                                 .with_seed(seed.wrapping_add(current_epoch as u64));
-                            if use_fim { dl.with_fim(fim_config.clone()) } else { dl }
+                            if use_fim {
+                                dl.with_fim(fim_config.clone())
+                            } else {
+                                dl
+                            }
                         };
                         match dataloader.next_batch() {
                             Some(b) => b,
-                            None => { println!("Dataset empty."); break 'training; }
+                            None => {
+                                println!("Dataset empty.");
+                                break 'training;
+                            }
                         }
                     } else {
                         println!("\nDataset exhausted at step {}. Done.", step);
@@ -419,18 +564,19 @@ fn main() {
                     }
                 }
             };
- 
+
             let tokens_this_micro = micro_batch_size * seq_len;
- 
+
             let x_id = g.alloc_pooled(vec![micro_batch_size, seq_len]);
             g.name_tensor(x_id, "input");
             g.load_tensor_data(x_id, &batch.x);
- 
-            g.print_vram_state("PRE FORWARD pass");
-            let logits_id   = model.forward(&mut g, x_id);
-            g.print_vram_state("POST FORWARD pass");
+
+            log_cfg.log_graph_memory(&g, "PRE FORWARD pass");
+            let logits_id = model.forward(&mut g, x_id);
+            log_cfg.log_graph_memory(&g, "POST FORWARD pass");
+            log_cfg.log_computation_graph(&g, "post-forward");
             let flat_logits = g.reshape(logits_id, vec![tokens_this_micro, vocab_size]);
- 
+
             // Use masked CE when FIM has produced ignore-index positions;
             // fall back to standard CE otherwise (no overhead).
             let loss_id = if batch.has_masked {
@@ -438,13 +584,34 @@ fn main() {
             } else {
                 g.cross_entropy(flat_logits, &batch.targets)
             };
- 
-            step_loss += g.tensors[loss_id].sync_to_cpu()[0];
+
+            let micro_loss = g.tensors[loss_id].sync_to_cpu()[0];
+            if fail_on_nonfinite && !micro_loss.is_finite() {
+                let logits_host = g.tensors[flat_logits].sync_to_cpu();
+                let (finite, non_finite, min_v, max_v) = finite_stats(&logits_host);
+                eprintln!(
+                    "\n[NON-FINITE] loss={} at epoch={} step={} micro={}",
+                    micro_loss, current_epoch, step, m_step
+                );
+                eprintln!(
+                    "[NON-FINITE] logits stats: finite={} non_finite={} min={:.6} max={:.6}",
+                    finite, non_finite, min_v, max_v
+                );
+                eprintln!(
+                    "[NON-FINITE] first targets: {:?}",
+                    &batch.targets.iter().take(16).collect::<Vec<_>>()
+                );
+                panic!(
+                    "Aborting due to non-finite loss (set EISEN_FAIL_ON_NONFINITE=0 to continue)"
+                );
+            }
+            step_loss += micro_loss;
             micro_count += 1;
-            g.print_vram_state("FORWARD pass");
- 
+            log_cfg.log_graph_memory(&g, "FORWARD pass");
+
             g.backward(loss_id);
-            g.print_vram_state("PAST backward pass");
+            log_cfg.log_graph_memory(&g, "POST backward pass");
+            log_cfg.log_computation_graph(&g, "post-backward");
 
             g.clear_activations();
         }
@@ -463,9 +630,9 @@ fn main() {
         last_grad_norm = grad_norm;
         last_clip_coef = grad_clip_coef;
 
-        g.print_vram_state("PRE step");
+        log_cfg.log_graph_memory(&g, "PRE step");
         optim.step(&mut g);
-        g.print_vram_state("POST step");
+        log_cfg.log_graph_memory(&g, "POST step");
         step += 1;
         cumulative_tokens += micro_count * tokens_per_micro;
 
@@ -478,10 +645,26 @@ fn main() {
             let throughput = (log_interval * tokens_per_step) as f32 / elapsed.max(1e-6);
             let avg = running_loss / log_interval as f32;
 
-            println!(
-                "Epoch {} | Step {:06} | Loss {:.4} | LR {:.2e} | {:.0} tok/s",
-                current_epoch, step, avg, current_lr, throughput
-            );
+            if log_cfg.loss && log_cfg.enabled(LogLevel::Info) {
+                println!(
+                    "Epoch {} | Step {:06} | Loss {:.4} | LR {:.2e} | {:.0} tok/s",
+                    current_epoch, step, avg, current_lr, throughput
+                );
+            }
+            if log_cfg.enabled(LogLevel::Debug) && !log_cfg.loss {
+                println!(
+                    "Epoch {} | Step {:06} | LR {:.2e} | {:.0} tok/s",
+                    current_epoch, step, current_lr, throughput
+                );
+            }
+            if log_cfg.graph_memory {
+                println!(
+                    "[DEBUG] Step {:06} memory: gpu_used={} bytes, rss={} bytes",
+                    step,
+                    g.get_used_vram(),
+                    get_rss_bytes()
+                );
+            }
 
             running_loss = 0.0;
             last_log = Instant::now();
@@ -556,7 +739,7 @@ fn main() {
         let x_id = g.alloc_pooled(vec![1, csl]);
         g.name_tensor(x_id, "input");
         g.load_tensor_data(x_id, &context_f32);
-        
+
         let logits_id = model.forward(&mut g, x_id);
         let logits = g.tensors[logits_id].sync_to_cpu();
 
@@ -597,7 +780,6 @@ fn main() {
         total_steps,
     );
     write_run_manifest(&manifest_path, &completed_manifest);
-
 
     println!("\n\nRun complete. Weights at {}", output_path);
 }
