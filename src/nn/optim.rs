@@ -522,7 +522,9 @@ impl AdamW {
                                 Storage::GpuBf16(s) => s,
                                 _ => unreachable!(),
                             };
-                            let grads_f32 = g.safe_alloc_zeros::<f32>(stream, size);
+                            let grads_f32 = stream
+                                .alloc_zeros::<f32>(size)
+                                .expect("AdamW bf16 grad cast: alloc grads_f32 failed");
                             let f_cast = cast_bf16_to_f32_fn_opt.as_ref().unwrap().clone();
                             let mut cast_builder = stream.launch_builder(&f_cast);
                             cast_builder.arg(grads).arg(&grads_f32).arg(&n);
@@ -649,7 +651,7 @@ impl AdamW {
                 // Write back — recompress to BF16 if the weight was BF16 on CPU
                 #[cfg(feature = "bf16")]
                 {
-                    use crate::tensor::{Storage, f32_to_bf16u};
+                    use crate::tensor::{f32_to_bf16u, Storage};
                     if matches!(g.tensors[p_id].data, Storage::CpuBf16(_)) {
                         let bf16_data: Vec<u16> =
                             weights_f32.iter().map(|&f| f32_to_bf16u(f)).collect();
