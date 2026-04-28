@@ -88,20 +88,26 @@ impl AdamW {
                 #[cfg(feature = "bf16")]
                 if g.uses_bf16_mixed_precision() {
                     if !self.m_gpu_bf16.contains_key(&p_id) {
-                        self.m_gpu_bf16.insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
-                        self.v_gpu_bf16.insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                        self.m_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                        self.v_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
                     }
                 } else {
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
-                        self.v_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                 }
                 #[cfg(not(feature = "bf16"))]
                 {
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
-                        self.v_gpu.insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                 }
             } else {
@@ -155,7 +161,8 @@ impl AdamW {
                     let stream = stream_opt
                         .as_ref()
                         .expect("GPU grad but graph has no GPU stream");
-                    let host: Vec<u16> = stream.clone_dtoh(s).expect("AdamW clip: bf16 dtoh failed");
+                    let host: Vec<u16> =
+                        stream.clone_dtoh(s).expect("AdamW clip: bf16 dtoh failed");
                     for &x in &host {
                         // Upcast u16 -> f32 for precision during sum of squares
                         let xf = f32::from_bits((x as u32) << 16) as f64;
@@ -182,11 +189,14 @@ impl AdamW {
         let scale_fn_opt = stream_opt
             .as_ref()
             .map(|_| g.functions.get("scale_f32").unwrap().clone());
-            
+
         #[cfg(feature = "bf16")]
-        let scale_bf16_fn_opt = stream_opt
-            .as_ref()
-            .map(|_| g.functions.get("scale_bf16").expect("scale_bf16 kernel not found").clone());
+        let scale_bf16_fn_opt = stream_opt.as_ref().map(|_| {
+            g.functions
+                .get("scale_bf16")
+                .expect("scale_bf16 kernel not found")
+                .clone()
+        });
 
         for &p_id in &self.params {
             let size = g.tensors[p_id].shape.iter().product::<usize>();
@@ -204,8 +214,7 @@ impl AdamW {
                     let mut builder = stream.launch_builder(&f);
                     let n = size as u64;
                     builder.arg(&*s).arg(&scale).arg(&n);
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
-                        .unwrap();
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
                 }
                 #[cfg(feature = "bf16")]
                 Storage::CpuBf16(v) => {
@@ -224,14 +233,13 @@ impl AdamW {
                     let mut builder = stream.launch_builder(&f);
                     let n = size as u64;
                     builder.arg(s).arg(&scale).arg(&n);
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }
-                        .unwrap();
-                    stream.synchronize().expect("optim maybe_clip_gradients sync failed");
-
+                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
+                    stream
+                        .synchronize()
+                        .expect("optim maybe_clip_gradients sync failed");
                 }
             }
         }
-
     }
 
     /// Zero all parameter gradients.
@@ -260,7 +268,8 @@ impl AdamW {
 
             // Inspect storage variant to decide which path to take
             #[cfg(feature = "bf16")]
-            let is_gpu_grad = matches!(&g.tensors[p_id].grad, Storage::Gpu(_) | Storage::GpuBf16(_));
+            let is_gpu_grad =
+                matches!(&g.tensors[p_id].grad, Storage::Gpu(_) | Storage::GpuBf16(_));
             #[cfg(not(feature = "bf16"))]
             let is_gpu_grad = matches!(&g.tensors[p_id].grad, Storage::Gpu(_));
 
@@ -273,12 +282,12 @@ impl AdamW {
                 match &g.tensors[p_id].grad {
                     Storage::Gpu(grad) => {
                         builder.arg(grad).arg(&val).arg(&n);
-                    },
+                    }
                     #[cfg(feature = "bf16")]
                     Storage::GpuBf16(grad) => {
                         builder.arg(grad).arg(&val).arg(&n);
                     }
-                    _ => unreachable!()
+                    _ => unreachable!(),
                 }
                 unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
             } else {
@@ -357,11 +366,14 @@ impl AdamW {
             let scale_fn_opt = stream_opt
                 .as_ref()
                 .map(|_| g.functions.get("scale_f32").unwrap().clone());
-                
+
             #[cfg(feature = "bf16")]
-            let scale_bf16_fn_opt = stream_opt
-                .as_ref()
-                .map(|_| g.functions.get("scale_bf16").expect("scale_bf16 kernel not loaded").clone());
+            let scale_bf16_fn_opt = stream_opt.as_ref().map(|_| {
+                g.functions
+                    .get("scale_bf16")
+                    .expect("scale_bf16 kernel not loaded")
+                    .clone()
+            });
 
             for &p_id in &self.params {
                 let size = g.tensors[p_id].shape.iter().product::<usize>();
@@ -449,6 +461,14 @@ impl AdamW {
         } else {
             None
         };
+        #[cfg(feature = "bf16")]
+        let cast_bf16_to_f32_fn_opt = if g.uses_bf16_mixed_precision() {
+            stream_opt
+                .as_ref()
+                .map(|_| g.functions.get("cast_bf16_to_f32").unwrap().clone())
+        } else {
+            None
+        };
 
         for &p_id in &self.params {
             let size = g.tensors[p_id].shape.iter().product::<usize>();
@@ -466,14 +486,10 @@ impl AdamW {
                 if adamw_bf16mom_fn_opt.is_some() {
                     // Lazy-init BF16 moment buffers (if init_moments wasn't called)
                     if !self.m_gpu_bf16.contains_key(&p_id) {
-                        self.m_gpu_bf16.insert(
-                            p_id,
-                            g.safe_alloc_zeros::<u16>(stream, size),
-                        );
-                        self.v_gpu_bf16.insert(
-                            p_id,
-                            g.safe_alloc_zeros::<u16>(stream, size),
-                        );
+                        self.m_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
+                        self.v_gpu_bf16
+                            .insert(p_id, g.safe_alloc_zeros::<u16>(stream, size));
                     }
                     let m_s = self.m_gpu_bf16.get(&p_id).unwrap();
                     let v_s = self.v_gpu_bf16.get(&p_id).unwrap();
@@ -506,11 +522,19 @@ impl AdamW {
                                 Storage::GpuBf16(s) => s,
                                 _ => unreachable!(),
                             };
+                            let grads_f32 = g.safe_alloc_zeros::<f32>(stream, size);
+                            let f_cast = cast_bf16_to_f32_fn_opt.as_ref().unwrap().clone();
+                            let mut cast_builder = stream.launch_builder(&f_cast);
+                            cast_builder.arg(grads).arg(&grads_f32).arg(&n);
+                            unsafe {
+                                cast_builder.launch(LaunchConfig::for_num_elems(size as u32))
+                            }
+                            .unwrap();
                             let f = adamw_bf16w_fn_opt.as_ref().unwrap().clone();
                             let mut builder = stream.launch_builder(&f);
                             builder
                                 .arg(weights)
-                                .arg(grads)
+                                .arg(&grads_f32)
                                 .arg(m_s)
                                 .arg(v_s)
                                 .arg(&self.lr)
@@ -526,17 +550,14 @@ impl AdamW {
                         }
                         _ => unreachable!(),
                     }
+                    stream.synchronize().expect("optim bf16 step sync failed");
                 } else {
                     // Lazy-init FP32 moment buffers (if init_moments wasn't called)
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(
-                            p_id,
-                            g.safe_alloc_zeros::<f32>(stream, size),
-                        );
-                        self.v_gpu.insert(
-                            p_id,
-                            g.safe_alloc_zeros::<f32>(stream, size),
-                        );
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                     let weights = match &g.tensors[p_id].data {
                         Storage::Gpu(s) => s,
@@ -570,14 +591,10 @@ impl AdamW {
                 {
                     // Lazy-init FP32 moment buffers
                     if !self.m_gpu.contains_key(&p_id) {
-                        self.m_gpu.insert(
-                            p_id,
-                            g.safe_alloc_zeros::<f32>(stream, size),
-                        );
-                        self.v_gpu.insert(
-                            p_id,
-                            g.safe_alloc_zeros::<f32>(stream, size),
-                        );
+                        self.m_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
+                        self.v_gpu
+                            .insert(p_id, g.safe_alloc_zeros::<f32>(stream, size));
                     }
                     let weights = match &g.tensors[p_id].data {
                         Storage::Gpu(s) => s,
@@ -618,7 +635,7 @@ impl AdamW {
                 let mut weights_f32: Vec<f32> = g.tensors[p_id].data.to_f32_vec();
 
                 for i in 0..size {
-                    let grad   = grad_data[i];
+                    let grad = grad_data[i];
                     let weight = weights_f32[i];
 
                     let decayed = weight * (1.0 - self.lr * self.weight_decay);
@@ -634,7 +651,8 @@ impl AdamW {
                 {
                     use crate::tensor::{Storage, f32_to_bf16u};
                     if matches!(g.tensors[p_id].data, Storage::CpuBf16(_)) {
-                        let bf16_data: Vec<u16> = weights_f32.iter().map(|&f| f32_to_bf16u(f)).collect();
+                        let bf16_data: Vec<u16> =
+                            weights_f32.iter().map(|&f| f32_to_bf16u(f)).collect();
                         g.tensors[p_id].data = Storage::CpuBf16(bf16_data);
                     } else {
                         g.tensors[p_id].data = Storage::Cpu(weights_f32);
