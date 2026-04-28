@@ -1,11 +1,10 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
-use crate::tensor::{Tensor, Device, Storage};
 use crate::data::fim::IGNORE_INDEX;
-use cudarc::driver::{PushKernelArg, LaunchConfig};
+use crate::graph::{is_bf16, Graph, TapeNode};
 use crate::safe_bf16_temp;
+use crate::tensor::{Device, Storage, Tensor};
+use cudarc::driver::{LaunchConfig, PushKernelArg};
 
 impl Graph {
-
     pub fn sum(&mut self, a_id: usize, dim: usize) -> usize {
         let device = self.device.clone();
         match &device {
@@ -41,16 +40,22 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
+                    let stream = match &self.device {
+                        Device::Gpu(_, s) => s.clone(),
+                        _ => unreachable!(),
+                    };
                     let f32_slice = self.safe_alloc_zeros::<f32>(&stream, out_size);
                     let tmp_id = self.tensors.len();
                     let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
-                        id: tmp_id, shape: out_shape.clone(),
+                        id: tmp_id,
+                        shape: out_shape.clone(),
                         strides: Tensor::compute_strides(&out_shape),
                         data: Storage::Gpu(f32_slice),
                         grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
+                        device: self.device.clone(),
+                        name: None,
+                        is_pooled: false,
                     });
                     (tmp_id, true)
                 } else {
@@ -70,7 +75,8 @@ impl Graph {
 
                 let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                    #[cfg(feature = "bf16")]
+                    (_, Some(t)) => t,
                     _ => unreachable!("sum: input must be Gpu or GpuBf16"),
                 };
                 let o_s = match &self.tensors[compute_target_id].data {
@@ -125,11 +131,15 @@ impl Graph {
                 if cast_to_bf16_after {
                     let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
                     let n_elem = out_size as u64;
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
+                    match (
+                        &self.tensors[compute_target_id].data,
+                        &self.tensors[out_id].data,
+                    ) {
                         (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
                             let mut b = stream.launch_builder(&f_cast);
                             b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            unsafe { b.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                            unsafe { b.launch(LaunchConfig::for_num_elems(out_size as u32)) }
+                                .unwrap();
                             stream.synchronize().unwrap();
                         }
                         _ => {}
@@ -230,16 +240,22 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let stream = match &self.device { Device::Gpu(_, s) => s.clone(), _ => unreachable!() };
+                    let stream = match &self.device {
+                        Device::Gpu(_, s) => s.clone(),
+                        _ => unreachable!(),
+                    };
                     let f32_slice = self.safe_alloc_zeros::<f32>(&stream, out_size);
                     let tmp_id = self.tensors.len();
                     let grad_slice = self.safe_alloc_zeros::<f32>(&stream, 1);
                     self.tensors.push(Tensor {
-                        id: tmp_id, shape: out_shape.clone(),
+                        id: tmp_id,
+                        shape: out_shape.clone(),
                         strides: Tensor::compute_strides(&out_shape),
                         data: Storage::Gpu(f32_slice),
                         grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
+                        device: self.device.clone(),
+                        name: None,
+                        is_pooled: false,
                     });
                     (tmp_id, true)
                 } else {
@@ -253,7 +269,7 @@ impl Graph {
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
-                
+
                 #[cfg(feature = "bf16")]
                 let a_temp_fwd = safe_bf16_temp!(self, a_id, _a_size, stream, &f_cast_to_f32);
                 #[cfg(not(feature = "bf16"))]
@@ -261,7 +277,8 @@ impl Graph {
 
                 let a_s = match (&self.tensors[a_id].data, &a_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
-                    #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                    #[cfg(feature = "bf16")]
+                    (_, Some(t)) => t,
                     _ => unreachable!("max: input must be Gpu or GpuBf16"),
                 };
                 let o_s = match &self.tensors[compute_target_id].data {
@@ -288,13 +305,19 @@ impl Graph {
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     #[cfg(feature = "bf16")]
-                    let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(&tensors[a_id].data, _a_size, &stream_clone, &f_cast_to_f32_bwd);
+                    let a_temp_bwd = crate::bf16_util::bf16_to_f32_temp(
+                        &tensors[a_id].data,
+                        _a_size,
+                        &stream_clone,
+                        &f_cast_to_f32_bwd,
+                    );
                     #[cfg(not(feature = "bf16"))]
                     let a_temp_bwd: Option<()> = None;
 
                     let a_data = match (&tensors[a_id].data, &a_temp_bwd) {
                         (Storage::Gpu(s), _) => s,
-                        #[cfg(feature = "bf16")] (_, Some(t)) => t,
+                        #[cfg(feature = "bf16")]
+                        (_, Some(t)) => t,
                         _ => unreachable!("max backward: input must be Gpu or GpuBf16"),
                     };
 
@@ -328,11 +351,15 @@ impl Graph {
                 if cast_to_bf16_after {
                     let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
                     let n_elem = out_size as u64;
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
+                    match (
+                        &self.tensors[compute_target_id].data,
+                        &self.tensors[out_id].data,
+                    ) {
                         (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
                             let mut b = stream.launch_builder(&f_cast);
                             b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            unsafe { b.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                            unsafe { b.launch(LaunchConfig::for_num_elems(out_size as u32)) }
+                                .unwrap();
                             stream.synchronize().unwrap();
                         }
                         _ => {}
@@ -400,8 +427,8 @@ impl Graph {
             Device::Gpu(_, stream) => {
                 let a = &self.tensors[a_id];
                 let out_shape = a.shape.clone();
-                let n  = *out_shape.last().unwrap() as u64;
-                let b  = (a.data.len() as u64) / n;
+                let n = *out_shape.last().unwrap() as u64;
+                let b = (a.data.len() as u64) / n;
                 let stream_clone = stream.clone();
 
                 #[cfg(feature = "bf16")]
@@ -450,14 +477,28 @@ impl Graph {
                     match (
                         &tensors[out_id].data,
                         &tensors[out_id].grad,
-                        &tensors[a_id].grad
+                        &tensors[a_id].grad,
                     ) {
                         (Storage::Gpu(out_data), Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
-                            builder.arg(out_data).arg(out_grad).arg(a_grad).arg(&b).arg(&n);
+                            builder
+                                .arg(out_data)
+                                .arg(out_grad)
+                                .arg(a_grad)
+                                .arg(&b)
+                                .arg(&n);
                         }
                         #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(out_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad)) => {
-                            builder.arg(out_data).arg(out_grad).arg(a_grad).arg(&b).arg(&n);
+                        (
+                            Storage::GpuBf16(out_data),
+                            Storage::GpuBf16(out_grad),
+                            Storage::GpuBf16(a_grad),
+                        ) => {
+                            builder
+                                .arg(out_data)
+                                .arg(out_grad)
+                                .arg(a_grad)
+                                .arg(&b)
+                                .arg(&n);
                         }
                         _ => unreachable!(),
                     }
@@ -466,7 +507,9 @@ impl Graph {
 
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
-                        inputs: vec![a_id], output: out_id, backward_fn,
+                        inputs: vec![a_id],
+                        output: out_id,
+                        backward_fn,
                     });
                 }
                 out_id
@@ -530,9 +573,29 @@ impl Graph {
                 let logits = &self.tensors[logits_id];
                 let batch_size = logits.shape[0];
                 let num_classes = logits.shape[1];
-                
-                // The loss is a scalar. It is perfectly fine (and preferred) 
-                // for it to stay purely as f32 in VRAM.
+
+                // Loss scalar must be FP32 even in BF16 mixed mode:
+                // forward kernel does atomicAdd(float*), backward consumes float grad_out.
+                #[cfg(feature = "bf16")]
+                let out_id = if self.uses_bf16_mixed_precision() {
+                    let data = self.safe_alloc_zeros::<f32>(stream, 1);
+                    let grad = self.safe_alloc_zeros::<f32>(stream, 1);
+                    let id = self.tensors.len();
+                    self.tensors.push(Tensor {
+                        id,
+                        shape: vec![],
+                        strides: vec![],
+                        data: Storage::Gpu(data),
+                        grad: Storage::Gpu(grad),
+                        device: self.device.clone(),
+                        name: None,
+                        is_pooled: false,
+                    });
+                    id
+                } else {
+                    self.alloc_pooled(vec![])
+                };
+                #[cfg(not(feature = "bf16"))]
                 let out_id = self.alloc_pooled(vec![]);
                 self.name_tensor(out_id, "cross_entropy_output");
 
@@ -547,12 +610,22 @@ impl Graph {
 
                 #[cfg(feature = "bf16")]
                 let f_bwd = if self.uses_bf16_mixed_precision() {
-                    self.functions.get("cross_entropy_backward_bf16").unwrap().clone()
+                    self.functions
+                        .get("cross_entropy_backward_bf16")
+                        .unwrap()
+                        .clone()
                 } else {
-                    self.functions.get("cross_entropy_backward_f32").unwrap().clone()
+                    self.functions
+                        .get("cross_entropy_backward_f32")
+                        .unwrap()
+                        .clone()
                 };
                 #[cfg(not(feature = "bf16"))]
-                let f_bwd = self.functions.get("cross_entropy_backward_f32").unwrap().clone();
+                let f_bwd = self
+                    .functions
+                    .get("cross_entropy_backward_f32")
+                    .unwrap()
+                    .clone();
 
                 let stream_clone = stream.clone();
 
@@ -576,27 +649,38 @@ impl Graph {
                 let mut builder = stream.launch_builder(&f_fwd);
                 match (&self.tensors[logits_id].data, &self.tensors[out_id].data) {
                     (Storage::Gpu(l_s), Storage::Gpu(o_s)) => {
-                        builder.arg(l_s).arg(&targets_d).arg(o_s).arg(&b_u64).arg(&c_u64);
+                        builder
+                            .arg(l_s)
+                            .arg(&targets_d)
+                            .arg(o_s)
+                            .arg(&b_u64)
+                            .arg(&c_u64);
                     }
                     #[cfg(feature = "bf16")]
-                    (Storage::GpuBf16(l_s), Storage::GpuBf16(o_s)) => {
-                        // Notice `o_s` is still Gpu (f32) - matching the float* out_loss signature
-                        builder.arg(l_s).arg(&targets_d).arg(o_s).arg(&b_u64).arg(&c_u64);
+                    (Storage::GpuBf16(l_s), Storage::Gpu(o_s)) => {
+                        builder
+                            .arg(l_s)
+                            .arg(&targets_d)
+                            .arg(o_s)
+                            .arg(&b_u64)
+                            .arg(&c_u64);
                     }
-                    (s1, s2) => unreachable!("cross_entropy: Invalid storage types [{:?} {:?}]", s1, s2),
+                    (s1, s2) => {
+                        unreachable!("cross_entropy: Invalid storage types [{:?} {:?}]", s1, s2)
+                    }
                 }
                 unsafe { builder.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
 
                 // --- BACKWARD PASS ---
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
-                    
+
                     tensors[out_id].sync_to_gpu();
                     tensors[logits_id].sync_to_gpu();
                     // Safely match the entire state vector to guarantee pointer type alignment
                     match (
-                        &tensors[logits_id].data, 
-                        &tensors[out_id].grad, 
+                        &tensors[logits_id].data,
+                        &tensors[out_id].grad,
                         &tensors[logits_id].grad
                     ) {
                         (Storage::Gpu(l_data), Storage::Gpu(out_grad), Storage::Gpu(l_grad)) => {
@@ -604,7 +688,7 @@ impl Graph {
                             b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
                         }
                         #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(l_data), Storage::GpuBf16(out_grad), Storage::GpuBf16(l_grad)) => {
+                        (Storage::GpuBf16(l_data), Storage::Gpu(out_grad), Storage::GpuBf16(l_grad)) => {
                             // BF16 Path -> calls cross_entropy_backward_bf16
                             b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
                         }
@@ -680,49 +764,59 @@ impl Graph {
     /// is valid (no masked positions) to avoid the normaliser overhead.
     pub fn cross_entropy_masked(&mut self, logits_id: usize, targets: &[usize]) -> usize {
         let valid_count = targets.iter().filter(|&&t| t != IGNORE_INDEX).count();
- 
+
         // No masked positions → use standard (faster) CE.
         if valid_count == targets.len() {
             return self.cross_entropy(logits_id, targets);
         }
- 
+
         // All positions masked — return zero loss (should not happen in practice).
         if valid_count == 0 {
             return self.alloc(vec![], vec![0.0]);
         }
- 
+
         let normalizer = 1.0_f32 / valid_count as f32;
- 
+
         let device = self.device.clone();
         match &device {
             Device::Gpu(_, stream) => {
-                let logits      = &self.tensors[logits_id];
-                let batch_size  = logits.shape[0];
+                let logits = &self.tensors[logits_id];
+                let batch_size = logits.shape[0];
                 let num_classes = logits.shape[1];
- 
-                let out_id  = self.alloc_pooled(vec![]);
-                self.name_tensor(out_id, "cross_entropy_masked_output");
+
                 #[cfg(feature = "bf16")]
-                let (compute_target_id, cast_to_bf16_after) = if self.uses_bf16_mixed_precision() {
-                    let f32_slice = self.safe_alloc_zeros::<f32>(stream, 1);
-                    let tmp_id = self.tensors.len();
-                    let grad_slice = self.safe_alloc_zeros::<f32>(stream, 1);
+                let out_id = if self.uses_bf16_mixed_precision() {
+                    let data = self.safe_alloc_zeros::<f32>(stream, 1);
+                    let grad = self.safe_alloc_zeros::<f32>(stream, 1);
+                    let id = self.tensors.len();
                     self.tensors.push(Tensor {
-                        id: tmp_id, shape: vec![],
+                        id,
+                        shape: vec![],
                         strides: vec![],
-                        data: Storage::Gpu(f32_slice),
-                        grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
+                        data: Storage::Gpu(data),
+                        grad: Storage::Gpu(grad),
+                        device: self.device.clone(),
+                        name: None,
+                        is_pooled: false,
                     });
-                    (tmp_id, true)
+                    id
                 } else {
-                    (out_id, false)
+                    self.alloc_pooled(vec![])
                 };
                 #[cfg(not(feature = "bf16"))]
-                #[allow(unused_variables)]
-                let (compute_target_id, _cast_to_bf16_after) = (out_id, false);
-                let f_fwd   = self.functions.get("cross_entropy_masked_f32").unwrap().clone();
-                let f_bwd   = self.functions.get("cross_entropy_masked_backward_f32").unwrap().clone();
+                let out_id = self.alloc_pooled(vec![]);
+                self.name_tensor(out_id, "cross_entropy_masked_output");
+                let compute_target_id = out_id;
+                let f_fwd = self
+                    .functions
+                    .get("cross_entropy_masked_f32")
+                    .unwrap()
+                    .clone();
+                let f_bwd = self
+                    .functions
+                    .get("cross_entropy_masked_backward_f32")
+                    .unwrap()
+                    .clone();
                 let stream_clone = stream.clone();
 
                 if let (Storage::Gpu(s), Device::Gpu(_, stream)) =
@@ -735,26 +829,36 @@ impl Graph {
                     builder.arg(s).arg(&val).arg(&n);
                     unsafe { builder.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
                 }
- 
+
                 let targets_f32: Vec<f32> = targets
                     .iter()
-                    .map(|&t| if t == IGNORE_INDEX { u32::MAX as f32 } else { t as f32 })
+                    .map(|&t| {
+                        if t == IGNORE_INDEX {
+                            u32::MAX as f32
+                        } else {
+                            t as f32
+                        }
+                    })
                     .collect();
                 let targets_d = stream.clone_htod(targets_f32.as_slice()).unwrap();
- 
+
                 // Optional BF16 cast for logits (same pattern as cross_entropy).
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32 = self.functions.get("cast_bf16_to_f32").unwrap().clone();
                 #[cfg(feature = "bf16")]
                 let f_cast_to_f32_bwd = f_cast_to_f32.clone();
- 
+
                 #[cfg(feature = "bf16")]
                 let l_temp_fwd = safe_bf16_temp!(
-                    self, logits_id, batch_size * num_classes, stream, &f_cast_to_f32
+                    self,
+                    logits_id,
+                    batch_size * num_classes,
+                    stream,
+                    &f_cast_to_f32
                 );
                 #[cfg(not(feature = "bf16"))]
                 let l_temp_fwd: Option<()> = None;
- 
+
                 let l_s = match (&self.tensors[logits_id].data, &l_temp_fwd) {
                     (Storage::Gpu(s), _) => s,
                     #[cfg(feature = "bf16")]
@@ -765,10 +869,10 @@ impl Graph {
                     Storage::Gpu(s) => s,
                     _ => unreachable!(),
                 };
- 
-                let b_u64 = batch_size  as u64;
+
+                let b_u64 = batch_size as u64;
                 let c_u64 = num_classes as u64;
- 
+
                 let mut builder = stream.launch_builder(&f_fwd);
                 builder
                     .arg(l_s)
@@ -778,7 +882,7 @@ impl Graph {
                     .arg(&b_u64)
                     .arg(&c_u64);
                 unsafe { builder.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
- 
+
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     #[cfg(feature = "bf16")]
                     let l_temp_bwd = crate::bf16_util::bf16_to_f32_temp(
@@ -789,7 +893,7 @@ impl Graph {
                     );
                     #[cfg(not(feature = "bf16"))]
                     let l_temp_bwd: Option<()> = None;
- 
+
                     let l_data = match (&tensors[logits_id].data, &l_temp_bwd) {
                         (Storage::Gpu(s), _) => s,
                         #[cfg(feature = "bf16")]
@@ -804,7 +908,7 @@ impl Graph {
                         Storage::Gpu(s) => s,
                         _ => unreachable!(),
                     };
- 
+
                     let mut b1 = stream_clone.launch_builder(&f_bwd);
                     b1.arg(l_data)
                         .arg(&targets_d)
@@ -816,22 +920,6 @@ impl Graph {
                     unsafe { b1.launch(LaunchConfig::for_num_elems(batch_size as u32)) }.unwrap();
                 });
 
-                #[cfg(feature = "bf16")]
-                if cast_to_bf16_after {
-                    let f_cast = self.functions.get("cast_f32_to_bf16").unwrap().clone();
-                    match (&self.tensors[compute_target_id].data, &self.tensors[out_id].data) {
-                        (Storage::Gpu(f32_src), Storage::GpuBf16(bf16_dst)) => {
-                            let mut b = stream.launch_builder(&f_cast);
-                            let n_elem = 1u64;
-                            b.arg(f32_src).arg(bf16_dst).arg(&n_elem);
-                            unsafe { b.launch(LaunchConfig::for_num_elems(1)) }.unwrap();
-                            stream.synchronize().unwrap();
-                        }
-                        _ => {}
-                    }
-                    self.tensors.pop();
-                }
- 
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
                         inputs: vec![logits_id],
@@ -841,19 +929,21 @@ impl Graph {
                 }
                 out_id
             }
- 
+
             Device::Cpu => {
                 // CPU reference path (used by tests / small models).
-                let logits      = &self.tensors[logits_id];
-                let batch_size  = logits.shape[0];
+                let logits = &self.tensors[logits_id];
+                let batch_size = logits.shape[0];
                 let num_classes = logits.shape[1];
                 let logits_data = logits.data.as_cpu().clone();
- 
+
                 let mut out_loss = 0.0_f32;
-                let mut probs    = vec![0.0_f32; batch_size * num_classes];
- 
+                let mut probs = vec![0.0_f32; batch_size * num_classes];
+
                 for b in 0..batch_size {
-                    if targets[b] == IGNORE_INDEX { continue; }
+                    if targets[b] == IGNORE_INDEX {
+                        continue;
+                    }
                     let mut max_val = f32::NEG_INFINITY;
                     for c in 0..num_classes {
                         max_val = max_val.max(logits_data[b * num_classes + c]);
@@ -870,24 +960,28 @@ impl Graph {
                     let p = probs[b * num_classes + targets[b]];
                     out_loss += -(p + 1e-8).ln() * normalizer;
                 }
- 
+
                 let targets_cap = targets.to_vec();
                 let out_id = self.alloc(vec![], vec![out_loss]);
- 
+
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
-                    let o_grad  = tensors[out_id].grad.as_cpu()[0];
-                    let l_grad  = tensors[logits_id].grad.as_cpu_mut();
+                    let o_grad = tensors[out_id].grad.as_cpu()[0];
+                    let l_grad = tensors[logits_id].grad.as_cpu_mut();
                     for b in 0..batch_size {
-                        if targets_cap[b] == IGNORE_INDEX { continue; }
+                        if targets_cap[b] == IGNORE_INDEX {
+                            continue;
+                        }
                         for c in 0..num_classes {
                             let idx = b * num_classes + c;
                             let mut g = probs[idx];
-                            if c == targets_cap[b] { g -= 1.0; }
+                            if c == targets_cap[b] {
+                                g -= 1.0;
+                            }
                             l_grad[idx] += g * normalizer * o_grad;
                         }
                     }
                 });
- 
+
                 if !self.no_grad {
                     self.tape.nodes.push(TapeNode {
                         inputs: vec![logits_id],
