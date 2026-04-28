@@ -221,39 +221,80 @@ impl Graph {
                     "cast_f32_to_bf16",
                     "cast_bf16_to_f32",
                     "cast_bf16_to_f32_accumulate",
+
+                    "scale_bf16",
+                    
                     "matmul_bf16_f32",
                     "matmul_f32_bf16accum_f32",
                     "matmul_f32_bf16rhsaccum_f32",
                     "matmul_backward_a_bf16b_f32",
                     "matmul_trans_b_bf16",
                     "matmul_trans_a_bf16",
+
+                    // matmul pure bf16
+                    "matmul_bf16",
+                    "matmul_backward_a_bf16",
+                    "matmul_backward_b_bf16",
+
+                    "bmm_bf16",
                     "bmm_f32_bf16accum_f32",
+                    "bmm_backward_a_bf16",
+                    "bmm_backward_a_transb_bf16",
+                    "bmm_backward_b_bf16",
+                    "bmm_backward_b_transb_bf16",
+                    
                     "gather_bf16_f32",
+                    "gather_bf16_bf16out",
+                    "gather_backward_bf16",
+
+                    // RMS Norm
                     "rmsnorm_f32_bf16w",
                     "rmsnorm_backward_bf16w_f32",
+                    "rmsnorm_bf16",
+                    "rmsnorm_backward_bf16in_f32",
+                    "rmsnorm_backward_bf16",
+
                     "adamw_step_bf16mom_f32",
                     "adamw_step_bf16w_bf16mom_f32",
+                    "adamw_step_bf16mom",
                     "add_bf16",
                     "add_bf16lhs_f32rhs_bf16out",
                     "accumulate_bf16out",
+                    "accumulate_bf16",
+
                     "mul_bf16",
                     "mul_bf16lhs_f32rhs_bf16out",
                     "mul_backward_bf16in_f32",
                     "mul_backward_bf16lhs_f32rhs",
+                    "mul_backward_bf16",
+
                     "silu_bf16",
                     "silu_backward_bf16in_f32",
+                    "silu_backward_bf16",
+
+                    "sum_bf16",
+                    "sum_backward_bf16",
+
+                    "max_bf16",
+                    "max_backward_bf16",
+
                     "softmax_bf16",
                     "softmax_backward_bf16in_f32",
+                    "softmax_backward_bf16",
+
                     "copy_bf16",
                     "transpose_0213_bf16",
+                    "transpose_0213_backward_bf16",
                     "rope_bf16",
-                    "rmsnorm_bf16",
-                    "rmsnorm_backward_bf16in_f32",
-                    "gather_bf16_bf16out",
+                    "rope_backward_bf16",
                     "bmm_f32_bf16out",
                     "matmul_f32_bf16out",
                     "repeat_kv_bf16",
                     "repeat_kv_backward_bf16",
+                    "cross_entropy_bf16",
+                    "cross_entropy_backward_bf16",
+
+                    "fill_bf16",
                 ];
 
                 for name in names {
@@ -580,20 +621,20 @@ impl Graph {
                 let d_data = stream
                     .clone_htod(u16_data.as_slice())
                     .expect("alloc_param_bf16: htod failed");
-                let d_grad = self.safe_alloc_zeros::<f32>(&stream, size);
+                let d_grad = self.safe_alloc_zeros::<u16>(&stream, size);
                 self.tensors.push(Tensor {
                     id,
                     shape,
                     strides,
                     data: Storage::GpuBf16(d_data),
-                    grad: Storage::Gpu(d_grad),
+                    grad: Storage::GpuBf16(d_grad),
                     device: self.device.clone(),
                     name: None,
                     is_pooled: false,
                 });
                 id
             }
-            Device::Cpu => self.alloc(shape, data),
+            _ => panic!("Only supports GPU!")
         }
     }
 
