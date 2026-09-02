@@ -1,4 +1,5 @@
-use std::io::{Read, Write};
+use std::io::{Read, Write, BufWriter};
+use std::fs::File;
 use std::net::TcpListener;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -48,12 +49,28 @@ pub struct TrainStats {
     pub vocab_size: usize,
     pub hidden_dim: usize,
     pub num_heads: usize,
+    pub num_kv_heads: usize,
+    pub tie_weights: bool,
     pub ffn_dim: usize,
     pub num_layers: usize,
     pub total_params: usize,
     pub history: Vec<StepRecord>,
     pub rss: usize,
     pub gpu_mem: usize,
+}
+
+impl TrainStats {
+    pub fn save_history(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = "./history-log.json";
+        let mut f = BufWriter::new(File::create(path)?);
+        f.write_all("[".as_bytes())?;
+        for record in &self.history {
+            let body = format!("{}\"step\": {}, \"loss\": {}, \"grad_norm\": {}{}", "{", record.step, record.loss, record.grad_norm, "}");
+
+            f.write_all(body.as_bytes())?;
+        }
+        Ok(f.flush()?)
+    }
 }
 
 const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
@@ -470,7 +487,7 @@ setInterval(async () => {
     setRow('s-par', fmt(d.total_params, 2));
     setRow('s-sz', (d.total_params * 2 / 1e9).toFixed(2) + ' GB');
     setRow('s-sz32', (d.total_params * 4 / 1e9).toFixed(2) + ' GB');
-    setRow('s-lh', d.num_layers + ' / ' + d.num_heads);
+    setRow('s-lh', d.num_layers + ' / ' + d.num_heads + ' / ' + d.num_kv_heads);
     setRow('s-hf', d.hidden_dim + ' / ' + d.ffn_dim);
     setRow('s-voc', fmt(d.vocab_size, 1));
 
@@ -549,7 +566,7 @@ pub fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>, bind_addr: &str) {
                             })
                             .collect();
                         let json = format!(
-                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2},"batch_time_ms":{:.2},"total_tokens":{},"grad_norm":{:.6},"grad_clip_coef":{:.6},"accum_steps":{},"seq_len":{},"micro_batch_size":{},"effective_batch":{},"vocab_size":{},"hidden_dim":{},"num_heads":{},"ffn_dim":{},"num_layers":{},"total_params":{},"rss":{},"gpu_mem":{},"history":[{}]}}"#,
+                            r#"{{"step":{},"loss":{:.6},"lr":{:.8},"tps":{:.2},"batch_time_ms":{:.2},"total_tokens":{},"grad_norm":{:.6},"grad_clip_coef":{:.6},"accum_steps":{},"seq_len":{},"micro_batch_size":{},"effective_batch":{},"vocab_size":{},"hidden_dim":{},"num_heads":{},"num_kv_heads":{},"tie_weights":{},"ffn_dim":{},"num_layers":{},"total_params":{},"rss":{},"gpu_mem":{},"history":[{}]}}"#,
                             s.step,
                             s.loss,
                             s.lr,
@@ -565,6 +582,8 @@ pub fn spawn_eisenboard(stats: Arc<RwLock<TrainStats>>, bind_addr: &str) {
                             s.vocab_size,
                             s.hidden_dim,
                             s.num_heads,
+                            s.num_kv_heads,
+                            s.tie_weights,
                             s.ffn_dim,
                             s.num_layers,
                             s.total_params,

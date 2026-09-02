@@ -112,6 +112,8 @@ fn save_hf_bundle(
     ffn_dim: usize,
     num_layers: usize,
     num_heads: usize,
+    num_kv_heads: usize,
+    tie_weights: bool,
     seq_len: usize,
     dir: &str,
 ) {
@@ -128,9 +130,9 @@ fn save_hf_bundle(
             num_hidden_layers: num_layers,
             num_attention_heads: num_heads,
             max_position_embeddings: seq_len,
+            tie_word_embeddings: tie_weights,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
-            tie_word_embeddings: false,
         },
     )
     .expect("Failed to write HF config");
@@ -194,6 +196,8 @@ fn main() {
     let num_heads = env_usize("EISEN_NUM_HEADS", 4);
     let ffn_dim = env_usize("EISEN_FFN_DIM", 336);
     let num_layers = env_usize("EISEN_NUM_LAYERS", 128);
+    let num_kv_heads = env_usize("EISEN_NUM_KV_HEADS", 4);
+    let tie_weights = env_bool("EISEN_TIE_WEIGHTS", true);
 
     // ── Training hyperparameters ─────────────────────────────────────────────
     let seq_len = env_usize("EISEN_SEQ_LEN", 512);
@@ -231,7 +235,7 @@ fn main() {
     println!("\nBuilding model…");
     let mut g = Graph::new(device);
     let model = TransformerLM::new(
-        &mut g, vocab_size, hidden_dim, num_heads, 4, ffn_dim, num_layers, true
+        &mut g, vocab_size, hidden_dim, num_heads, num_kv_heads, ffn_dim, num_layers, tie_weights
     );
     model.tag_parameters(&mut g);
 
@@ -273,8 +277,8 @@ fn main() {
     println!("\nArchitecture summary:");
     println!("Trainable parameters: {}", total_params);
     println!(
-        "  Layers:  {} | Hidden: {} | Heads: {} | FFN: {}",
-        num_layers, hidden_dim, num_heads, ffn_dim
+        "  Layers:  {} | Hidden: {} | Heads: {} | FFN: {} | KV Heads: {}",
+        num_layers, hidden_dim, num_heads, ffn_dim, num_kv_heads
     );
     println!(
         "  Micro-batch: {} | Accum: {} | Effective batch: {}",
@@ -311,6 +315,8 @@ fn main() {
         s.micro_batch_size = micro_batch_size;
         s.accum_steps = accum_steps;
         s.effective_batch = effective_batch;
+        s.tie_weights = tie_weights;
+        s.num_kv_heads = num_kv_heads;
     }
 
     // ── Stability + reproducibility controls ────────────────────────────────
@@ -337,7 +343,7 @@ fn main() {
     }
 
     let run_manifest = format!(
-        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n    \"rss\": {}\n    \"gpu_mem\": {}  }}\n}}",
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"num_kv_heads\": {},\n    \"tie_weights\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {},\n    \"rss\": {},\n    \"gpu_mem\": {}  }}\n}}",
         started_unix,
         run_seed,
         deterministic,
@@ -345,6 +351,8 @@ fn main() {
         epochs,
         hidden_dim,
         num_heads,
+        num_kv_heads,
+        tie_weights,
         ffn_dim,
         num_layers,
         seq_len,
@@ -520,24 +528,27 @@ fn main() {
             board_timer = Instant::now();
         }
 
-        /*
         // ── Checkpoint ────────────────────────────────────────────────────────
         if avg_loss < best_loss && !avg_loss.is_nan() {
             println!("🚀 NEW BEST LOSS: {:.4} (previous was {:.4})", avg_loss, best_loss);
             best_loss = avg_loss;
             save_weights(&g, output_path);
             save_hf_bundle(
-                &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len,
+                &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads,
+                num_kv_heads, tie_weights, seq_len,
                 hf_out_dir,
             );
+            if let Ok(mut s) = shared_stats.write() {
+                s.save_history();
+            }
         }
-        */
     }
 
     // Final save
     save_weights(&g, output_path);
     save_hf_bundle(
-        &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads, seq_len, hf_out_dir,
+        &g, &model, vocab_size, hidden_dim, ffn_dim, num_layers, num_heads,
+        num_kv_heads, tie_weights, seq_len, hf_out_dir,
     );
 
     // ── Generation smoke test ─────────────────────────────────────────────────
@@ -577,7 +588,7 @@ fn main() {
         .unwrap()
         .as_secs();
     let completed_manifest = format!(
-        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
+        "{{\n  \"phase\": 8,\n  \"started_unix\": {},\n  \"seed\": {},\n  \"deterministic\": {},\n  \"grad_clip_max_norm\": {:.6},\n  \"hyperparams\": {{\n    \"epochs\": {},\n    \"hidden_dim\": {},\n    \"num_heads\": {},\n    \"num_kv_heads\": {},\n    \"tie_weights\": {},\n    \"ffn_dim\": {},\n    \"num_layers\": {},\n    \"seq_len\": {},\n    \"micro_batch_size\": {},\n    \"accum_steps\": {},\n    \"effective_batch\": {},\n    \"lr_max\": {:.8},\n    \"lr_min\": {:.8},\n    \"warmup_steps\": {},\n    \"total_steps\": {}\n  }}\n}}",
         started_unix,
         run_seed,
         deterministic,
@@ -585,6 +596,8 @@ fn main() {
         epochs,
         hidden_dim,
         num_heads,
+        num_kv_heads,
+        tie_weights,
         ffn_dim,
         num_layers,
         seq_len,

@@ -29,6 +29,8 @@ struct Hyperparams {
     ffn_dim: usize,
     num_layers: usize,
     seq_len: usize,
+    num_kv_heads: usize,
+    tie_weights: bool,
 }
 
 // --- Advanced Sampling Configuration & Logic ---
@@ -55,10 +57,11 @@ impl Default for SamplerConfig {
 pub fn sample_logits(logits: &mut [f32], context: &[usize], config: &SamplerConfig) -> usize {
     // 1. Repetition Penalty
     if config.repetition_penalty != 1.0 {
-        for &token_id in context {
+        let mut unique_context = context.to_vec();
+        unique_context.sort_unstable();
+        unique_context.dedup();
+        for &token_id in &unique_context {
             let score = logits[token_id];
-            // If score is negative, multiply to penalize (make more negative). 
-            // If positive, divide to penalize (make closer to 0).
             logits[token_id] = if score < 0.0 {
                 score * config.repetition_penalty
             } else {
@@ -169,7 +172,7 @@ fn load_weights(g: &mut Graph, params: &[usize], path: &str) {
     for &p_id in params {
         let size = g.tensors[p_id].size();
         if offset + size > raw_floats.len() {
-            panic!("Weight file is truncated! Expected more than {} floats.", raw_floats.len());
+            panic!("Weight file is truncated! Expected more than {} floats [for sure {}].", raw_floats.len(), offset + size);
         }
         let chunk = &raw_floats[offset..offset + size];
         g.load_tensor_data(p_id, chunk); 
@@ -222,15 +225,23 @@ fn main() {
     let num_heads = manifest.hyperparams.num_heads;
     let num_layers = manifest.hyperparams.num_layers;
     let ffn_dim = manifest.hyperparams.ffn_dim;
+    let num_kv_heads = manifest.hyperparams.num_kv_heads;
+    let tie_weights = manifest.hyperparams.tie_weights;
 
     println!("Loaded Architecture: Layers={}, Hidden={}, Heads={}, FFN={}, SeqLen={}", 
              num_layers, hidden_dim, num_heads, ffn_dim, seq_len);
 
     let mut g = Graph::new(device);
-    let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, num_heads, ffn_dim, num_layers, false);
+    //let model = TransformerLM::new(&mut g, vocab_size, hidden_dim, num_heads, num_heads, ffn_dim, num_layers, false);
     
     // CRITICAL FIX: Lock parameters so clear_activations doesn't delete them!
-    g.mark_params(); 
+    //g.mark_params(); 
+    let model = TransformerLM::new(
+        &mut g, vocab_size, hidden_dim, num_heads, num_kv_heads, ffn_dim, num_layers, tie_weights
+    );
+    model.tag_parameters(&mut g);
+
+    g.mark_params();
     
     // Disable autograd tracking for inference to save memory
     g.no_grad = true;
