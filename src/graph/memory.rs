@@ -435,6 +435,15 @@ impl Graph {
 
         // Pull from the appropriate pool
         match self.tensors[id].data {
+            Storage::Cpu(_) => {
+                let grad_slice = self.safe_alloc_zeros::<f32>(&stream, size);
+                self.tensors[id].grad = Storage::Gpu(grad_slice);
+            }
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(_) => {
+                let grad_slice = self.safe_alloc_zeros::<u16>(&stream, size);
+                self.tensors[id].grad = Storage::GpuBf16(grad_slice);
+            }
             Storage::Gpu(_) => {
                 let grad_slice = self.safe_alloc_zeros::<f32>(&stream, size);
                 self.tensors[id].grad = Storage::Gpu(grad_slice);

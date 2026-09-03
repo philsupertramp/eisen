@@ -80,7 +80,7 @@ pub fn bf16_to_f32_temp(
 pub fn is_bf16(s: &Storage) -> bool {
     #[cfg(feature = "bf16")]
     {
-        matches!(s, Storage::GpuBf16(_))
+        matches!(s, Storage::GpuBf16(_) | Storage::CpuBf16(_))
     }
     #[cfg(not(feature = "bf16"))]
     {

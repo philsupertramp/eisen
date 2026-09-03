@@ -294,7 +294,14 @@ impl GroupedQueryAttention {
         let seq_len = shape[1];
 
         #[cfg(feature = "bf16")]
-        assert_eq!(match g.tensors[self.q_proj.weight_id].data { Storage::Gpu(_) => "GPU", Storage::GpuBf16(_) => "GpuBf16", _ => "Other" }, "GpuBf16" );
+        assert_eq!(
+            match g.tensors[self.q_proj.weight_id].data {
+                Storage::Gpu(_) => "GPU",
+                Storage::GpuBf16(_) | Storage::CpuBf16(_) => "Bf16",
+                _ => "Other"
+            },
+            "Bf16"
+        );
 
         // 1. Projections -> Q is [B, S, HDim], K/V are [B, S, KVDim]
         let q_id = self.q_proj.forward(g, x_id);

@@ -493,7 +493,7 @@ impl Graph {
                         cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
                     Storage::GpuBf16(slice)
                 }
-                Device::Cpu => Storage::Cpu(vec![0.0; size]), // CPU always FP32
+                Device::Cpu => Storage::CpuBf16(vec![0u16; size]),
             }
         } else {
             // FP32 path — same as original

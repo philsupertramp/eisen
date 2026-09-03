@@ -11,8 +11,13 @@ fn matmul_kernels(
 ) -> (CudaFunction, CudaFunction, CudaFunction) 
 {
     #[cfg(feature = "bf16")]
-    match (is_bf16(a), is_bf16(b)) {
-        (true, true) => (
+    match (is_bf16(a), is_bf16(b), b) {
+        (true, true, Storage::GpuBf16(_)) => (
+            functions["matmul_bf16"].clone(),
+            functions["matmul_backward_a_bf16"].clone(),
+            functions["matmul_backward_b_bf16"].clone(),
+        ),
+        (true, true, Storage::CpuBf16(_)) => (
             functions["matmul_bf16"].clone(),
             functions["matmul_backward_a_bf16"].clone(),
             functions["matmul_backward_b_bf16"].clone(),
@@ -33,13 +38,16 @@ fn matmul_kernels(
 
 impl Graph {
     pub fn matmul(&mut self, a_id: usize, b_id: usize) -> usize {
+        #[cfg(feature = "bf16")]
+        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_) | Storage::CpuBf16(_));
+        #[cfg(not(feature = "bf16"))]
         let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
         #[cfg(feature = "bf16")]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
         #[cfg(not(feature = "bf16"))]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_));
 
-        if a_is_gpu && b_is_cpu {
+        if a_is_gpu || b_is_cpu {
             println!("STREAMING!");
             return self.matmul_streamed(a_id, b_id);
         }
@@ -420,7 +428,7 @@ impl Graph {
 
     #[cfg(feature = "bf16")]
     pub fn matmul_bf16(&mut self, a_id: usize, b_id: usize) -> usize {
-        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_) | Storage::CpuBf16(_));
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
 
         if a_is_gpu && b_is_cpu {
@@ -696,11 +704,9 @@ impl Graph {
             &self.tensors[b_id].data,
         );
         let stream_bwd = stream.clone();
-
-        let b_f32_fwd = self.tensors[b_id].data.to_f32_vec();
-        let b_temp_fwd = stream.clone_htod(b_f32_fwd.as_slice()).unwrap_or_else(|err| {
-            panic!("matmul_streamed: forward htod failed for size {}: {:?}", b_f32_fwd.len(), err)
-        });
+        let mut b_temp_storage = None;
+        #[cfg(feature = "bf16")]
+        let mut b_temp_storage_bf16 = None;
 
         let out_id = self.alloc_pooled(vec![m, n]);
         self.name_tensor(out_id, "tmp_matmul_streamed_out");
@@ -708,38 +714,78 @@ impl Graph {
         let m_u64 = m as u64;
         let k_u64 = k as u64;
         let n_u64 = n as u64;
-        
         let cfg_fwd = LaunchConfig {
             grid_dim: ((n as u32 + 15) / 16, (m as u32 + 15) / 16, 1),
             block_dim: (16, 16, 1),
             shared_mem_bytes: 0,
         };
         let mut builder = stream.launch_builder(&f_fwd);
-        match (
-            &self.tensors[a_id].data,
-            &self.tensors[b_id].data,
-            &self.tensors[out_id].data,
-        ) {
-            (Storage::Gpu(a_s), Storage::Gpu(b_temp_fwd), Storage::Gpu(o_s)) => {
-                builder
-                    .arg(a_s)
-                    .arg(b_temp_fwd)
-                    .arg(o_s)
-                    .arg(&m_u64)
-                    .arg(&k_u64)
-                    .arg(&n_u64);
-            }
+
+        if is_bf16(&self.tensors[a_id].data) || is_bf16(&self.tensors[b_id].data) {
+            /* TODO (pze): This is currently broken
+             *              - should assert that both values are bf16
+             *              - move both to the same device - preferrably the gpu
+             *              - register forward pass
+             *              - register args for both
+             */
             #[cfg(feature = "bf16")]
-            (Storage::GpuBf16(a_s), Storage::GpuBf16(b_temp_fwd), Storage::GpuBf16(o_s)) => {
+            {
+                let b_slice = match &self.tensors[b_id].data {
+                    Storage::GpuBf16(s) => s,
+                    Storage::CpuBf16(cpu_vec) => {
+                        println!("converting..");
+                        // HTOD copy for the u16 BF16 data
+                        let gpu_slice = self.alloc_param_bf16(cpu_vec.shape, cpu_vec.as_slice());
+                        b_temp_storage_bf16 = Some(gpu_slice);
+                        b_temp_storage_bf16.as_ref().unwrap()
+                    },
+                    _ => panic!("Expected b to be GpuBf16 or CpuBf16"),
+                };
+                // 2. Extract a (assuming it is already GpuBf16)
+                let a_slice = match &self.tensors[a_id].data {
+                    Storage::GpuBf16(s) => s,
+                    _ => panic!("Expected a to be GpuBf16"),
+                };
+                let o_slice = match &self.tensors[out_id].data {
+                    Storage::GpuBf16(s) => s,
+                    _ => panic!("Expected o to be GpuBf16"),
+                };
                 builder
-                    .arg(a_s)
-                    .arg(b_temp_fwd)
-                    .arg(o_s)
+                    .arg(a_slice)
+                    .arg(b_slice)
+                    .arg(o_slice)
                     .arg(&m_u64)
                     .arg(&k_u64)
                     .arg(&n_u64);
             }
-            (s1, s2, s3) => unreachable!("matmul_streamed: Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
+        } else {
+            println!("PLAN B");
+            let gpu_slice = self.alloc(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_f32_vec());
+            let b_slice = match &self.tensors[b_id].data {
+                Storage::Gpu(s) => s,
+                Storage::Cpu(cpu_vec) => {
+                    println!("converting..");
+                    b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::Gpu(v) => v, _ => panic!("INVALID")});
+                    b_temp_storage.as_ref().unwrap()
+
+                },
+                _ => panic!("Expected b to be Gpu or Cpu"),
+            };
+            match (
+                &self.tensors[a_id].data,
+                &self.tensors[out_id].data,
+            ) {
+                (Storage::Gpu(a_s), Storage::Gpu(o_s)) => {
+                    builder
+                        .arg(a_s)
+                        .arg(b_slice)
+                        .arg(o_s)
+                        .arg(&m_u64)
+                        .arg(&k_u64)
+                        .arg(&n_u64);
+                }
+                (s1, s2) => unreachable!("matmul_streamed: Wrong storage types [{:?}, {:?}]", s1, s2)
+            }
         }
         unsafe { builder.launch(cfg_fwd) }.unwrap_or_else(|err| {
             panic!("matmul_streamed forward kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_fwd.grid_dim, cfg_fwd.block_dim)
@@ -1004,6 +1050,7 @@ impl Graph {
     }
     
     pub fn bmm(&mut self, a_id: usize, b_id: usize, trans_b: bool) -> usize {
+        println!("bmm");
         let a_shape = self.tensors[a_id].shape.clone();
         let b_shape = self.tensors[b_id].shape.clone();
         let batch = a_shape[0];

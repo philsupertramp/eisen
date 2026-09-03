@@ -240,28 +240,33 @@ impl Graph {
                 self.name_tensor(out_id, "mul_output");
 
                 let n = out_size as u64;
+                let mut b_temp_storage = None;
+                #[cfg(feature = "bf16")]
+                let mut b_temp_storage_bf16 = None;
+                #[cfg(feature = "bf16")]
+                let gpu_slice = self.alloc_param_bf16(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_vec());
+                #[cfg(not(feature = "bf16"))]
+                let gpu_slice = self.alloc(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_f32_vec());
+                b_temp_storage = Some(gpu_slice);
+                let b_slice = b_temp_storage.as_ref().unwrap();
+
 
                 {
                     let mut builder = stream.launch_builder(&f_fwd);
                     match (
                         &self.tensors[a_id].data,
-                        &self.tensors[b_id].data,
                         &self.tensors[out_id].data,
                     ) {
-                        (Storage::Gpu(a), Storage::Gpu(b), Storage::Gpu(o)) => {
-                            builder.arg(a).arg(b).arg(o).arg(&n);
+                        (Storage::Gpu(a), Storage::Gpu(o)) => {
+                            builder.arg(a).arg(b_slice).arg(o).arg(&n);
                         }
                         #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(a), Storage::GpuBf16(b), Storage::GpuBf16(o)) => {
-                            builder.arg(a).arg(b).arg(o).arg(&n);
+                        (Storage::GpuBf16(a), Storage::GpuBf16(o)) => {
+                            builder.arg(a).arg(b_slice).arg(o).arg(&n);
                         }
-                        #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(a), Storage::Gpu(b), Storage::GpuBf16(o)) => {
-                            builder.arg(a).arg(b).arg(o).arg(&n);
-                        }
-                        (p1, p2, p3) => panic!(
-                            "mul: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
-                            p1, p2, p3
+                        (p1, p2) => panic!(
+                            "mul: unsupported storage combination. Received: ({:?}, {:?})",
+                            p1, p2
                         ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();

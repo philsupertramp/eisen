@@ -923,24 +923,27 @@ extern "C" __global__ void cross_entropy_backward_bf16(
 
 // ── MATMUL BF16 OUTPUT ───────────────────────────────────────────────────────
 extern "C" __global__ void matmul_bf16(
-    const __nv_bfloat16* a, const __nv_bfloat16* b, float* out,
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out,
     const size_t m, const size_t k, const size_t n
 ) {
     __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
 
-    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
-    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    // Force all indexing coordinates to 64-bit size_t to prevent offset overflow
+    size_t row = (size_t)blockIdx.y * TILE_SIZE + threadIdx.y;
+    size_t col = (size_t)blockIdx.x * TILE_SIZE + threadIdx.x;
+    
     float sum = 0.0f;
 
-    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
-        int a_col = t * TILE_SIZE + threadIdx.x;
-        int b_row = t * TILE_SIZE + threadIdx.y;
+    for (size_t t = 0; t < (k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        size_t a_col = t * TILE_SIZE + threadIdx.x;
+        size_t b_row = t * TILE_SIZE + threadIdx.y;
 
-        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+        tile_A[threadIdx.y][threadIdx.x] = (row < m && a_col < k)
             ? a[row * k + a_col]
             : __float2bfloat16(0.0f);
-        tile_B[threadIdx.y][threadIdx.x] = (b_row < (int)k && col < (int)n)
+            
+        tile_B[threadIdx.y][threadIdx.x] = (b_row < k && col < n)
             ? b[b_row * n + col]
             : __float2bfloat16(0.0f);
 
@@ -954,8 +957,8 @@ extern "C" __global__ void matmul_bf16(
         __syncthreads();
     }
 
-    if (row < (int)m && col < (int)n) {
-        out[row * n + col] = sum;
+    if (row < m && col < n) {
+        out[row * n + col] = __float2bfloat16(sum); 
     }
 }
 
