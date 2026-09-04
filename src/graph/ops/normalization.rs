@@ -1,4 +1,4 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
+use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice};
 
@@ -39,6 +39,7 @@ impl Graph {
                     self.functions.get("rmsnorm_backward_f32").unwrap().clone(),
                 );
 
+                #[cfg(feature = "bf16")]
                 let b_u16_slice: CudaSlice<u16>;
                 let out_id = self.alloc_pooled(x.shape.clone());
                 self.name_tensor(out_id, "rmsnorm_output");

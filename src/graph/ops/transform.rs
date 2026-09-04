@@ -1,7 +1,6 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
+use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig};
-use crate::safe_bf16_temp;
 
 impl Graph {
     pub fn transpose_0213(&mut self, a_id: usize) -> usize {

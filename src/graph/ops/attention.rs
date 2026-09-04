@@ -1,7 +1,6 @@
-use crate::graph::{Graph, is_bf16};
-use crate::tensor::{Tensor, Device, Storage};
+use crate::graph::{Graph};
+use crate::tensor::{Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig};
-use crate::safe_bf16_temp;
 
 impl Graph {
     pub fn flash_attention(

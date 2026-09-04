@@ -207,7 +207,6 @@ impl Tensor {
             #[cfg(feature = "bf16")]
             Storage::GpuBf16(s) => {},
             Storage::Gpu(s) => {},
-            _ => unreachable!("sync_to_gpu: data must be Gpu or GpuBf16"),
         }
         match &self.grad {
             #[cfg(feature = "bf16")]
@@ -222,7 +221,6 @@ impl Tensor {
                 stream.clone_htod(s.as_slice())
                     .expect("Failed to copy data to VRAM");
             },
-            _ => unreachable!("sync_to_gpu: data must be Gpu or GpuBf16"),
         }
     }
 

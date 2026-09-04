@@ -1,5 +1,4 @@
 use crate::graph::{Graph, TapeNode, is_bf16};
-use crate::safe_bf16_temp;
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig, CudaFunction};
 use std::collections::HashMap;
@@ -693,7 +692,7 @@ impl Graph {
             "matmul_streamed: lhs last dim must equal rhs first dim"
         );
 
-        let (gpu_device, stream) = match &self.device {
+        let (_gpu_device, stream) = match &self.device {
             Device::Gpu(d, s) => (d.clone(), s.clone()),
             Device::Cpu => unreachable!("matmul_streamed called on CPU graph"),
         };
@@ -730,13 +729,13 @@ impl Graph {
              */
             #[cfg(feature = "bf16")]
             {
+                let gpu_slice = self.alloc_param_bf16(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_f32_vec());
                 let b_slice = match &self.tensors[b_id].data {
                     Storage::GpuBf16(s) => s,
                     Storage::CpuBf16(cpu_vec) => {
                         println!("converting..");
                         // HTOD copy for the u16 BF16 data
-                        let gpu_slice = self.alloc_param_bf16(cpu_vec.shape, cpu_vec.as_slice());
-                        b_temp_storage_bf16 = Some(gpu_slice);
+                        b_temp_storage_bf16 = Some(match &self.tensors[gpu_slice].data {Storage::GpuBf16(v) => v, _ => panic!("INVALID")});
                         b_temp_storage_bf16.as_ref().unwrap()
                     },
                     _ => panic!("Expected b to be GpuBf16 or CpuBf16"),
@@ -760,12 +759,11 @@ impl Graph {
             }
         } else {
             println!("PLAN B");
-            let gpu_slice = self.alloc(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_f32_vec());
             let b_slice = match &self.tensors[b_id].data {
                 Storage::Gpu(s) => s,
                 Storage::Cpu(cpu_vec) => {
                     println!("converting..");
-                    b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::Gpu(v) => v, _ => panic!("INVALID")});
+                    b_temp_storage = Some(match &self.tensors[b_id].data {Storage::Gpu(v) => v, _ => panic!("INVALID")});
                     b_temp_storage.as_ref().unwrap()
 
                 },
@@ -898,7 +896,7 @@ impl Graph {
             "matmul_trans_b_streamed: lhs last dim must equal rhs last dim (k)"
         );
 
-        let (gpu_device, stream) = match &self.device {
+        let (_gpu_device, stream) = match &self.device {
             Device::Gpu(d, s) => (d.clone(), s.clone()),
             Device::Cpu => unreachable!("matmul_trans_b_streamed called on CPU graph"),
         };

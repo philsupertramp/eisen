@@ -1,5 +1,5 @@
 use crate::graph::Graph;
-use crate::tensor::{bf16u_to_f32, f32_to_bf16u, Device, Storage};
+use crate::tensor::{Device, Storage};
 use std::collections::HashSet;
 
 // ── StreamingReport ────────────────────────────────────────────────────────────

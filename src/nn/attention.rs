@@ -1,7 +1,6 @@
 use crate::graph::Graph;
 use crate::nn::linear::Linear;
 use crate::nn::Module;
-use crate::tensor::Storage;
 
 /// Attention module.
 /// Configured for Single-Head Attention (num_heads=1) to fit our 3D tensor limits

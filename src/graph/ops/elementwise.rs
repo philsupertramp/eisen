@@ -1,6 +1,6 @@
-use crate::graph::{Graph, TapeNode, is_bf16};
+use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
-use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice, CudaFunction};
+use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice};
 
 
 impl Graph {
@@ -242,36 +242,98 @@ impl Graph {
                 let n = out_size as u64;
                 let mut b_temp_storage = None;
                 #[cfg(feature = "bf16")]
-                let mut b_temp_storage_bf16 = None;
-                #[cfg(feature = "bf16")]
-                let gpu_slice = self.alloc_param_bf16(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_vec());
-                #[cfg(not(feature = "bf16"))]
-                let gpu_slice = self.alloc(self.tensors[b_id].shape.clone(), self.tensors[b_id].data.clone().to_f32_vec());
-                b_temp_storage = Some(gpu_slice);
-                let b_slice = b_temp_storage.as_ref().unwrap();
-
-
                 {
-                    let mut builder = stream.launch_builder(&f_fwd);
-                    match (
-                        &self.tensors[a_id].data,
-                        &self.tensors[out_id].data,
-                    ) {
-                        (Storage::Gpu(a), Storage::Gpu(o)) => {
-                            builder.arg(a).arg(b_slice).arg(o).arg(&n);
+                    let mut b_temp_storage_bf16 = None;
+                    let gpu_slice = self.alloc_pooled(self.tensors[b_id].shape.clone());
+                    self.load_tensor_data(gpu_slice, &self.tensors[b_id].data.to_f32_vec());
+                    if is_bf16(&self.tensors[a_id].data) || is_bf16(&self.tensors[b_id].data) {
+                        let b_slice = match &self.tensors[b_id].data {
+                            Storage::GpuBf16(s) => s,
+                            Storage::CpuBf16(cpu_vec) => {
+                                println!("converting..");
+                                // HTOD copy for the u16 BF16 data
+                                b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::GpuBf16(v) => v, _ => panic!("INVALID")});
+                                b_temp_storage_bf16.as_ref().unwrap()
+                            },
+                            _ => panic!("Expected b to be GpuBf16 or CpuBf16"),
+                        };
+                        {
+                            let mut builder = stream.launch_builder(&f_fwd);
+                            match (
+                                &self.tensors[a_id].data,
+                                &self.tensors[out_id].data,
+                            ) {
+                                #[cfg(feature = "bf16")]
+                                (Storage::GpuBf16(a), Storage::GpuBf16(o)) => {
+                                    builder.arg(a).arg(b_slice).arg(o).arg(&n);
+                                }
+                                (p1, p2) => panic!(
+                                    "mul: unsupported storage combination. Received: ({:?}, {:?})",
+                                    p1, p2
+                                ),
+                            }
+                            unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                         }
-                        #[cfg(feature = "bf16")]
-                        (Storage::GpuBf16(a), Storage::GpuBf16(o)) => {
-                            builder.arg(a).arg(b_slice).arg(o).arg(&n);
+                    } else {
+                        let b_slice = match &self.tensors[b_id].data {
+                            Storage::Gpu(s) => s,
+                            Storage::Cpu(cpu_vec) => {
+                                println!("converting..");
+                                // HTOD copy for the u16 BF16 data
+                                b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::Gpu(v) => v, _ => panic!("INVALID")});
+                                b_temp_storage.as_ref().unwrap()
+                            },
+                            _ => panic!("Expected b to be Gpu or Cpu"),
+                        };
+                        {
+                            let mut builder = stream.launch_builder(&f_fwd);
+                            match (
+                                &self.tensors[a_id].data,
+                                &self.tensors[out_id].data,
+                            ) {
+                                (Storage::Gpu(a), Storage::Gpu(o)) => {
+                                    builder.arg(a).arg(b_slice).arg(o).arg(&n);
+                                }
+                                (p1, p2) => panic!(
+                                    "mul: unsupported storage combination. Received: ({:?}, {:?})",
+                                    p1, p2
+                                ),
+                            }
+                            unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                         }
-                        (p1, p2) => panic!(
-                            "mul: unsupported storage combination. Received: ({:?}, {:?})",
-                            p1, p2
-                        ),
                     }
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 }
-
+                #[cfg(not(feature = "bf16"))]
+                {
+                    let gpu_slice = self.alloc_pooled(self.tensors[b_id].shape.clone());
+                    self.load_tensor_data(gpu_slice, &self.tensors[b_id].data.to_f32_vec());
+                    let b_slice = match &self.tensors[b_id].data {
+                        Storage::Gpu(s) => s,
+                        Storage::Cpu(cpu_vec) => {
+                            println!("converting..");
+                            // HTOD copy for the u16 BF16 data
+                            b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::Gpu(v) => v, _ => panic!("INVALID")});
+                            b_temp_storage.as_ref().unwrap()
+                        },
+                        _ => panic!("Expected b to be Gpu or Cpu"),
+                    };
+                    {
+                        let mut builder = stream.launch_builder(&f_fwd);
+                        match (
+                            &self.tensors[a_id].data,
+                            &self.tensors[out_id].data,
+                        ) {
+                            (Storage::Gpu(a), Storage::Gpu(o)) => {
+                                builder.arg(a).arg(b_slice).arg(o).arg(&n);
+                            }
+                            (p1, p2) => panic!(
+                                "mul: unsupported storage combination. Received: ({:?}, {:?})",
+                                p1, p2
+                            ),
+                        }
+                        unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                    }
+                }
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let mut builder = stream_clone.launch_builder(&f_bwd);
                     match (

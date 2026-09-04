@@ -1,6 +1,5 @@
 use crate::data::fim::IGNORE_INDEX;
-use crate::graph::{is_bf16, Graph, TapeNode};
-use crate::safe_bf16_temp;
+use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Device, Storage, Tensor};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 

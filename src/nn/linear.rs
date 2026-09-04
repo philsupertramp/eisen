@@ -8,7 +8,6 @@ pub struct Linear {
 
 impl Linear {
     pub fn new(g: &mut Graph, in_features: usize, out_features: usize, use_bias: bool) -> Self {
-        let limit = (6.0f32 / (in_features as f32 + out_features as f32)).sqrt();
         let weight_len = in_features * out_features;
         let mut weight_data = vec![0.0; weight_len];
 
