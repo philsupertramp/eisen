@@ -1,6 +1,7 @@
-use crate::graph::{Graph};
-use crate::tensor::{Device, Storage};
+use crate::graph::{Graph, is_bf16};
+use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig};
+use crate::safe_bf16_temp;
 
 impl Graph {
     pub fn flash_attention(
@@ -54,7 +55,10 @@ impl Graph {
                         strides: Tensor::compute_strides(&[batch, m, d]),
                         data: Storage::Gpu(f32_slice),
                         grad: Storage::Gpu(grad_slice),
-                        device: self.device.clone(), name: None, is_pooled: false,
+                        device: self.device.clone(),
+                        name: None,
+                        is_pooled: false,
+                        is_param: true,
                     });
                     (tmp_id, true)
                 } else {
@@ -187,7 +191,7 @@ impl Graph {
                     }
                 }
 
-                self.alloc(vec![batch, m, d], out)
+                self.alloc_pooled_with_data(vec![batch, m, d], &out)
             }
         }
     }

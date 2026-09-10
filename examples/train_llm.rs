@@ -249,6 +249,7 @@ fn save_hf_bundle(
             hidden_size: hidden_dim,
             intermediate_size: ffn_dim,
             num_hidden_layers: num_layers,
+            num_key_value_heads: num_kv_heads,
             num_attention_heads: num_heads,
             max_position_embeddings: seq_len,
             tie_word_embeddings: tie_weights,
@@ -267,7 +268,10 @@ fn main() {
     println!("║  Eisen Engine — 1.07B Parameter Pre-Training            ║");
     println!("╚══════════════════════════════════════════════════════════╝");
 
-    let device = setup_gpu();
+    let device = match env::var("CUDA_DEVICE_VISIBLE").as_deref() {
+        Ok("-1") | Ok("") => Device::Cpu,
+        Ok(_)  | Err(_) => setup_gpu(),
+    };
     let shared_stats = Arc::new(RwLock::new(TrainStats::default()));
     let board_bind = env::var("EISEN_BOARD_BIND").unwrap_or_else(|_| "0.0.0.0:8080".to_string());
     spawn_eisenboard(shared_stats.clone(), &board_bind);

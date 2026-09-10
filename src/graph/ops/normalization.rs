@@ -2,6 +2,8 @@ use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice};
 
+#[cfg(feature = "bf16")]
+use crate::graph::is_bf16;
 
 impl Graph {
 
@@ -104,6 +106,12 @@ impl Graph {
                                 .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
                         }
                         #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(x_s), Storage::GpuBf16(w_s), Storage::Gpu(out_grad), Storage::Gpu(x_grad), Storage::GpuBf16(w_grad)) => {
+                            builder.arg(x_s).arg(w_s).arg(out_grad)
+                                .arg(x_grad).arg(w_grad)
+                                .arg(&dim_u64).arg(&eps).arg(&num_vecs_u64);
+                        }
+                        #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(x_s), Storage::GpuBf16(w_s), Storage::GpuBf16(out_grad), Storage::GpuBf16(x_grad), Storage::GpuBf16(w_grad)) => {
                             builder.arg(x_s).arg(w_s).arg(out_grad)
                                 .arg(x_grad).arg(w_grad)
@@ -143,7 +151,7 @@ impl Graph {
                     }
                 }
 
-                let out_id = self.alloc(x.shape.clone(), out_data);
+                let out_id = self.alloc_pooled_with_data(x.shape.clone(), &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
                     for n in 0..num_vecs {

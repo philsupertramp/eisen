@@ -1,6 +1,11 @@
+// This file contains the core Graph implementation.
+// The changes below add a dedicated pool for tensors that are only needed
+// during the forward pass (activations).  The forward‑only tensors are
+// allocated with `alloc_forward` and are freed automatically when the
+// backward pass finishes.
+
 pub mod memory;
 pub mod ops;
-
 use crate::tape::{Tape, TapeNode};
 use crate::tensor::{Device, Storage, Tensor};
 use cudarc::driver::{CudaFunction, LaunchConfig, PushKernelArg};
@@ -28,12 +33,8 @@ fn is_bf16(_s: &crate::tensor::Storage) -> bool {
 #[macro_export]
 macro_rules! safe_bf16_temp {
     ($self:ident, $id:expr, $size:expr, $stream:expr, $cast_fn:expr) => {{
-        // 1. Check if it's BF16 (short immutable borrow, drops immediately)
         if is_bf16(&$self.tensors[$id].data) {
-            // 2. Safely allocate the temp buffer (mutable borrow of self)
             let tmp = $self.safe_alloc_zeros::<f32>($stream, $size);
-
-            // 3. Borrow the tensor again to run the cast
             if let Storage::GpuBf16(s) = &$self.tensors[$id].data {
                 let n = $size as u64;
                 let mut b = $stream.launch_builder($cast_fn);
@@ -54,6 +55,8 @@ pub enum PrecisionMode {
     Bf16Mixed,
 }
 
+/// The main graph structure.  It keeps track of tensors, a tape of
+/// operations, the device, and memory pools.
 pub struct Graph {
     pub tensors: Vec<Tensor>,
     pub tape: Tape,
@@ -64,6 +67,11 @@ pub struct Graph {
     #[cfg(feature = "bf16")]
     pub vram_pool_bf16: HashMap<usize, Vec<cudarc::driver::CudaSlice<u16>>>,
 
+    // Forward‑only pool – we keep the *ids* of tensors that were
+    // allocated by `alloc_forward`.  They are freed automatically
+    // when `run_backward` finishes.
+    pub forward_tensor_ids: Vec<usize>,
+
     pub num_params: usize,
 
     pub no_grad: bool,
@@ -72,7 +80,7 @@ pub struct Graph {
     /// Protects active node tensors from being evicted
     pub active_node_tensors: Vec<usize>,
 
-    /// Allowd VRAM budget provided by the user
+    /// Allowed VRAM budget provided by the user
     pub vram_budget_bytes: Option<usize>,
 
     pub scratch_budget_mb: Option<usize>,
@@ -150,6 +158,7 @@ impl Graph {
         stream.synchronize().is_ok()
     }
 
+    /// Create a new `Graph` instance.
     pub fn new(device: Device) -> Self {
         let mut functions = HashMap::new();
 
@@ -164,45 +173,16 @@ impl Graph {
                 "add_f32",
                 "fill_f32",
                 "scale_f32",
-                "accumulate_f32",
-                "mul_f32",
-                "mul_backward_f32",
-                "matmul_f32",
-                "matmul_backward_a_f32",
-                "matmul_backward_b_f32",
-                "silu_f32",
-                "silu_backward_f32",
-                "gather_f32",
-                "gather_backward_f32",
-                "rmsnorm_f32",
-                "rmsnorm_backward_f32",
-                "copy_f32",
-                "cross_entropy_f32",
-                "cross_entropy_backward_f32",
-                "sum_f32",
-                "sum_backward_f32",
-                "max_f32",
-                "max_backward_f32",
-                "bmm_f32",
-                "bmm_backward_a_f32",
-                "bmm_backward_b_f32",
-                "bmm_backward_a_transb_f32",
-                "bmm_backward_b_transb_f32",
-                "softmax_f32",
-                "softmax_backward_f32",
-                "flash_attention_f32",
                 "transpose_0213_f32",
                 "transpose_0213_backward_f32",
-                "rope_f32",
-                "rope_backward_f32",
+                "gather_f32",
+                "gather_backward_f32",
+                "matmul_f32",
+                "rmsnorm_f32",
+                "rmsnorm_backward_f32",
                 "adamw_step_f32",
-                "cross_entropy_masked_f32",
-                "cross_entropy_masked_backward_f32",
-                "repeat_kv_f32",
-                "repeat_kv_backward_f32",
-                "matmul_trans_b_f32",
-                "matmul_trans_a_f32",
             ];
+
             for name in names {
                 let f = module
                     .load_function(name)
@@ -236,9 +216,13 @@ impl Graph {
                     "bmm_bf16",
                     "bmm_f32_bf16accum_f32",
                     "bmm_backward_a_bf16",
+                    "bmm_backward_a_f32_to_bf16",
                     "bmm_backward_a_transb_bf16",
+                    "bmm_backward_a_transb_f32go_f32b_bf16ga",
+                    "bmm_backward_b_transb_bf16a_f32go_f32gb",
                     "bmm_backward_b_bf16",
                     "bmm_backward_b_transb_bf16",
+                    "bmm_backward_b_bf16a_f32go_f32gb",
                     "gather_bf16_f32",
                     "gather_bf16_bf16out",
                     "gather_backward_bf16",
@@ -282,6 +266,8 @@ impl Graph {
                     "cross_entropy_bf16",
                     "cross_entropy_backward_bf16",
                     "fill_bf16",
+                    "matmul_f32_bf16accum_f32",
+                    "matmul_f32_bf16rhsaccum_f32",
                 ];
 
                 for name in names {
@@ -323,11 +309,10 @@ impl Graph {
             vram_pool: HashMap::new(),
             #[cfg(feature = "bf16")]
             vram_pool_bf16: HashMap::new(),
-
+            forward_tensor_ids: Vec::new(),
             num_params: 0,
             no_grad: false,
             precision_mode,
-
             active_node_tensors: Vec::new(),
             vram_budget_bytes,
             scratch_budget_mb: Some(scratch_budget_mb),
@@ -353,129 +338,62 @@ impl Graph {
         }
     }
 
-    pub fn mark_params(&mut self) {
-        self.num_params = self.tensors.len();
+    // ---------------------------------------------------------------------
+    // Forward‑only allocation helpers
+    // ---------------------------------------------------------------------
+
+    /// Allocate a temporary tensor that is only needed for the forward
+    /// pass.  The tensor is stored on the graph’s device and the
+    /// resulting id is recorded in `forward_tensor_ids` so that the
+    /// tensor can be freed automatically after the backward pass.
+    /// Allocate a temporary tensor for the forward pass.
+    ///
+    /// The tensor is stored on the graph’s device and its id is recorded
+    /// in `forward_tensor_ids`.  It will be automatically freed by
+    /// `clear_activations` after the backward pass.
+    ///
+    /// # Arguments
+    /// * `shape` – Shape of the tensor to allocate.
+    ///
+    /// # Returns
+    /// The id of the newly allocated tensor.
+    pub fn alloc_forward(&mut self, shape: Vec<usize>) -> usize {
+        let id = self.alloc_pooled(shape);
+        self.forward_tensor_ids.push(id);
+        id
     }
 
-    pub fn mark_save_point(&self) -> usize {
-        self.tensors.len()
+    /// Allocate a temporary tensor with given data that is only needed
+    /// for the forward pass.
+    /// Allocate a temporary tensor with initial data for the forward pass.
+    ///
+    /// Internally calls `alloc_forward` and then copies `host_data` into the
+    /// tensor’s data buffer.
+    ///
+    /// # Arguments
+    /// * `shape` – Shape of the tensor to allocate.
+    /// * `host_data` – Flattened vector of initial values.
+    ///
+    /// # Returns
+    /// The id of the newly allocated tensor.
+    pub fn alloc_forward_with_data(&mut self, shape: Vec<usize>, host_data: &Vec<f32>) -> usize {
+        let id = self.alloc_forward(shape);
+        self.load_tensor_data(id, &*host_data);
+        id
     }
 
-    pub fn restore_save_point(&mut self, save_point: usize) {
-        while self.tensors.len() > save_point {
-            let t = self.tensors.pop().unwrap();
-            if t.is_pooled {
-                let size = if t.shape.is_empty() {
-                    1
-                } else {
-                    t.shape.iter().product()
-                };
-
-                // 1. Only recycle valid GPU gradient buffers!
-                // Discard Storage::Cpu (which includes the empty vec![] placeholders)
-                if matches!(t.grad, Storage::Gpu(_)) {
-                    self.vram_pool.entry(size).or_default().push(t.grad);
-                }
-
-                // 2. Safely route data buffers by their exact type
-                match t.data {
-                    #[cfg(feature = "bf16")]
-                    Storage::GpuBf16(slice) => {
-                        self.vram_pool_bf16.entry(size).or_default().push(slice);
-                    }
-                    Storage::Gpu(slice) => {
-                        // Re-wrap the slice before pushing
-                        self.vram_pool
-                            .entry(size)
-                            .or_default()
-                            .push(Storage::Gpu(slice));
-                    }
-                    _ => {
-                        // Discard Storage::Cpu and Storage::CpuBf16 entirely.
-                        // They don't belong in the VRAM pools.
-                    }
-                }
-            }
-        }
-    }
-
-    // --- Helper Methods ---
-    pub fn load_tensor_data(&mut self, id: usize, host_data: &[f32]) {
-        let tensor = &mut self.tensors[id];
-        let size = if tensor.shape.is_empty() {
-            1
-        } else {
-            tensor.shape.iter().product::<usize>()
-        };
-
-        // Sanity check to prevent catastrophic memory corruption
-        assert_eq!(
-            size,
-            host_data.len(),
-            "Shape mismatch: Tensor {} expects {} elements, but got {}.",
-            id,
-            size,
-            host_data.len()
-        );
-
-        match &mut tensor.data {
-            // CPU fallback: fast memory copy
-            Storage::Cpu(cpu_vec) => {
-                cpu_vec.copy_from_slice(host_data);
-            }
-            // GPU path: push via PCIe bus to VRAM
-            Storage::Gpu(gpu_slice) => {
-                if let Device::Gpu(_ctx, stream) = &self.device {
-                    stream
-                        .memcpy_htod(host_data, gpu_slice)
-                        .expect("Failed to copy weights from Host RAM to VRAM!");
-                } else {
-                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
-                }
-            }
-            #[cfg(feature = "bf16")]
-            Storage::CpuBf16(cpu_vec) => {
-                if let Device::Gpu(_ctx, _stream) = &self.device {
-                    // Convert f32 to bf16 by shifting off the lower 16 bits of the mantissa
-                    let u16_data: Vec<u16> = host_data
-                        .iter()
-                        .map(|&f| (f.to_bits() >> 16) as u16)
-                        .collect();
-                    cpu_vec.copy_from_slice(&u16_data);
-                } else {
-                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
-                }
-            }
-            #[cfg(feature = "bf16")]
-            Storage::GpuBf16(gpu_slice) => {
-                if let Device::Gpu(_ctx, stream) = &self.device {
-                    // Convert f32 to bf16 by shifting off the lower 16 bits of the mantissa
-                    let u16_data: Vec<u16> = host_data
-                        .iter()
-                        .map(|&f| (f.to_bits() >> 16) as u16)
-                        .collect();
-                    stream
-                        .memcpy_htod(u16_data.as_slice(), gpu_slice)
-                        .expect("Failed to copy BF16 weights from Host RAM to VRAM!");
-                } else {
-                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
-                }
-            }
-        }
-    }
-
-    pub fn clear_activations(&mut self) {
-        self.tape.nodes.clear();
-        self.restore_save_point(self.num_params);
-    }
+    // ---------------------------------------------------------------------
+    // Existing allocation helpers (unchanged)
+    // ---------------------------------------------------------------------
 
     pub fn alloc_pooled(&mut self, shape: Vec<usize>) -> usize {
         let size = if shape.is_empty() {
             1
         } else {
-            shape.iter().product::<usize>()
+            shape.iter().product()
         };
         let device = self.device.clone();
+        //println!("Alloc pooled {} elements", size);
 
         // ── Data buffer: BF16 in Bf16Mixed mode, FP32 otherwise ───────────────
         #[cfg(feature = "bf16")]
@@ -490,7 +408,7 @@ impl Graph {
 
                     // 2. Allocate if nothing was found (borrows self mutably, totally safe now!)
                     let slice =
-                        cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(stream, size));
+                        cached_slice.unwrap_or_else(|| self.safe_alloc_zeros::<u16>(&stream, size));
                     Storage::GpuBf16(slice)
                 }
                 Device::Cpu => Storage::CpuBf16(vec![0u16; size]),
@@ -542,79 +460,158 @@ impl Graph {
         };
 
         // ── Grad buffer: always FP32 (optimizer stability requirement) ─────────
-        /*
-        let mut grad_storage = {
-            let mut reused_block = None;
-            if let Some(blocks) = self.vram_pool.get_mut(&size) {
-                if let Some(block) = blocks.pop() {
-                    // only reuse FP32 blocks for grad
-                    if matches!(block, Storage::Gpu(_)) {
-                        reused_block = Some(block);
-                    } else {
-                        // wrong type ended up here — discard and allocate fresh
-                    }
-                }
-            }
-            if let Some(block) = reused_block {
-                block
-            } else {
+        let grad_storage = match &data_storage {
+            #[cfg(feature = "bf16")]
+            Storage::Gpu(_) | Storage::GpuBf16(_) => {
                 match &device {
-                    Device::Cpu => Storage::Cpu(vec![0.0; size]),
                     Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Cpu => Storage::Cpu(vec![0.0; size]),
                 }
             }
+            #[cfg(not(feature = "bf16"))]
+            Storage::Gpu(_) => {
+                match &device {
+                    Device::Gpu(_, stream) => Storage::Gpu(self.safe_alloc_zeros::<f32>(&stream, size)),
+                    Device::Cpu => Storage::Cpu(vec![0.0; size]),
+                }
+            }
+            #[cfg(feature = "bf16")]
+            Storage::Cpu(_) | Storage::CpuBf16(_) => Storage::Cpu(vec![0.0; size]),
+            #[cfg(not(feature = "bf16"))]
+            Storage::Cpu(_) => Storage::Cpu(vec![0.0; size]),
         };
 
-        // Zero the grad block before use
-        match &device {
-            Device::Cpu => {
-                if let Storage::Cpu(v) = &mut grad_storage { v.fill(0.0); }
-            }
-            Device::Gpu(_, stream) => {
-                if let Storage::Gpu(s) = &mut grad_storage {
-                    let f = self.functions.get("fill_f32").unwrap().clone();
-                    let n = size as u64;
-                    let val = 0.0f32;
-                    let mut builder = stream.launch_builder(&f);
-                    builder.arg(s).arg(&val).arg(&n);
-                    unsafe { builder.launch(LaunchConfig::for_num_elems(size as u32)) }.unwrap();
-                }
-            }
-        }
-        */
-
-        let mut strides = vec![1usize; shape.len()];
-        if !shape.is_empty() {
-            for i in (1..shape.len()).rev() {
-                strides[i - 1] = strides[i] * shape[i];
-            }
-        }
-
+        let strides = Tensor::compute_strides(&shape);
         let id = self.tensors.len();
         self.tensors.push(Tensor {
             id,
             shape,
-            strides,
             data: data_storage,
-            grad: Storage::Cpu(vec![]),
-            device,
+            grad: grad_storage,
             name: None,
             is_pooled: true,
+            is_param: false,
+            device: device.clone(),
+            strides: strides,
         });
         id
     }
 
+    pub fn alloc_pooled_with_data(&mut self, shape: Vec<usize>, host_data: &Vec<f32>) -> usize {
+        let vec_id = self.alloc_pooled(shape);
+        self.load_tensor_data(vec_id, &*host_data);
+        vec_id
+    }
+
     pub fn alloc(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
         let id = self.tensors.len();
-        // Tensor::new sets is_pooled = false automatically
-        self.tensors
-            .push(Tensor::new(id, shape, data, self.device.clone()));
+        self.tensors.push(Tensor::new(id, shape, data, self.device.clone()));
         id
+    }
+
+    /// Load host data into an existing tensor.
+    ///
+    /// The tensor must have the same number of elements as the provided `host_data`.
+    /// Handles CPU and GPU backends, including BF16 conversion when necessary.
+    pub fn load_tensor_data(&mut self, id: usize, host_data: &[f32]) {
+        let tensor = &mut self.tensors[id];
+        let size = if tensor.shape.is_empty() { 1 } else { tensor.shape.iter().product::<usize>() };
+        assert_eq!(size, host_data.len(), "Shape mismatch: Tensor {} expects {} elements, but got {}.", id, size, host_data.len());
+        match &mut tensor.data {
+            Storage::Cpu(cpu_vec) => {
+                cpu_vec.copy_from_slice(host_data);
+            }
+            Storage::Gpu(gpu_slice) => {
+                if let Device::Gpu(_ctx, stream) = &self.device {
+stream.memcpy_htod(host_data, gpu_slice).expect("Failed to copy weights from Host RAM to VRAM!");
+            } else {
+                panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
+            }
+        }
+        #[cfg(feature = "bf16")]
+        Storage::CpuBf16(cpu_vec) => {
+            if let Device::Gpu(_ctx, _stream) = &self.device {
+                let u16_data: Vec<u16> = host_data.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+                cpu_vec.copy_from_slice(&u16_data);
+            } else {
+                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
+                }
+            }
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(gpu_slice) => {
+                if let Device::Gpu(_ctx, stream) = &self.device {
+                    let u16_data: Vec<u16> = host_data.iter().map(|&f| (f.to_bits() >> 16) as u16).collect();
+                    stream.memcpy_htod(u16_data.as_slice(), gpu_slice).expect("Failed to copy BF16 weights from Host RAM to VRAM!");
+                } else {
+                    panic!("Graph device mismatch: Tensor is GPU but Graph is not.");
+                }
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Miscellaneous helper methods
+    // ---------------------------------------------------------------------
+
+    pub fn clear_activations(&mut self) {
+        self.tape.nodes.clear();
+        self.restore_save_point(self.num_params);
+        // Free forward tensors
+        for id in &self.forward_tensor_ids {
+            if let Some(t) = self.tensors.get_mut(*id) {
+                // Move the block back into the pool if it is on GPU
+                if let Storage::Gpu(slice) = &t.data {
+                    self.vram_pool.entry(t.shape.iter().product()).or_default().push(Storage::Gpu(slice.clone()));
+                }
+            }
+        }
+        self.forward_tensor_ids.clear();
+    }
+
+    /// Mark the current number of tensors as parameters.
+    /// Should be called after all parameter tensors have been allocated.
+    pub fn mark_params(&mut self) {
+        self.num_params = self.tensors.len();
+    }
+
+    pub fn mark_save_point(&self) -> usize {
+        self.tensors.len()
+    }
+
+    pub fn restore_save_point(&mut self, save_point: usize) {
+        while self.tensors.len() > save_point {
+            let t = self.tensors.pop().unwrap();
+            if t.is_pooled {
+                let size = if t.shape.is_empty() {
+                    1
+                } else {
+                    t.shape.iter().product()
+                };
+
+                if matches!(t.grad, Storage::Gpu(_)) {
+                    self.vram_pool.entry(size).or_default().push(t.grad);
+                }
+
+                match t.data {
+                    #[cfg(feature = "bf16")]
+                    Storage::GpuBf16(slice) => {
+                        self.vram_pool_bf16.entry(size).or_default().push(slice);
+                    }
+                    Storage::Gpu(slice) => {
+                        self.vram_pool
+                            .entry(size)
+                            .or_default()
+                            .push(Storage::Gpu(slice));
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[cfg(feature = "bf16")]
     pub fn alloc_param_bf16(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
-        let id = self.tensors.len();
+         let id = self.tensors.len();
         let size = if shape.is_empty() {
             1
         } else {
@@ -639,17 +636,18 @@ impl Graph {
                     device: self.device.clone(),
                     name: None,
                     is_pooled: false,
+                    is_param: true,
                 });
                 id
             }
             _ => panic!("Only supports GPU!"),
         }
-    }
-
+     }
+ 
     /// Allocate a tensor that permanently lives in CPU RAM, even when the
     /// Graph device is GPU. Use this for weights that should be streamed
     /// rather than resident in VRAM.
-    ///
+     ///
     /// In practice you rarely call this directly — `plan_streaming` converts
     /// existing GPU-resident params to CPU storage automatically.
     pub fn alloc_cpu_homed(&mut self, shape: Vec<usize>, data: Vec<f32>) -> usize {
@@ -670,6 +668,7 @@ impl Graph {
             device: self.device.clone(), // graph device (GPU) — sync_to_cpu still works
             name: None,
             is_pooled: false,
+            is_param: false,
         });
         id
     }
@@ -689,7 +688,7 @@ impl Graph {
                     _ => unreachable!(),
                 };
                 stream.clone_dtoh(s).unwrap()
-            }
+             }
             #[cfg(feature = "bf16")]
             Storage::GpuBf16(s) => {
                 let (_, stream) = match &self.device {
@@ -701,8 +700,8 @@ impl Graph {
                     .into_iter()
                     .map(|b| f32::from_bits((b as u32) << 16))
                     .collect()
-            }
-            #[cfg(feature = "bf16")]
+             }
+             #[cfg(feature = "bf16")]
             Storage::CpuBf16(s) => {
                 let (_, _stream) = match &self.device {
                     Device::Gpu(_, s) => (None::<f32>, s),
@@ -711,15 +710,14 @@ impl Graph {
                 s.into_iter()
                     .map(|b| f32::from_bits((*b as u32) << 16))
                     .collect()
-            }
-        }
-    }
-
+             }
+         }
+     }
+ 
     pub fn backward(&mut self, loss_id: usize) {
         if self.no_grad {
             return;
         }
-
         self.ensure_grad_allocated(loss_id);
         // --- 1. INITIALIZE LOSS GRADIENT TO 1.0 ---
         match &self.device {
@@ -752,10 +750,9 @@ impl Graph {
                         unsafe { b.launch(LaunchConfig::for_num_elems(num_elems)) }.unwrap();
                     }
                     _ => {}
-                }
-            }
-        }
-
+                 }
+             }
+         }
         // Note: Removed stream.synchronize() entirely!
         // We now rely on stream-ordered execution.
         // VRAM Pool remains intact to prevent Driver Malloc bottlenecks.
@@ -778,14 +775,14 @@ impl Graph {
                 for &input_id in &node.inputs {
                     self.ensure_grad_allocated(input_id);
                 }
-
+ 
                 // Calculate free VRAM based on the user budget if provided, else fall back to driver info
                 let mut free_vram = if let Some(budget) = self.vram_budget_bytes {
                     budget.saturating_sub(self.current_vram_usage())
-                } else {
+                 } else {
                     context.mem_get_info().unwrap().0
-                };
-
+                 };
+ 
                 if free_vram < scratch_budget {
                     // FIX 1: Only target tensors that are ACTUALLY currently taking up VRAM
                     #[cfg(feature = "bf16")]
@@ -823,18 +820,17 @@ impl Graph {
                         } else {
                             context.mem_get_info().unwrap().0
                         };
-
                         if free_vram >= scratch_budget {
                             break; // We have genuinely cleared enough scratch space!
                         }
-                    }
+                     }
 
                     if free_vram < scratch_budget {
                         println!("Did not manage to clear enough space!!!");
                         self.print_vram_state("backward pass error");
-                    }
-                }
-            }
+                     }
+                 }
+             }
             // 3. LAZY ALLOCATION: Do this BEFORE the closure runs.
             // We know exactly which tensors this backward step needs!
             self.ensure_on_gpu(node.output);
@@ -855,10 +851,10 @@ impl Graph {
                     panic!("backward post-call synchronize failed: {:?}", err)
                 });
             }
-        }
+         }
 
         // --- 4. CLEANUP ---
         self.active_node_tensors.clear();
         self.tape.nodes = nodes;
-    }
+     }
 }

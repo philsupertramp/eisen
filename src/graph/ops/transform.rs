@@ -1,6 +1,10 @@
 use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig};
+#[cfg(feature = "bf16")]
+use crate::safe_bf16_temp;
+#[cfg(feature = "bf16")]
+use crate::graph::is_bf16;
 
 impl Graph {
     pub fn transpose_0213(&mut self, a_id: usize) -> usize {
@@ -101,7 +105,7 @@ impl Graph {
                     }
                 }
 
-                let out_id = self.alloc(out_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape, &out_data);
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
@@ -241,6 +245,14 @@ impl Graph {
                                 .arg(&hidden_u64)
                                 .arg(&out_size_u64);
                         },
+                        #[cfg(feature = "bf16")]
+                        (Storage::Gpu(idx_data), Storage::Gpu(out_grad), Storage::GpuBf16(w_grad)) => {
+                            b1.arg(idx_data)
+                                .arg(out_grad)
+                                .arg(w_grad)
+                                .arg(&hidden_u64)
+                                .arg(&out_size_u64);
+                        },
                         (s1, s2, s3) => panic!("Gather backward: wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
                     }
                     unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
@@ -273,7 +285,7 @@ impl Graph {
 
                 let mut out_shape = idx.shape.clone();
                 out_shape.push(hidden_dim);
-                let out_id = self.alloc(out_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape, &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
                     let w_grad = tensors[weights_id].grad.as_cpu_mut();
@@ -370,7 +382,7 @@ impl Graph {
             }
             Device::Cpu => {
                 let old_size = self.tensors[a_id].data.as_cpu().len();
-                let out_id = self.alloc(new_shape, self.tensors[a_id].data.as_cpu().clone());
+                let out_id = self.alloc_pooled_with_data(new_shape, &self.tensors[a_id].data.as_cpu().clone());
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();
@@ -424,7 +436,7 @@ impl Graph {
                     let nd = Tensor::flat_to_nd(i, &out_shape);
                     out_data[i] = a_data[Tensor::nd_to_flat(&nd, &out_strides)];
                 }
-                let out_id = self.alloc(out_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape, &out_data);
                 let out_strides_cap = out_strides.clone();
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
@@ -557,7 +569,7 @@ impl Graph {
                     }
                 }
 
-                let out_id = self.alloc(shape, out_data);
+                let out_id = self.alloc_pooled_with_data(shape, &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();

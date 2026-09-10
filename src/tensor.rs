@@ -139,6 +139,7 @@ pub struct Tensor {
     pub device: Device,
     pub name: Option<String>,
     pub is_pooled: bool,
+    pub is_param: bool,
 }
 
 impl Tensor {
@@ -185,6 +186,7 @@ impl Tensor {
             device,
             name: None,
             is_pooled: false,
+            is_param: false,
         }
     }
 

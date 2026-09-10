@@ -159,7 +159,7 @@ impl Graph {
                     }
                 }
 
-                let out_id = self.alloc(out_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape, &out_data);
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();

@@ -2,6 +2,10 @@ use crate::data::fim::IGNORE_INDEX;
 use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Device, Storage, Tensor};
 use cudarc::driver::{LaunchConfig, PushKernelArg};
+#[cfg(feature = "bf16")]
+use crate::safe_bf16_temp;
+#[cfg(feature = "bf16")]
+use crate::graph::is_bf16;
 
 impl Graph {
     pub fn sum(&mut self, a_id: usize, dim: usize) -> usize {
@@ -55,6 +59,7 @@ impl Graph {
                         device: self.device.clone(),
                         name: None,
                         is_pooled: false,
+                        is_param: true,
                     });
                     (tmp_id, true)
                 } else {
@@ -178,7 +183,7 @@ impl Graph {
                     };
                     out_data[idx] += a_data[i];
                 }
-                let out_id = self.alloc(out_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape, &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
                     for i in 0..tensors[a_id].data.as_cpu().len() {
@@ -255,6 +260,7 @@ impl Graph {
                         device: self.device.clone(),
                         name: None,
                         is_pooled: false,
+                        is_param: true,
                     });
                     (tmp_id, true)
                 } else {
@@ -401,7 +407,7 @@ impl Graph {
                         argmax[idx] = i;
                     }
                 }
-                let out_id = self.alloc(out_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape, &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu().clone();
                     for i in 0..o_grad.len() {
@@ -499,7 +505,22 @@ impl Graph {
                                 .arg(&b)
                                 .arg(&n);
                         }
-                        _ => unreachable!(),
+                        #[cfg(feature = "bf16")]
+                        (
+                            Storage::GpuBf16(out_data),
+                            Storage::Gpu(out_grad),
+                            Storage::Gpu(a_grad),
+                        ) => {
+                            builder
+                                .arg(out_data)
+                                .arg(out_grad)
+                                .arg(a_grad)
+                                .arg(&b)
+                                .arg(&n);
+                        }
+                        (s1, s2, s3) => {
+                            unreachable!("cross_entropy: Invalid storage types [{:?} {:?}, {:?}]", s1, s2, s3)
+                        }
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(b as u32)) }.unwrap();
                 });
@@ -536,7 +557,7 @@ impl Graph {
                 }
 
                 let out_fwd = out_data.clone();
-                let out_id = self.alloc(a_shape, out_data);
+                let out_id = self.alloc_pooled_with_data(a_shape, &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();
@@ -589,6 +610,7 @@ impl Graph {
                         device: self.device.clone(),
                         name: None,
                         is_pooled: false,
+                        is_param: true,
                     });
                     id
                 } else {
@@ -687,6 +709,11 @@ impl Graph {
                             b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
                         }
                         #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(l_data), Storage::Gpu(out_grad), Storage::Gpu(l_grad)) => {
+                            // F32 Path -> calls cross_entropy_backward_f32
+                            b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
+                        }
+                        #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(l_data), Storage::Gpu(out_grad), Storage::GpuBf16(l_grad)) => {
                             // BF16 Path -> calls cross_entropy_backward_bf16
                             b1.arg(l_data).arg(&targets_d).arg(out_grad).arg(l_grad).arg(&b_u64).arg(&c_u64);
@@ -730,7 +757,8 @@ impl Graph {
                     out_loss += -(probs[b * num_classes + targets[b]] + 1e-8).ln();
                 }
 
-                let out_id = self.alloc(vec![], vec![out_loss / batch_size as f32]);
+                let out_loss_data = vec![out_loss / batch_size as f32];
+                let out_id = self.alloc_pooled_with_data(vec![], &out_loss_data);
                 let targets_cap = targets.to_vec();
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu()[0];
@@ -771,7 +799,8 @@ impl Graph {
 
         // All positions masked — return zero loss (should not happen in practice).
         if valid_count == 0 {
-            return self.alloc(vec![], vec![0.0]);
+            let zero = vec![0.0];
+            return self.alloc_pooled_with_data(vec![], &zero);
         }
 
         let normalizer = 1.0_f32 / valid_count as f32;
@@ -797,6 +826,7 @@ impl Graph {
                         device: self.device.clone(),
                         name: None,
                         is_pooled: false,
+                        is_param: true,
                     });
                     id
                 } else {
@@ -961,7 +991,8 @@ impl Graph {
                 }
 
                 let targets_cap = targets.to_vec();
-                let out_id = self.alloc(vec![], vec![out_loss]);
+                let o_data = vec![out_loss];
+                let out_id = self.alloc_pooled_with_data(vec![], &o_data);
 
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let o_grad = tensors[out_id].grad.as_cpu()[0];

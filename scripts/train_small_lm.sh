@@ -7,7 +7,9 @@ set -euo pipefail
 #
 # Approx class: ~250-350M params depending on vocab and exact dims.
 
-export EISEN_HIDDEN_DIM="${EISEN_HIDDEN_DIM:-1024}"
+export EISEN_LOG_DATA=loss,memory,tape
+
+export EISEN_HIDDEN_DIM="${EISEN_HIDDEN_DIM:-128}"
 export EISEN_NUM_HEADS="${EISEN_NUM_HEADS:-16}"
 export EISEN_NUM_KV_HEADS="${EISEN_NUM_KV_HEADS:-4}"
 export EISEN_FFN_DIM="${EISEN_FFN_DIM:-2048}"
@@ -35,4 +37,6 @@ echo "  HIDDEN=$EISEN_HIDDEN_DIM HEADS=$EISEN_NUM_HEADS FFN=$EISEN_FFN_DIM LAYER
 echo "  SEQ=$EISEN_SEQ_LEN MICRO_BATCH=$EISEN_MICRO_BATCH ACCUM=$EISEN_ACCUM_STEPS"
 echo "  VRAM_BUDGET_MB=$EISEN_VRAM_BUDGET_MB RESERVE_MB=$EISEN_ACTIVATION_RESERVE_MB"
 
-cargo run  --example train_llm ${EISEN_DTYPE}
+cargo build  --example train_llm ${EISEN_DTYPE}
+#
+./target/debug/examples/train_llm ${EISEN_DTYPE}

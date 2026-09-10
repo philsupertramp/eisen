@@ -2,6 +2,10 @@ use crate::graph::{Graph, TapeNode};
 use crate::tensor::{Tensor, Device, Storage};
 use cudarc::driver::{PushKernelArg, LaunchConfig, CudaSlice};
 
+#[cfg(feature = "bf16")]
+use crate::graph::is_bf16;
+#[cfg(feature = "bf16")]
+use cudarc::driver::CudaFunction;
 
 impl Graph {
     pub fn add(&mut self, a_id: usize, b_id: usize) -> usize {
@@ -135,6 +139,18 @@ impl Graph {
                             unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                         },
                         #[cfg(feature = "bf16")]
+                        (Storage::Gpu(out_grad), Storage::Gpu(a_grad), Storage::GpuBf16(b_grad)) => {
+                            b1.arg(a_grad).arg(out_grad).arg(&n).arg(&rank)
+                                .arg(&s[0]).arg(&s[1]).arg(&s[2])
+                                .arg(&a_str[0]).arg(&a_str[1]).arg(&a_str[2]);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+
+                            b1.arg(b_grad).arg(out_grad).arg(&n).arg(&rank)
+                                .arg(&s[0]).arg(&s[1]).arg(&s[2])
+                                .arg(&b_str[0]).arg(&b_str[1]).arg(&b_str[2]);
+                            unsafe { b1.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
+                        },
+                        #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_grad), Storage::GpuBf16(b_grad)) => {
                             b1.arg(a_grad).arg(out_grad).arg(&n).arg(&rank)
                                 .arg(&s[0]).arg(&s[1]).arg(&s[2])
@@ -176,7 +192,7 @@ impl Graph {
                     out_data[i] = a_data[Tensor::nd_to_flat(&nd, &a_strides)]
                         + b_data[Tensor::nd_to_flat(&nd, &b_strides)];
                 }
-                let out_id = self.alloc(out_shape.clone(), out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape.clone(), &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     for i in 0..out_size {
@@ -244,8 +260,16 @@ impl Graph {
                 #[cfg(feature = "bf16")]
                 {
                     let mut b_temp_storage_bf16 = None;
-                    let gpu_slice = self.alloc_pooled(self.tensors[b_id].shape.clone());
-                    self.load_tensor_data(gpu_slice, &self.tensors[b_id].data.to_f32_vec());
+                    let gpu_slice = match &self.tensors[b_id].data {
+                        Storage::Gpu(_) => b_id,
+                        #[cfg(feature = "bf16")]
+                        Storage::GpuBf16(_) => b_id,
+                        _ => {
+                            let idx = self.alloc_pooled(self.tensors[b_id].shape.clone());
+                            self.load_tensor_data(idx, &self.tensors[b_id].data.to_f32_vec());
+                            idx
+                        }
+                    };
                     if is_bf16(&self.tensors[a_id].data) || is_bf16(&self.tensors[b_id].data) {
                         let b_slice = match &self.tensors[b_id].data {
                             Storage::GpuBf16(s) => s,
@@ -276,11 +300,10 @@ impl Graph {
                         }
                     } else {
                         let b_slice = match &self.tensors[b_id].data {
-                            Storage::Gpu(s) => s,
                             Storage::Cpu(cpu_vec) => {
                                 println!("converting..");
                                 // HTOD copy for the u16 BF16 data
-                                b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::Gpu(v) => v, _ => panic!("INVALID")});
+                                b_temp_storage = Some(match &self.tensors[gpu_slice].data {Storage::GpuBf16(v) => v, _ => panic!("INVALID")});
                                 b_temp_storage.as_ref().unwrap()
                             },
                             _ => panic!("Expected b to be Gpu or Cpu"),
@@ -292,7 +315,7 @@ impl Graph {
                                 &self.tensors[out_id].data,
                             ) {
                                 (Storage::Gpu(a), Storage::Gpu(o)) => {
-                                    builder.arg(a).arg(b_slice).arg(o).arg(&n);
+                                    builder.arg(a).arg(*b_slice).arg(o).arg(&n);
                                 }
                                 (p1, p2) => panic!(
                                     "mul: unsupported storage combination. Received: ({:?}, {:?})",
@@ -305,8 +328,16 @@ impl Graph {
                 }
                 #[cfg(not(feature = "bf16"))]
                 {
-                    let gpu_slice = self.alloc_pooled(self.tensors[b_id].shape.clone());
-                    self.load_tensor_data(gpu_slice, &self.tensors[b_id].data.to_f32_vec());
+                    let gpu_slice = match &self.tensors[b_id].data {
+                        Storage::Gpu(_) => b_id,
+                        #[cfg(feature = "bf16")]
+                        Storage::GpuBf16(_) => b_id,
+                        _ => {
+                            let idx = self.alloc_pooled(self.tensors[b_id].shape.clone());
+                            self.load_tensor_data(idx, &self.tensors[b_id].data.to_f32_vec());
+                            idx
+                        }
+                    };
                     let b_slice = match &self.tensors[b_id].data {
                         Storage::Gpu(s) => s,
                         Storage::Cpu(cpu_vec) => {
@@ -347,6 +378,10 @@ impl Graph {
                             builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
                         }
                         #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a), Storage::GpuBf16(b), Storage::Gpu(a_grad), Storage::Gpu(b_grad), Storage::Gpu(out_grad)) => {
+                            builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
+                        }
+                        #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(a), Storage::GpuBf16(b), Storage::GpuBf16(a_grad), Storage::GpuBf16(b_grad), Storage::GpuBf16(out_grad)) => {
                             builder.arg(a).arg(b).arg(out_grad).arg(a_grad).arg(b_grad).arg(&n);
                         }
@@ -384,7 +419,7 @@ impl Graph {
                     out_data[i] = a_fwd[Tensor::nd_to_flat(&nd, &a_strides)]
                         * b_fwd[Tensor::nd_to_flat(&nd, &b_strides)];
                 }
-                let out_id = self.alloc(out_shape.clone(), out_data);
+                let out_id = self.alloc_pooled_with_data(out_shape.clone(), &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     for i in 0..out_size {
@@ -453,7 +488,10 @@ impl Graph {
                         (Storage::GpuBf16(a_s), Storage::GpuBf16(o_s)) => {
                             builder.arg(a_s).arg(o_s).arg(&n);
                         }
-                        _ => panic!("silu: mismatched storage types"),
+                        (p1, p2) => panic!(
+                            "silu: unsupported storage combination. Received: ({:?}, {:?})",
+                            p1, p2
+                        ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 }
@@ -470,10 +508,19 @@ impl Graph {
                             // FP32 backward kernel path after the cast
                             builder.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
                         }
+                        #[cfg(feature = "bf16")]
+                        (Storage::GpuBf16(a_data), Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
+                            // silu_backward_bf16in_f32 already consumed — but we're in the
+                            // FP32 backward kernel path after the cast
+                            builder.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
+                        }
                         (Storage::Gpu(a_data), Storage::Gpu(out_grad), Storage::Gpu(a_grad)) => {
                             builder.arg(a_data).arg(out_grad).arg(a_grad).arg(&n);
                         }
-                        _ => unreachable!(),
+                        (p1, p2, p3) => panic!(
+                            "silu backward: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
+                            p1, p2, p3
+                        ),
                     }
                     unsafe { builder.launch(LaunchConfig::for_num_elems(out_size as u32)) }.unwrap();
                 });
@@ -492,7 +539,7 @@ impl Graph {
                     let x = a_data[i];
                     out_data[i] = x * (1.0 / (1.0 + (-x).exp()));
                 }
-                let out_id = self.alloc(self.tensors[a_id].shape.clone(), out_data);
+                let out_id = self.alloc_pooled_with_data(self.tensors[a_id].shape.clone(), &out_data);
                 let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
                     let out_grad = tensors[out_id].grad.as_cpu().clone();
                     let a_grad = tensors[a_id].grad.as_cpu_mut();

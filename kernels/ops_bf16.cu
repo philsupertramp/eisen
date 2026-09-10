@@ -1425,6 +1425,41 @@ extern "C" __global__ void bmm_f32_bf16out(
         out[b_idx * (m * n) + row * n + col] = __float2bfloat16(sum);
 }
 
+extern "C" __global__ void bmm_backward_a_f32_to_bf16(
+    const float* grad_out, const __nv_bfloat16* b, float* a,
+    const size_t batch, const size_t m, const size_t k, const size_t n
+) {
+    __shared__ float tileGO[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tileBT[TILE_SIZE][TILE_SIZE];
+
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int b_idx = blockIdx.z;
+    if (b_idx >= (int)batch) return;
+
+    const float* go_batch = grad_out + b_idx * (m * n);
+    const __nv_bfloat16* b_batch = b + b_idx * (k * n);
+    float* a_batch = a + b_idx * (m * k);
+
+    float sum = 0.0f;
+    for (int t = 0; t < ((int)n + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int go_col = t * TILE_SIZE + threadIdx.x;
+        int bt_n   = t * TILE_SIZE + threadIdx.y;
+
+        tileGO[threadIdx.y][threadIdx.x] = (row < (int)m && go_col < (int)n)
+            ? go_batch[row * n + go_col] : 0.0f;
+        tileBT[threadIdx.y][threadIdx.x] = (col < (int)k && bt_n < (int)n)
+            ? b_batch[col * n + bt_n] : __float2bfloat16(0.0f);
+
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            sum += tileGO[threadIdx.y][i] * __bfloat162float(tileBT[i][threadIdx.x]);
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)k) a_batch[row * k + col] += sum;
+}
 // Backward A: dA = dC * B^T
 extern "C" __global__ void bmm_backward_a_bf16(
     const __nv_bfloat16* grad_out, const __nv_bfloat16* b, __nv_bfloat16* grad_a,
@@ -1472,6 +1507,41 @@ extern "C" __global__ void bmm_backward_a_bf16(
     }
 }
 
+extern "C" __global__ void bmm_backward_b_bf16a_f32go_f32gb(
+    const __nv_bfloat16* a, const float* grad_out, float* grad_b,
+    const size_t batch, const size_t n, const size_t k, const size_t m
+) {
+    __shared__ __nv_bfloat16 tileAT[TILE_SIZE][TILE_SIZE];
+    __shared__ float tileGO[TILE_SIZE][TILE_SIZE];
+
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x; // N dimension
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y; // K dimension
+    int b_idx = blockIdx.z;
+    if (b_idx >= (int)batch) return;
+
+    const __nv_bfloat16* a_batch  = a + b_idx * (m * k);
+    const float* go_batch = grad_out + b_idx * (m * n);
+    float* gb_batch = grad_b + b_idx * (k * n);
+
+    float sum = 0.0f;
+    for (int t = 0; t < ((int)m + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int at_m = t * TILE_SIZE + threadIdx.x;
+        int go_m = t * TILE_SIZE + threadIdx.y;
+
+        tileAT[threadIdx.y][threadIdx.x] = (row < (int)k && at_m < (int)m)
+            ? a_batch[at_m * k + row] : __float2bfloat16(0.0f);
+        tileGO[threadIdx.y][threadIdx.x] = (go_m < (int)m && col < (int)n)
+            ? go_batch[go_m * n + col] : 0.0f;
+
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            sum += __bfloat162float(tileAT[threadIdx.y][i]) * tileGO[i][threadIdx.x];
+        __syncthreads();
+    }
+
+    if (row < (int)k && col < (int)n) gb_batch[row * n + col] += sum;
+}
 // Backward B: dB = A^T * dC
 extern "C" __global__ void bmm_backward_b_bf16(
     const __nv_bfloat16* a, const __nv_bfloat16* grad_out, __nv_bfloat16* grad_b,
@@ -1518,6 +1588,41 @@ extern "C" __global__ void bmm_backward_b_bf16(
         gb_batch[row * n + col] = __float2bfloat16(current_grad + sum);
     }
 }
+extern "C" __global__ void bmm_backward_a_transb_f32go_f32b_bf16ga(
+    const float* grad_out, const __nv_bfloat16* b, float* grad_a,
+    const size_t batch, const size_t m, const size_t k, const size_t n
+) {
+    __shared__ float tileGO[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tileB[TILE_SIZE][TILE_SIZE];
+
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int b_idx = blockIdx.z;
+    if (b_idx >= (int)batch) return;
+
+    const float* go_batch = grad_out + b_idx * (m * n);
+    const __nv_bfloat16* b_batch = b + b_idx * (n * k); // B physically [N, K]
+    float* ga_batch = grad_a + b_idx * (m * k);
+
+    float sum = 0.0f;
+    for (int t = 0; t < ((int)n + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int go_col = t * TILE_SIZE + threadIdx.x;
+        int b_row  = t * TILE_SIZE + threadIdx.y;
+
+        tileGO[threadIdx.y][threadIdx.x] = (row < (int)m && go_col < (int)n)
+            ? go_batch[row * n + go_col] : 0.0f;
+        tileB[threadIdx.y][threadIdx.x] = (b_row < (int)n && col < (int)k)
+            ? b_batch[b_row * k + col] : __float2bfloat16(0.0f);
+
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            sum += tileGO[threadIdx.y][i] * __bfloat162float(tileB[i][threadIdx.x]);
+        __syncthreads();
+    }
+
+    if (row < (int)m && col < (int)k) ga_batch[row * k + col] += sum;
+}
 // Backward A (Transposed B): dA = dC * B
 extern "C" __global__ void bmm_backward_a_transb_bf16(
     const __nv_bfloat16* grad_out, const __nv_bfloat16* b, __nv_bfloat16* grad_a,
@@ -1562,7 +1667,41 @@ extern "C" __global__ void bmm_backward_a_transb_bf16(
         ga_batch[row * k + col] = __float2bfloat16(current_grad + sum);
     }
 }
+extern "C" __global__ void bmm_backward_b_transb_bf16a_f32go_f32gb(
+    const __nv_bfloat16* a, const float* grad_out, float* grad_b,
+    const size_t batch, const size_t n, const size_t k, const size_t m
+) {
+    __shared__ float tileGOT[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tileA[TILE_SIZE][TILE_SIZE];
 
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x; // K dimension
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y; // N dimension
+    int b_idx = blockIdx.z;
+    if (b_idx >= (int)batch) return;
+
+    const __nv_bfloat16* a_batch  = a + b_idx * (m * k);
+    const float* go_batch = grad_out + b_idx * (m * n);
+    float* gb_batch = grad_b + b_idx * (n * k);
+
+    float sum = 0.0f;
+    for (int t = 0; t < ((int)m + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int got_m = t * TILE_SIZE + threadIdx.x;
+        int a_row = t * TILE_SIZE + threadIdx.y;
+
+        tileGOT[threadIdx.y][threadIdx.x] = (row < (int)n && got_m < (int)m)
+            ? go_batch[got_m * n + row] : 0.0f;
+        tileA[threadIdx.y][threadIdx.x] = (a_row < (int)m && col < (int)k)
+            ? a_batch[a_row * k + col] : __float2bfloat16(0.0f);
+
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            sum += tileGOT[threadIdx.y][i] * __bfloat162float(tileA[i][threadIdx.x]);
+        __syncthreads();
+    }
+
+    if (row < (int)n && col < (int)k) gb_batch[row * k + col] += sum;
+}
 // Backward B (Transposed B): dB = dC^T * A
 extern "C" __global__ void bmm_backward_b_transb_bf16(
     const __nv_bfloat16* a, const __nv_bfloat16* grad_out, __nv_bfloat16* grad_b,
