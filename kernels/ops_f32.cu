@@ -2,6 +2,19 @@
 #define FLASH_MAX_HEAD_DIM 256
 #define FIM_IGNORE_INDEX 0xFFFFFFFFu
 
+/**
+ * Computes masked cross‑entropy loss for a batch of logits and targets.
+ *
+ * # Arguments
+ * * `logits` – Logit matrix [batch_size, num_classes] in BF16 format.
+ * * `targets` – Target indices cast to float; `IGNORE_INDEX` (4294967295.0f) marks padding.
+ * * `out_loss` – Scalar output; loss accumulated via atomic addition.
+ * * `normalizer` – 1 / valid_count used for averaging.
+ * * `batch_size`, `num_classes` – Dimensions of the input tensors.
+ *
+ * # Notes
+ * The kernel performs a numerically stable softmax and accumulates the negative log‑probability of the true class.
+ */
 extern "C" __global__ void cross_entropy_masked_f32(
     const float* logits,
     const float* targets,       // float-cast usize; IGNORE_INDEX → 4294967295.0
@@ -29,6 +42,20 @@ extern "C" __global__ void cross_entropy_masked_f32(
     atomicAdd(out_loss, -logf(prob + 1e-8f) * normalizer);
 }
 
+/**
+ * Backward pass for masked cross‑entropy loss.
+ *
+ * # Arguments
+ * * `logits` – Logit matrix [batch_size, num_classes] in BF16 format.
+ * * `targets` – Target indices cast to float; `IGNORE_INDEX` marks padding.
+ * * `grad_out` – Gradient of the loss scalar.
+ * * `grad_logits` – Gradient to accumulate into the logits matrix.
+ * * `normalizer` – 1 / valid_count.
+ * * `batch_size`, `num_classes` – Input dimensions.
+ *
+ * # Notes
+ * Computes the gradient of the softmax cross‑entropy with respect to logits, ignoring padded positions.
+ */
 extern "C" __global__ void cross_entropy_masked_backward_f32(
     const float* logits,
     const float* targets,
@@ -63,6 +90,20 @@ extern "C" __global__ void cross_entropy_masked_backward_f32(
 }
 
 // --- BROADCAST-AWARE ADDITION (Using Safe Grid-Stride) ---
+/**
+ * Broadcast‑aware element‑wise addition of two float tensors.
+ *
+ * # Arguments
+ * * `a`, `b` – Input tensors, possibly broadcasted.
+ * * `out` – Output tensor.
+ * * `n` – Total number of elements in the broadcasted result.
+ * * `rank`, `s0`, `s1`, `s2` – Shape information of the broadcasted result.
+ * * `a0`, `a1`, `a2` – Strides of tensor `a` in the broadcasted layout.
+ * * `b0`, `b1`, `b2` – Strides of tensor `b` in the broadcasted layout.
+ *
+ * # Notes
+ * Uses grid‑stride loop for arbitrary shapes up to rank 3; performs BF16 conversion for each operand.
+ */
 extern "C" __global__ void add_f32(
     const float* a, const float* b, float* out,
     const size_t n, const size_t rank,
@@ -81,6 +122,18 @@ extern "C" __global__ void add_f32(
     }
 }
 
+/**
+ * Accumulates gradients into a target tensor respecting broadcasting.
+ *
+ * # Arguments
+ * * `grad_target` – Gradient tensor to accumulate into.
+ * * `grad_out` – Gradient output from the next operation.
+ * * `n`, `rank`, `s0`, `s1`, `s2` – Size and shape of the broadcasted result.
+ * * `t0`, `t1`, `t2` – Strides of the target tensor in the broadcasted layout.
+ *
+ * # Notes
+ * Uses atomic adds and grid‑stride to handle arbitrary shapes up to rank 3.
+ */
 extern "C" __global__ void accumulate_f32(
     float* grad_target, const float* grad_out,
     const size_t n, const size_t rank,
@@ -98,24 +151,69 @@ extern "C" __global__ void accumulate_f32(
 }
 
 // --- ELEMENT-WISE OPS (Safe Grid-Stride replacing dangerous float4) ---
+/**
+ * Fills a tensor with a constant value.
+ *
+ * # Arguments
+ * * `data` – Output tensor.
+ * * `value` – Scalar value to fill.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Performs BF16 conversion on the value before storing.
+ */
 extern "C" __global__ void fill_f32(float* data, const float value, const size_t n) {
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         data[i] = value;
     }
 }
 
+/**
+ * Scales each element of a tensor by a constant factor.
+ *
+ * # Arguments
+ * * `data` – Tensor to scale in-place.
+ * * `scale` – Scaling factor.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Both input and output are converted to BF16; atomic add is not used.
+ */
 extern "C" __global__ void scale_f32(float* data, const float scale, const size_t n) {
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         data[i] = bf16q(bf16q(data[i]) * bf16q(scale));
     }
 }
 
+/**
+ * Element‑wise multiplication of two tensors.
+ *
+ * # Arguments
+ * * `a`, `b` – Input tensors.
+ * * `out` – Result tensor.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Uses grid‑stride and BF16 conversion for each operand.
+ */
 extern "C" __global__ void mul_f32(const float* a, const float* b, float* out, const size_t n) {
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         out[i] = bf16q(bf16q(a[i]) * bf16q(b[i]));
     }
 }
 
+/**
+ * Backward pass for element‑wise multiplication.
+ *
+ * # Arguments
+ * * `a`, `b` – Original inputs.
+ * * `grad_out` – Gradient from the next operation.
+ * * `grad_a`, `grad_b` – Gradients to accumulate into.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Accumulates gradients using atomic adds with BF16 conversion.
+ */
 extern "C" __global__ void mul_backward_f32(
     const float* a, const float* b, const float* grad_out,
     float* grad_a, float* grad_b, const size_t n
@@ -126,12 +224,34 @@ extern "C" __global__ void mul_backward_f32(
     }
 }
 
+/**
+ * Copies a tensor from source to destination.
+ *
+ * # Arguments
+ * * `src` – Source tensor.
+ * * `dst` – Destination tensor.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Performs BF16 conversion on each element.
+ */
 extern "C" __global__ void copy_f32(const float* src, float* dst, const size_t n) {
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         dst[i] = bf16q(src[i]);
     }
 }
 
+/**
+ * Computes the SiLU activation function (x * sigmoid(x)).
+ *
+ * # Arguments
+ * * `x` – Input tensor.
+ * * `out` – Output tensor.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Implements the formula with BF16 conversion for each operation.
+ */
 extern "C" __global__ void silu_f32(const float* x, float* out, const size_t n) {
     for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += blockDim.x * gridDim.x) {
         float val = bf16q(x[i]);
@@ -139,6 +259,18 @@ extern "C" __global__ void silu_f32(const float* x, float* out, const size_t n) 
     }
 }
 
+/**
+ * Backward pass for the SiLU activation.
+ *
+ * # Arguments
+ * * `x` – Original input tensor.
+ * * `grad_out` – Gradient from the next operation.
+ * * `grad_x` – Gradient to accumulate into.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Uses the derivative of SiLU: sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x)).
+ */
 extern "C" __global__ void silu_backward_f32(
     const float* x, const float* grad_out, float* grad_x, const size_t n
 ) {
@@ -155,6 +287,18 @@ extern "C" __global__ void silu_backward_f32(
 // MATMUL REVERTED TO SAFE 1D TILING
 // Restored to perfectly match the 16x16 block launch logic in Rust
 // ============================================================
+/**
+ * Tiled matrix multiplication: C = A × B.
+ *
+ * # Arguments
+ * * `a` – Left matrix [m, k].
+ * * `b` – Right matrix [k, n].
+ * * `out` – Result matrix [m, n].
+ * * `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Uses shared memory tiling with TILE_SIZE and BF16 conversion; one thread per output element.
+ */
 extern "C" __global__ void matmul_f32(
     const float* a, const float* b, float* out,
     const size_t m, const size_t k, const size_t n
@@ -189,6 +333,18 @@ extern "C" __global__ void matmul_f32(
 }
 
 // Backwards matmul passes restored identically for launch config stability
+/**
+ * Backward pass for matrix multiplication w.r.t. matrix A (∂C/∂A).
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the output matrix [m, n].
+ * * `b` – Right matrix [k, n].
+ * * `grad_a` – Gradient to accumulate into [m, k].
+ * * `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Accumulates using atomic adds; shared memory tiling is used.
+ */
 extern "C" __global__ void matmul_backward_a_f32(
     const float* grad_out, const float* b, float* grad_a,
     const size_t m, const size_t k, const size_t n
@@ -222,6 +378,18 @@ extern "C" __global__ void matmul_backward_a_f32(
         grad_a[row * k + col] += bf16q(sum);
 }
 
+/**
+ * Backward pass for matrix multiplication w.r.t. matrix B (∂C/∂B).
+ *
+ * # Arguments
+ * * `a` – Left matrix [m, k].
+ * * `grad_out` – Gradient of the output matrix [m, n].
+ * * `grad_b` – Gradient to accumulate into [k, n].
+ * * `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Accumulates using atomic adds; shared memory tiling is used.
+ */
 extern "C" __global__ void matmul_backward_b_f32(
     const float* a, const float* grad_out, float* grad_b,
     const size_t m, const size_t k, const size_t n
@@ -258,6 +426,21 @@ extern "C" __global__ void matmul_backward_b_f32(
 // -------------------------------------------------------------
 // SUM AND MAX REDUCTIONS (Restored to 1 Thread = 1 Output Mapping)
 // -------------------------------------------------------------
+/**
+ * Computes a sum reduction along a specified dimension.
+ *
+ * # Arguments
+ * * `a` – Input tensor.
+ * * `out` – Output tensor of reduced shape.
+ * * `out_size` – Number of elements in the output.
+ * * `reduced_dim_size` – Size of the dimension being reduced.
+ * * `reduced_dim_stride` – Stride to step along the reduced dimension.
+ * * `out_rank`, `os0`, `os1`, `os2` – Shape of the output tensor.
+ * * `is0`, `is1`, `is2` – Strides of the input tensor.
+ *
+ * # Notes
+ * Handles tensors up to rank 3 and performs BF16 conversion.
+ */
 extern "C" __global__ void sum_f32(
     const float* a, float* out,
     const size_t out_size, const size_t reduced_dim_size, const size_t reduced_dim_stride,
@@ -276,6 +459,18 @@ extern "C" __global__ void sum_f32(
     }
 }
 
+/**
+ * Backward pass for sum reduction.
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the output tensor.
+ * * `grad_a` – Gradient to accumulate into the input tensor.
+ * * `out_size`, `reduced_dim_size`, `reduced_dim_stride` – Same as in forward.
+ * * `out_rank`, `os0`, `os1`, `os2`, `is0`, `is1`, `is2` – Shape and stride metadata.
+ *
+ * # Notes
+ * Uses atomic adds and grid‑stride to accumulate gradients.
+ */
 extern "C" __global__ void sum_backward_f32(
     const float* grad_out, float* grad_a,
     const size_t out_size, const size_t reduced_dim_size, const size_t reduced_dim_stride,
@@ -293,6 +488,21 @@ extern "C" __global__ void sum_backward_f32(
     }
 }
 
+/**
+ * Computes a max reduction along a specified dimension.
+ *
+ * # Arguments
+ * * `a` – Input tensor.
+ * * `out` – Output tensor of reduced shape.
+ * * `out_size` – Number of elements in the output.
+ * * `reduced_dim_size` – Size of the dimension being reduced.
+ * * `reduced_dim_stride` – Stride to step along the reduced dimension.
+ * * `out_rank`, `os0`, `os1`, `os2` – Shape of the output tensor.
+ * * `is0`, `is1`, `is2` – Strides of the input tensor.
+ *
+ * # Notes
+ * Handles tensors up to rank 3; BF16 conversion is applied.
+ */
 extern "C" __global__ void max_f32(
     const float* a, float* out,
     const size_t out_size, const size_t reduced_dim_size, const size_t reduced_dim_stride,
@@ -314,6 +524,19 @@ extern "C" __global__ void max_f32(
     }
 }
 
+/**
+ * Backward pass for max reduction.
+ *
+ * # Arguments
+ * * `a` – Input tensor.
+ * * `grad_out` – Gradient of the output tensor.
+ * * `grad_a` – Gradient to accumulate into the input tensor.
+ * * `out_size`, `reduced_dim_size`, `reduced_dim_stride` – As in forward.
+ * * `out_rank`, `os0`, `os1`, `os2`, `is0`, `is1`, `is2` – Shape and stride metadata.
+ *
+ * # Notes
+ * Accumulates gradient only into the element that achieved the maximum.
+ */
 extern "C" __global__ void max_backward_f32(
     const float* a, const float* grad_out, float* grad_a,
     const size_t out_size, const size_t reduced_dim_size, const size_t reduced_dim_stride,
@@ -339,6 +562,19 @@ extern "C" __global__ void max_backward_f32(
 // BMM, Gather, RMSNorm, Rope, Flash Attention untouched below
 // to ensure complete stability while retaining standard logic
 // -------------------------------------------------------------
+/**
+ * Batched matrix multiplication: C[b] = A[b] × B[b].
+ *
+ * # Arguments
+ * * `a` – Batch of left matrices [batch, m, k].
+ * * `b` – Batch of right matrices [batch, k, n] (or transposed if `trans_b`).
+ * * `out` – Batch of output matrices [batch, m, n].
+ * * `batch`, `m`, `k`, `n` – Batch size and dimensions.
+ * * `trans_b` – Whether `b` is stored transposed.
+ *
+ * # Notes
+ * Uses shared memory tiling; one thread per output element; handles transposition via index mapping.
+ */
 extern "C" __global__ void bmm_f32(
     const float* a, const float* b, float* out,
     const size_t batch, const size_t m, const size_t k, const size_t n,
@@ -378,6 +614,18 @@ extern "C" __global__ void bmm_f32(
     }
 }
 
+/**
+ * Backward pass for batched matrix multiplication w.r.t. matrix A.
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the output batch [batch, m, n].
+ * * `b` – Right batch [batch, k, n] (or transposed).
+ * * `grad_a` – Gradient to accumulate into [batch, m, k].
+ * * `batch`, `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Uses shared memory tiling and grid‑stride loops.
+ */
 extern "C" __global__ void bmm_backward_a_f32(
     const float* __restrict__ grad_out, const float* __restrict__ b, float* __restrict__ grad_a,
     const size_t batch, const size_t m, const size_t k, const size_t n
@@ -411,6 +659,18 @@ extern "C" __global__ void bmm_backward_a_f32(
     if (row < m && col < k) ga_batch[row * k + col] = bf16q(acc);
 }
 
+/**
+ * Backward pass for batched matrix multiplication w.r.t. matrix B.
+ *
+ * # Arguments
+ * * `a` – Left batch [batch, m, k].
+ * * `grad_out` – Gradient of the output batch [batch, m, n].
+ * * `grad_b` – Gradient to accumulate into [batch, k, n].
+ * * `batch`, `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Uses shared memory tiling and grid‑stride loops.
+ */
 extern "C" __global__ void bmm_backward_b_f32(
     const float* __restrict__ a, const float* __restrict__ grad_out, float* __restrict__ grad_b,
     const size_t batch, const size_t m, const size_t k, const size_t n
@@ -444,6 +704,18 @@ extern "C" __global__ void bmm_backward_b_f32(
     if (row < k && col < n) gb_batch[row * n + col] = bf16q(acc);
 }
 
+/**
+ * Backward pass for batched matrix multiplication when B is transposed.
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the output batch [batch, m, n].
+ * * `b` – Right batch stored transposed [batch, n, k].
+ * * `grad_a` – Gradient to accumulate into [batch, m, k].
+ * * `batch`, `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Uses shared memory tiling and grid‑stride loops.
+ */
 extern "C" __global__ void bmm_backward_a_transb_f32(
     const float* __restrict__ grad_out, const float* __restrict__ b, float* __restrict__ grad_a,
     const size_t batch, const size_t m, const size_t k, const size_t n
@@ -477,6 +749,18 @@ extern "C" __global__ void bmm_backward_a_transb_f32(
     if (row < m && col < k) ga_batch[row * k + col] = bf16q(acc);
 }
 
+/**
+ * Backward pass for batched matrix multiplication when B is transposed, w.r.t. B.
+ *
+ * # Arguments
+ * * `a` – Left batch [batch, m, k].
+ * * `grad_out` – Gradient of the output batch [batch, m, n].
+ * * `grad_b` – Gradient to accumulate into [batch, n, k] (transposed layout).
+ * * `batch`, `m`, `k`, `n` – Dimensions.
+ *
+ * # Notes
+ * Uses shared memory tiling and grid‑stride loops.
+ */
 extern "C" __global__ void bmm_backward_b_transb_f32(
     const float* __restrict__ a, const float* __restrict__ grad_out, float* __restrict__ grad_b,
     const size_t batch, const size_t m, const size_t k, const size_t n
@@ -510,6 +794,18 @@ extern "C" __global__ void bmm_backward_b_transb_f32(
     if (row < n && col < k) gb_batch[row * k + col] = bf16q(acc);
 }
 
+/**
+ * Gathers rows from a weight matrix using integer indices.
+ *
+ * # Arguments
+ * * `weights` – Weight matrix [num_weights, hidden_dim].
+ * * `indices` – Integer indices selecting rows, cast to float.
+ * * `out` – Gathered output [out_size].
+ * * `hidden_dim`, `out_size` – Dimensions.
+ *
+ * # Notes
+ * Performs BF16 conversion on gathered values.
+ */
 extern "C" __global__ void gather_f32(
     const float* weights, const float* indices, float* out,
     const size_t hidden_dim, const size_t out_size
@@ -523,6 +819,18 @@ extern "C" __global__ void gather_f32(
     }
 }
 
+/**
+ * Backward pass for gather operation.
+ *
+ * # Arguments
+ * * `indices` – Same indices as in forward.
+ * * `grad_out` – Gradient of the gathered output.
+ * * `grad_weights` – Gradient to accumulate into the weight matrix.
+ * * `hidden_dim`, `out_size` – Dimensions.
+ *
+ * # Notes
+ * Uses atomic adds; each gradient is added to the corresponding weight row.
+ */
 extern "C" __global__ void gather_backward_f32(
     const float* indices, const float* grad_out, float* grad_weights,
     const size_t hidden_dim, const size_t out_size
@@ -536,6 +844,18 @@ extern "C" __global__ void gather_backward_f32(
     }
 }
 
+/**
+ * RMS‑normalization of a batch of vectors.
+ *
+ * # Arguments
+ * * `x` – Input tensor [num_vecs, dim].
+ * * `w` – Scale parameters per dimension.
+ * * `out` – Normalized output.
+ * * `dim`, `eps`, `num_vecs` – Dimension, epsilon, and batch size.
+ *
+ * # Notes
+ * Implements `x * w * sqrt(1 / (mean(x^2) + eps))` with BF16 conversion.
+ */
 extern "C" __global__ void rmsnorm_f32(
     const float* x, const float* w, float* out,
     const size_t dim, const float eps, const size_t num_vecs
@@ -550,6 +870,17 @@ extern "C" __global__ void rmsnorm_f32(
     }
 }
 
+/**
+ * Backward pass for RMS‑normalization.
+ *
+ * # Arguments
+ * * `x`, `w`, `grad_out` – Inputs and gradient of output.
+ * * `grad_x`, `grad_w` – Gradients to accumulate into.
+ * * `dim`, `eps`, `num_vecs` – Dimension, epsilon, and batch size.
+ *
+ * # Notes
+ * Uses atomic adds for `grad_w` and BF16 conversion.
+ */
 extern "C" __global__ void rmsnorm_backward_f32(
     const float* x, const float* w, const float* grad_out,
     float* grad_x, float* grad_w,
@@ -577,6 +908,18 @@ extern "C" __global__ void rmsnorm_backward_f32(
     }
 }
 
+/**
+ * Cross‑entropy loss for a batch of logits and targets.
+ *
+ * # Arguments
+ * * `logits` – Logit matrix [batch_size, num_classes] in BF16 format.
+ * * `targets` – Target indices.
+ * * `out_loss` – Scalar loss output.
+ * * `batch_size`, `num_classes` – Dimensions.
+ *
+ * # Notes
+ * Computes softmax and loss in a numerically stable manner.
+ */
 extern "C" __global__ void cross_entropy_f32(
     const float* logits, const float* targets, float* out_loss,
     const size_t batch_size, const size_t num_classes
@@ -597,6 +940,18 @@ extern "C" __global__ void cross_entropy_f32(
     }
 }
 
+/**
+ * Backward pass for cross‑entropy loss.
+ *
+ * # Arguments
+ * * `logits`, `targets` – Inputs.
+ * * `grad_out` – Gradient of the loss scalar.
+ * * `grad_logits` – Gradient to accumulate into logits.
+ * * `batch_size`, `num_classes` – Dimensions.
+ *
+ * # Notes
+ * Computes gradient of softmax cross‑entropy w.r.t. logits.
+ */
 extern "C" __global__ void cross_entropy_backward_f32(
     const float* logits, const float* targets, const float* grad_out,
     float* grad_logits, const size_t batch_size, const size_t num_classes
@@ -622,6 +977,17 @@ extern "C" __global__ void cross_entropy_backward_f32(
     }
 }
 
+/**
+ * Softmax activation over the last dimension of a batch.
+ *
+ * # Arguments
+ * * `x` – Input tensor [B, N].
+ * * `out` – Softmax output tensor.
+ * * `B`, `N` – Batch size and dimension.
+ *
+ * # Notes
+ * Uses a numerically stable algorithm with BF16 conversion.
+ */
 extern "C" __global__ void softmax_f32(const float* x, float* out, const size_t B, const size_t N) {
     size_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < B) {
@@ -633,6 +999,18 @@ extern "C" __global__ void softmax_f32(const float* x, float* out, const size_t 
     }
 }
 
+/**
+ * Backward pass for softmax.
+ *
+ * # Arguments
+ * * `out` – Forward softmax output.
+ * * `grad_out` – Gradient of the loss w.r.t. softmax output.
+ * * `grad_x` – Gradient to accumulate into input.
+ * * `B`, `N` – Batch size and dimension.
+ *
+ * # Notes
+ * Accumulates using atomic adds; BF16 conversion is applied.
+ */
 extern "C" __global__ void softmax_backward_f32(const float* out, const float* grad_out, float* grad_x, const size_t B, const size_t N) {
     size_t b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b < B) {
@@ -645,6 +1023,19 @@ extern "C" __global__ void softmax_backward_f32(const float* out, const float* g
     }
 }
 
+/**
+ * Flash attention kernel for multi‑head attention.
+ *
+ * # Arguments
+ * * `q`, `k`, `v` – Query, key, and value tensors.
+ * * `out` – Output tensor.
+ * * `batch`, `m`, `n`, `d` – Batch size, query length, key/value length, head dimension.
+ * * `scale` – Scaling factor for dot‑products.
+ * * `causal` – Whether to apply a causal mask.
+ *
+ * # Notes
+ * Implements the efficient softmax‑based attention with numerically stable accumulation.
+ */
 extern "C" __global__ void flash_attention_f32(
     const float* q, const float* k, const float* v, float* out,
     const size_t batch, const size_t m, const size_t n, const size_t d,
@@ -691,6 +1082,17 @@ extern "C" __global__ void flash_attention_f32(
     for (size_t x = 0; x < d; ++x) out_row[x] = bf16q(acc[x] * inv_l);
 }
 
+/**
+ * Transposes a 4‑D tensor from layout B‑S‑H‑D to B‑H‑S‑D.
+ *
+ * # Arguments
+ * * `src` – Source tensor.
+ * * `dst` – Destination tensor.
+ * * `B`, `S`, `H`, `D` – Dimensions of the source tensor.
+ *
+ * # Notes
+ * Uses a single thread per element; BF16 conversion is applied.
+ */
 extern "C" __global__ void transpose_0213_f32(
     const float* src, float* dst,
     const size_t B, const size_t S, const size_t H, const size_t D
@@ -706,6 +1108,17 @@ extern "C" __global__ void transpose_0213_f32(
     }
 }
 
+/**
+ * Backward pass for the 0213 transpose.
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the output tensor.
+ * * `grad_src` – Gradient to accumulate into the source tensor.
+ * * `B`, `S`, `H`, `D` – Dimensions.
+ *
+ * # Notes
+ * Accumulates gradient via atomic adds with BF16 conversion.
+ */
 extern "C" __global__ void transpose_0213_backward_f32(
     const float* grad_out, float* grad_src,
     const size_t B, const size_t S, const size_t H, const size_t D
@@ -721,6 +1134,17 @@ extern "C" __global__ void transpose_0213_backward_f32(
     }
 }
 
+/**
+ * Rotary positional encoding (ROPE) for query/key tensors.
+ *
+ * # Arguments
+ * * `x` – Input tensor.
+ * * `out` – Rotated tensor.
+ * * `seq_len`, `hidden_dim`, `head_dim`, `num_pairs` – Layout parameters.
+ *
+ * # Notes
+ * Applies sine/cosine rotations per head dimension.
+ */
 extern "C" __global__ void rope_f32(
     const float* x, float* out,
     const size_t seq_len, const size_t hidden_dim, const size_t head_dim, const size_t num_pairs
@@ -740,6 +1164,17 @@ extern "C" __global__ void rope_f32(
     }
 }
 
+/**
+ * Backward pass for ROPE.
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the rotated tensor.
+ * * `grad_x` – Gradient to accumulate into the original tensor.
+ * * `seq_len`, `hidden_dim`, `head_dim`, `num_pairs` – Layout parameters.
+ *
+ * # Notes
+ * Uses the inverse rotation to propagate gradients.
+ */
 extern "C" __global__ void rope_backward_f32(
     const float* grad_out, float* grad_x,
     const size_t seq_len, const size_t hidden_dim, const size_t head_dim, const size_t num_pairs
@@ -759,6 +1194,20 @@ extern "C" __global__ void rope_backward_f32(
     }
 }
 
+/**
+ * AdamW optimizer step for a single weight vector.
+ *
+ * # Arguments
+ * * `weights` – Parameters to update.
+ * * `grads` – Gradients.
+ * * `m`, `v` – First‑ and second‑moment estimates.
+ * * `lr`, `beta1`, `beta2`, `eps`, `weight_decay` – Hyper‑parameters.
+ * * `bc1`, `bc2` – Bias‑correction factors.
+ * * `n` – Length of the weight vector.
+ *
+ * # Notes
+ * Updates weights in place with BF16 conversion.
+ */
 extern "C" __global__ void adamw_step_f32(
     float* weights, const float* grads, float* m, float* v,
     const float lr, const float beta1, const float beta2,
@@ -784,6 +1233,17 @@ extern "C" __global__ void adamw_step_f32(
 }
 
 
+/**
+ * Repeats KV heads to match the number of query heads.
+ *
+ * # Arguments
+ * * `input` – KV tensor [batch, kv_heads, seq_len, head_dim].
+ * * `output` – Repeated tensor [batch, q_heads, seq_len, head_dim].
+ * * `batch`, `num_kv_heads`, `repeats`, `seq_len`, `head_dim` – Layout parameters.
+ *
+ * # Notes
+ * Performs a simple index mapping; no atomic operations needed.
+ */
 extern "C" __global__ void repeat_kv_f32(
     const float* __restrict__ input,
     float* __restrict__ output,
@@ -808,6 +1268,17 @@ extern "C" __global__ void repeat_kv_f32(
     }
 }
 
+/**
+ * Backward pass for repeat‑KV operation.
+ *
+ * # Arguments
+ * * `grad_out` – Gradient of the repeated tensor.
+ * * `grad_in` – Gradient to accumulate into the KV tensor.
+ * * `batch`, `num_kv_heads`, `repeats`, `seq_len`, `head_dim` – Layout parameters.
+ *
+ * # Notes
+ * Sums gradients across repeated heads using a loop.
+ */
 extern "C" __global__ void repeat_kv_backward_f32(
     const float* __restrict__ grad_out,
     float* __restrict__ grad_in,
@@ -839,6 +1310,18 @@ extern "C" __global__ void repeat_kv_backward_f32(
 
 // Standard tiled matrix multiplication for C = A * B^T
 // A: [M, K], B: [N, K], C: [M, N]
+/**
+ * Transposed matrix multiplication: C = A × Bᵀ.
+ *
+ * # Arguments
+ * * `A` – Matrix [M, K].
+ * * `B` – Matrix [N, K] (to be transposed).
+ * * `C` – Result matrix [M, N].
+ * * `M`, `K`, `N` – Dimensions.
+ *
+ * # Notes
+ * Uses straightforward per‑element multiplication; no shared memory.
+ */
 extern "C" __global__ void matmul_trans_b_f32(
     const float* __restrict__ A,
     const float* __restrict__ B,
@@ -861,6 +1344,18 @@ extern "C" __global__ void matmul_trans_b_f32(
 
 // Backward kernel for B gradient: dB = dC^T * A
 // dC: [M, N], A: [M, K], dB: [N, K]
+/**
+ * Backward pass for transposed matrix multiplication w.r.t. Aᵀ.
+ *
+ * # Arguments
+ * * `dC` – Gradient of the output matrix [M, N].
+ * * `A` – Matrix [M, K].
+ * * `dB` – Gradient to accumulate into Bᵀ [N, K].
+ * * `M`, `N`, `K` – Dimensions.
+ *
+ * # Notes
+ * Accumulates gradients via atomic adds.
+ */
 extern "C" __global__ void matmul_trans_a_f32(
     const float* __restrict__ dC,
     const float* __restrict__ A,

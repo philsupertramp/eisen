@@ -1,6 +1,17 @@
 #include "common.cuh"
 
 
+/**
+ * Converts a tensor from FP32 to BF16.
+ *
+ * # Arguments
+ * * `src` – Pointer to the input array of FP32 values.
+ * * `dst` – Pointer to the output array of BF16 values.
+ * * `n` – Number of elements to convert.
+ *
+ * # Notes
+ * Performs element‑wise conversion using the CUDA intrinsic `__float2bfloat16`.
+ */
 extern "C" __global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst, const size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -8,6 +19,17 @@ extern "C" __global__ void cast_f32_to_bf16(const float* src, __nv_bfloat16* dst
     }
 }
 
+/**
+ * Converts a tensor from BF16 to FP32.
+ *
+ * # Arguments
+ * * `src` – Pointer to the input array of BF16 values.
+ * * `dst` – Pointer to the output array of FP32 values.
+ * * `n` – Number of elements to convert.
+ *
+ * # Notes
+ * Uses CUDA intrinsic `__bfloat162float` for conversion.
+ */
 extern "C" __global__ void cast_bf16_to_f32(const __nv_bfloat16* src, float* dst, const size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -15,6 +37,17 @@ extern "C" __global__ void cast_bf16_to_f32(const __nv_bfloat16* src, float* dst
     }
 }
 
+/**
+ * Converts a BF16 tensor to FP32 and atomically accumulates into a destination buffer.
+ *
+ * # Arguments
+ * * `src` – Input array of BF16 values.
+ * * `dst` – FP32 buffer to accumulate into.
+ * * `n` – Number of elements.
+ *
+ * # Notes
+ * Each element is converted to FP32 and added to the corresponding entry in `dst` using `atomicAdd`.
+ */
 extern "C" __global__ void cast_bf16_to_f32_accumulate(const __nv_bfloat16* src, float* dst, const size_t n) {
     size_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) {
@@ -22,6 +55,20 @@ extern "C" __global__ void cast_bf16_to_f32_accumulate(const __nv_bfloat16* src,
     }
 }
 
+/**
+ * Gathers rows from a BF16 weight matrix based on integer indices and outputs FP32 values.
+ *
+ * # Arguments
+ * * `weights` – BF16 weight matrix.
+ * * `indices` – Integer indices (floats cast from usize).
+ * * `out` – Output FP32 tensor.
+ * * `hidden_dim` – Width of each weight row.
+ * * `out_size` – Total number of elements in the output.
+ *
+ * # Notes
+ * For each output element, the function selects the corresponding row from `weights` using the index
+ * from `indices` and converts the BF16 value to FP32 before writing to `out`.
+ */
 extern "C" __global__ void gather_bf16_f32(
     const __nv_bfloat16* weights,
     const float* indices,
@@ -38,6 +85,22 @@ extern "C" __global__ void gather_bf16_f32(
     }
 }
 
+/**
+ * Computes RMS‑normalization of an FP32 input tensor with BF16 scaling weights.
+ *
+ * # Arguments
+ * * `x` – Input FP32 tensor.
+ * * `w` – BF16 scaling weights (one per dimension).
+ * * `out` – Output FP32 tensor.
+ * * `dim` – Size of the feature dimension.
+ * * `eps` – Epsilon for numerical stability.
+ * * `num_vecs` – Number of independent vectors (batch size).
+ *
+ * # Notes
+ * The kernel computes the mean‑squared value per vector, takes the reciprocal square root
+ * (rrms), and scales each element by `rrms * w`. All intermediate accumulations are performed
+ * in FP32 for precision.
+ */
 extern "C" __global__ void rmsnorm_f32_bf16w(
     const float* x, const __nv_bfloat16* w, float* out,
     const size_t dim, const float eps, const size_t num_vecs
@@ -54,6 +117,21 @@ extern "C" __global__ void rmsnorm_f32_bf16w(
     }
 }
 
+/**
+ * Backward pass for RMS‑normalization with BF16 weights, producing FP32 gradients.
+ *
+ * # Arguments
+ * * `x` – Original FP32 input tensor.
+ * * `w` – BF16 scaling weights.
+ * * `grad_out` – Gradient w.r.t. the output (FP32).
+ * * `grad_x` – Gradient to accumulate into the input (FP32).
+ * * `grad_w` – Gradient to accumulate into the weights (FP32).
+ * * `dim`, `eps`, `num_vecs` – Same as forward.
+ *
+ * # Notes
+ * Gradients are computed in FP32 and then accumulated into the FP32 buffers. The weight gradient
+ * uses an atomic add to avoid race conditions.
+ */
 extern "C" __global__ void rmsnorm_backward_bf16w_f32(
     const float* x, const __nv_bfloat16* w, const float* grad_out,
     float* grad_x, float* grad_w,
@@ -84,6 +162,21 @@ extern "C" __global__ void rmsnorm_backward_bf16w_f32(
 
 
 
+/**
+ * AdamW optimizer step with BF16 momentum and variance buffers, updating FP32 weights.
+ *
+ * # Arguments
+ * * `weights` – FP32 weight tensor to update.
+ * * `grads` – FP32 gradients.
+ * * `m` – BF16 first‑moment buffer.
+ * * `v` – BF16 second‑moment buffer.
+ * * `lr`, `beta1`, `beta2`, `eps`, `weight_decay`, `bc1`, `bc2` – Optimizer hyper‑parameters.
+ * * `n` – Number of parameters.
+ *
+ * # Notes
+ * The function performs bias‑correction on the momentum and variance, computes the update, and
+ * writes the new weight in FP32. Momentum and variance are stored in BF16 to save memory.
+ */
 extern "C" __global__ void adamw_step_bf16mom_f32(
     float* weights,
     const float* grads,
@@ -119,6 +212,20 @@ extern "C" __global__ void adamw_step_bf16mom_f32(
     }
 }
 
+/**
+ * AdamW step where gradients are stored in BF16, weights remain FP32.
+ *
+ * # Arguments
+ * * `weights` – FP32 weight tensor.
+ * * `grads` – BF16 gradient tensor.
+ * * `m`, `v` – BF16 momentum and variance buffers.
+ * * `lr`, `beta1`, `beta2`, `eps`, `weight_decay`, `bc1`, `bc2` – Hyper‑parameters.
+ * * `n` – Number of parameters.
+ *
+ * # Notes
+ * Gradients are converted to FP32 before being used in the update equations. Momentum and
+ * variance are kept in BF16.
+ */
 extern "C" __global__ void adamw_step_bf16mom(
     float* weights,
     const __nv_bfloat16* grads,
@@ -154,6 +261,19 @@ extern "C" __global__ void adamw_step_bf16mom(
     }
 }
 
+/**
+ * AdamW step with BF16 weights, BF16 momentum/variance, updating FP32 weights.
+ *
+ * # Arguments
+ * * `weights` – BF16 weight tensor (converted to FP32 for the update).
+ * * `grads` – FP32 gradients.
+ * * `m`, `v` – BF16 momentum/variance buffers.
+ * * `lr`, `beta1`, `beta2`, `eps`, `weight_decay`, `bc1`, `bc2` – Hyper‑parameters.
+ * * `n` – Number of parameters.
+ *
+ * # Notes
+ * The weight is converted to FP32, updated, and then converted back to BF16 for storage.
+ */
 extern "C" __global__ void adamw_step_bf16w_bf16mom_f32(
     __nv_bfloat16* weights,
     const float* grads,
@@ -193,6 +313,22 @@ extern "C" __global__ void adamw_step_bf16w_bf16mom_f32(
 // ── ADD ──────────────────────────────────────────────────────────────────────
 
 // BF16 inputs + BF16 output (broadcast-aware)
+/**
+ * Broadcast‑aware element‑wise addition of two BF16 tensors, producing BF16 output.
+ *
+ * # Arguments
+ * * `a`, `b` – Input BF16 tensors.
+ * * `out` – Output BF16 tensor.
+ * * `n` – Total number of elements in the broadcasted result.
+ * * `rank` – Rank of the broadcasted tensor.
+ * * `s0`, `s1`, `s2` – Shape of the broadcasted result.
+ * * `a0`, `a1`, `a2` – Strides of tensor `a` in the broadcasted layout.
+ * * `b0`, `b1`, `b2` – Strides of tensor `b` in the broadcasted layout.
+ *
+ * # Notes
+ * Uses a grid‑stride loop to handle arbitrary shapes up to rank 3. Each operand is converted
+ * to FP32, added, and then cast back to BF16.
+ */
 extern "C" __global__ void add_bf16(
     const __nv_bfloat16* a,
     const __nv_bfloat16* b,
