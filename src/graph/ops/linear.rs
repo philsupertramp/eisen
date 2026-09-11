@@ -1086,9 +1086,9 @@ impl Graph {
                             .arg(b_s)
                             .arg(o_s)
                             .arg(&batch_u64)
-                            .arg(&m_u64)
-                            .arg(&k_u64)
                             .arg(&n_u64)
+                            .arg(&k_u64)
+                            .arg(&m_u64)
                             .arg(&trans_b);
                     },
                     #[cfg(feature = "bf16")]
@@ -1118,6 +1118,7 @@ impl Graph {
                     panic!("bmm forward kernel launch failed: {:?} (batch={}, m={}, k={}, n={}, trans_b={}, grid={:?}, block={:?})", err, batch, m, k, n, trans_b, cfg_fwd.grid_dim, cfg_fwd.block_dim)
                 });
                 
+                println!("bmm fwd!");
                 // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
                 stream.synchronize().expect("bmm forward sync failed");
 
@@ -1130,13 +1131,13 @@ impl Graph {
                         &tensors[b_id].data
                     ) {
                         (Storage::Gpu(a_grad), Storage::Gpu(out_grad), Storage::Gpu(b_data)) => {
-                            b1.arg(out_grad)
+                            b1.arg(a_grad)
                                 .arg(b_data)
-                                .arg(a_grad)
+                                .arg(out_grad)
                                 .arg(&batch_u64)
-                                .arg(&m_u64)
+                                .arg(&n_u64)
                                 .arg(&k_u64)
-                                .arg(&n_u64);
+                                .arg(&m_u64);
                         },
                         // #[cfg(feature = "bf16")]
                         // (Storage::GpuBf16(a_grad), Storage::GpuBf16(out_grad), Storage::GpuBf16(b_data)) => {
@@ -1150,13 +1151,13 @@ impl Graph {
                         // },
                         #[cfg(feature = "bf16")]
                         (Storage::Gpu(a_grad), Storage::Gpu(out_grad), Storage::GpuBf16(b_data)) => {
-                            b1.arg(out_grad)
+                            b1.arg(a_grad)
                                 .arg(b_data)
-                                .arg(a_grad)
+                                .arg(out_grad)
                                 .arg(&batch_u64)
-                                .arg(&m_u64)
+                                .arg(&n_u64)
                                 .arg(&k_u64)
-                                .arg(&n_u64);
+                                .arg(&m_u64);
                         },
                         (p1, p2, p3) => panic!(
                             "bmm backward: unsupported storage combination. Received: ({:?}, {:?}, {:?})",
@@ -1186,18 +1187,18 @@ impl Graph {
                     ) {
                         (Storage::Gpu(a_data), Storage::Gpu(out_grad), Storage::Gpu(b_grad)) => {
                             b2.arg(a_data)
-                                .arg(out_grad)
                                 .arg(b_grad)
+                                .arg(out_grad)
                                 .arg(&batch_u64)
-                                .arg(&m_u64)
+                                .arg(&n_u64)
                                 .arg(&k_u64)
-                                .arg(&n_u64);
+                                .arg(&m_u64);
                         },
                         #[cfg(feature = "bf16")]
                         (Storage::GpuBf16(a_data), Storage::Gpu(out_grad), Storage::Gpu(b_grad)) => {
                             b2.arg(a_data)
-                                .arg(out_grad)
                                 .arg(b_grad)
+                                .arg(out_grad)
                                 .arg(&batch_u64)
                                 .arg(&n_u64)
                                 .arg(&k_u64)

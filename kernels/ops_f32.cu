@@ -577,7 +577,7 @@ extern "C" __global__ void max_backward_f32(
  */
 extern "C" __global__ void bmm_f32(
     const float* a, const float* b, float* out,
-    const size_t batch, const size_t m, const size_t k, const size_t n,
+    const size_t batch, const size_t n, const size_t k, const size_t m,
     const bool trans_b
 ) {
     __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
@@ -627,8 +627,10 @@ extern "C" __global__ void bmm_f32(
  * Uses shared memory tiling and grid‑stride loops.
  */
 extern "C" __global__ void bmm_backward_a_f32(
-    const float* __restrict__ grad_out, const float* __restrict__ b, float* __restrict__ grad_a,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    float* __restrict__ grad_a,
+    const float* __restrict__ b,
+    const float* __restrict__ grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
     __shared__ float s_b [TILE_SIZE][TILE_SIZE + 1];
@@ -672,8 +674,10 @@ extern "C" __global__ void bmm_backward_a_f32(
  * Uses shared memory tiling and grid‑stride loops.
  */
 extern "C" __global__ void bmm_backward_b_f32(
-    const float* __restrict__ a, const float* __restrict__ grad_out, float* __restrict__ grad_b,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    const float* __restrict__ a,
+    float* __restrict__ grad_b,
+    const float* __restrict__ grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float s_a [TILE_SIZE][TILE_SIZE + 1];
     __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
@@ -717,8 +721,10 @@ extern "C" __global__ void bmm_backward_b_f32(
  * Uses shared memory tiling and grid‑stride loops.
  */
 extern "C" __global__ void bmm_backward_a_transb_f32(
-    const float* __restrict__ grad_out, const float* __restrict__ b, float* __restrict__ grad_a,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    float* __restrict__ grad_a,
+    const float* __restrict__ b,
+    const float* __restrict__ grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
     __shared__ float s_b [TILE_SIZE][TILE_SIZE + 1];
@@ -762,8 +768,10 @@ extern "C" __global__ void bmm_backward_a_transb_f32(
  * Uses shared memory tiling and grid‑stride loops.
  */
 extern "C" __global__ void bmm_backward_b_transb_f32(
-    const float* __restrict__ a, const float* __restrict__ grad_out, float* __restrict__ grad_b,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    const float* __restrict__ a,
+    float* __restrict__ grad_b,
+    const float* __restrict__ grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float s_go[TILE_SIZE][TILE_SIZE + 1];
     __shared__ float s_a [TILE_SIZE][TILE_SIZE + 1];

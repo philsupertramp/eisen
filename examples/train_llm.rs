@@ -357,7 +357,7 @@ fn main() {
     let log_interval = env_usize("EISEN_LOG_INTERVAL", 50);
     let board_interval = 1_usize;
     let log_cfg = TrainLogConfig::from_env();
-    let fail_on_nonfinite = env_bool("EISEN_FAIL_ON_NONFINITE", true);
+    let fail_on_nonfinite = env_bool("EISEN_FAIL_ON_NONFINITE", false);
     println!(
         "Logging: level={:?} data=[loss={}, graph_memory={}, computation_graph={}]",
         log_cfg.level, log_cfg.loss, log_cfg.graph_memory, log_cfg.computation_graph

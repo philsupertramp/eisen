@@ -1429,7 +1429,7 @@ extern "C" __global__ void matmul_backward_b_bf16(
 // BMM implementations
 extern "C" __global__ void bmm_f32_bf16accum_f32(
     const float* a, const float* b, float* out,
-    const size_t batch, const size_t m, const size_t k, const size_t n,
+    const size_t batch, const size_t n, const size_t k, const size_t m,
     const bool trans_b
 ) {
     __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
@@ -1478,7 +1478,7 @@ extern "C" __global__ void bmm_f32_bf16accum_f32(
 // Handles both standard (A * B) and transposed B (A * B^T) via the trans_b flag.
 extern "C" __global__ void bmm_bf16(
     const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out,
-    const size_t batch, const size_t m, const size_t k, const size_t n,
+    const size_t batch, const size_t n, const size_t k, const size_t m,
     const bool trans_b
 ) {
     __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
@@ -1527,7 +1527,7 @@ extern "C" __global__ void bmm_bf16(
 
 extern "C" __global__ void bmm_f32_bf16out(
     const float* a, const float* b, __nv_bfloat16* out,
-    const size_t batch, const size_t m, const size_t k, const size_t n,
+    const size_t batch, const size_t n, const size_t k, const size_t m,
     const bool trans_b
 ) {
     __shared__ float tile_A[TILE_SIZE][TILE_SIZE];
@@ -1562,8 +1562,10 @@ extern "C" __global__ void bmm_f32_bf16out(
 }
 
 extern "C" __global__ void bmm_backward_a_f32_to_bf16(
-    const float* grad_out, const __nv_bfloat16* b, float* a,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    float* a,
+    const __nv_bfloat16* b,
+    const float* grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float tileGO[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tileBT[TILE_SIZE][TILE_SIZE];
@@ -1598,8 +1600,10 @@ extern "C" __global__ void bmm_backward_a_f32_to_bf16(
 }
 // Backward A: dA = dC * B^T
 extern "C" __global__ void bmm_backward_a_bf16(
-    const __nv_bfloat16* grad_out, const __nv_bfloat16* b, __nv_bfloat16* grad_a,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    __nv_bfloat16* grad_a,
+    const __nv_bfloat16* b,
+    const __nv_bfloat16* grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ __nv_bfloat16 tileGO[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tileBT[TILE_SIZE][TILE_SIZE];
@@ -1644,7 +1648,9 @@ extern "C" __global__ void bmm_backward_a_bf16(
 }
 
 extern "C" __global__ void bmm_backward_b_bf16a_f32go_f32gb(
-    const __nv_bfloat16* a, const float* grad_out, float* grad_b,
+    const __nv_bfloat16* a,
+    float* grad_b,
+    const float* grad_out,
     const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ __nv_bfloat16 tileAT[TILE_SIZE][TILE_SIZE];
@@ -1680,8 +1686,10 @@ extern "C" __global__ void bmm_backward_b_bf16a_f32go_f32gb(
 }
 // Backward B: dB = A^T * dC
 extern "C" __global__ void bmm_backward_b_bf16(
-    const __nv_bfloat16* a, const __nv_bfloat16* grad_out, __nv_bfloat16* grad_b,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    const __nv_bfloat16* a,
+    __nv_bfloat16* grad_b,
+    const __nv_bfloat16* grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ __nv_bfloat16 tileAT[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tileGO[TILE_SIZE][TILE_SIZE];
@@ -1725,8 +1733,10 @@ extern "C" __global__ void bmm_backward_b_bf16(
     }
 }
 extern "C" __global__ void bmm_backward_a_transb_f32go_f32b_bf16ga(
-    const float* grad_out, const __nv_bfloat16* b, float* grad_a,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    float* grad_a,
+    const __nv_bfloat16* b,
+    const float* grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float tileGO[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tileB[TILE_SIZE][TILE_SIZE];
@@ -1761,8 +1771,10 @@ extern "C" __global__ void bmm_backward_a_transb_f32go_f32b_bf16ga(
 }
 // Backward A (Transposed B): dA = dC * B
 extern "C" __global__ void bmm_backward_a_transb_bf16(
-    const __nv_bfloat16* grad_out, const __nv_bfloat16* b, __nv_bfloat16* grad_a,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    __nv_bfloat16* grad_a,
+    const __nv_bfloat16* b,
+    const __nv_bfloat16* grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ __nv_bfloat16 tileGO[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tileB[TILE_SIZE][TILE_SIZE];
@@ -1804,7 +1816,9 @@ extern "C" __global__ void bmm_backward_a_transb_bf16(
     }
 }
 extern "C" __global__ void bmm_backward_b_transb_bf16a_f32go_f32gb(
-    const __nv_bfloat16* a, const float* grad_out, float* grad_b,
+    const __nv_bfloat16* a,
+    float* grad_b,
+    const float* grad_out,
     const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ float tileGOT[TILE_SIZE][TILE_SIZE];
@@ -1840,8 +1854,10 @@ extern "C" __global__ void bmm_backward_b_transb_bf16a_f32go_f32gb(
 }
 // Backward B (Transposed B): dB = dC^T * A
 extern "C" __global__ void bmm_backward_b_transb_bf16(
-    const __nv_bfloat16* a, const __nv_bfloat16* grad_out, __nv_bfloat16* grad_b,
-    const size_t batch, const size_t m, const size_t k, const size_t n
+    const __nv_bfloat16* a,
+    __nv_bfloat16* grad_b,
+    const __nv_bfloat16* grad_out,
+    const size_t batch, const size_t n, const size_t k, const size_t m
 ) {
     __shared__ __nv_bfloat16 tileGOT[TILE_SIZE][TILE_SIZE];
     __shared__ __nv_bfloat16 tileA[TILE_SIZE][TILE_SIZE];
@@ -1907,7 +1923,7 @@ extern "C" __global__ void gather_bf16_bf16out(
 // gather backward is FP32 accumulation into param grad — unchanged (gather_backward_f32).
 
 extern "C" __global__ void gather_backward_bf16(
-    const __nv_bfloat16* indices, 
+    const float* indices, 
     const __nv_bfloat16* grad_out, 
     __nv_bfloat16* grad_w,
     const size_t hidden_dim, 
