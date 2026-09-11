@@ -992,6 +992,9 @@ impl Graph {
             }
         }
 
+        // Note: Removed stream.synchronize() entirely!
+        // We now rely on stream-ordered execution.
+        // VRAM Pool remains intact to prevent Driver Malloc bottlenecks.
         let nodes = std::mem::take(&mut self.tape.nodes);
         let (ctx, stream_opt) = match &self.device {
             Device::Gpu(ctx, s) => (Some(ctx.clone()), Some(s.clone())),

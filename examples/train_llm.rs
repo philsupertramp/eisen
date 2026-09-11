@@ -357,7 +357,11 @@ fn main() {
     let log_interval = env_usize("EISEN_LOG_INTERVAL", 50);
     let board_interval = 1_usize;
     let log_cfg = TrainLogConfig::from_env();
+<<<<<<< HEAD
     let fail_on_nonfinite = env_bool("EISEN_FAIL_ON_NONFINITE", false);
+=======
+    let fail_on_nonfinite = env_bool("EISEN_FAIL_ON_NONFINITE", true);
+>>>>>>> c3e8d76cdf8a051a2b6e95b4a7e4f3d5869a3eb3
     println!(
         "Logging: level={:?} data=[loss={}, graph_memory={}, computation_graph={}]",
         log_cfg.level, log_cfg.loss, log_cfg.graph_memory, log_cfg.computation_graph
@@ -367,7 +371,11 @@ fn main() {
     println!("\nBuilding model…");
     let mut g = Graph::new(device);
     let model = TransformerLM::new(
+<<<<<<< HEAD
         &mut g, vocab_size, hidden_dim, num_heads, num_kv_heads, ffn_dim, num_layers, tie_weights
+=======
+        &mut g, vocab_size, hidden_dim, num_heads, 4, ffn_dim, num_layers, true,
+>>>>>>> c3e8d76cdf8a051a2b6e95b4a7e4f3d5869a3eb3
     );
     model.tag_parameters(&mut g);
 

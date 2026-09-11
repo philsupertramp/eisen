@@ -226,6 +226,44 @@ impl Tensor {
         }
     }
 
+    pub fn sync_to_gpu(&self) {
+        let stream = match &self.device {
+            Device::Gpu(_ctx, stream) => stream,
+            Device::Cpu => panic!("No GPU!"),
+        };
+
+        match &self.data {
+            Storage::Cpu(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(s) => {},
+            Storage::Gpu(s) => {},
+            _ => unreachable!("sync_to_gpu: data must be Gpu or GpuBf16"),
+        }
+        match &self.grad {
+            #[cfg(feature = "bf16")]
+            Storage::GpuBf16(s) => {},
+            Storage::Gpu(s) => {},
+            Storage::Cpu(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            #[cfg(feature = "bf16")]
+            Storage::CpuBf16(s) => {
+                stream.clone_htod(s.as_slice())
+                    .expect("Failed to copy data to VRAM");
+            },
+            _ => unreachable!("sync_to_gpu: data must be Gpu or GpuBf16"),
+        }
+    }
+
     pub fn sync_to_cpu(&self) -> Vec<f32> {
         match &self.data {
             Storage::Cpu(v) => v.clone(),

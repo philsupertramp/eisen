@@ -1080,6 +1080,20 @@ extern "C" __global__ void matmul_bf16(
             : __float2bfloat16(0.0f);
             
         tile_B[threadIdx.y][threadIdx.x] = (b_row < k && col < n)
+=======
+    int row = blockIdx.y * TILE_SIZE + threadIdx.y;
+    int col = blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (int t = 0; t < ((int)k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        int a_col = t * TILE_SIZE + threadIdx.x;
+        int b_row = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < (int)m && a_col < (int)k)
+            ? a[row * k + a_col]
+            : __float2bfloat16(0.0f);
+        tile_B[threadIdx.y][threadIdx.x] = (b_row < (int)k && col < (int)n)
+>>>>>>> c3e8d76cdf8a051a2b6e95b4a7e4f3d5869a3eb3
             ? b[b_row * n + col]
             : __float2bfloat16(0.0f);
 

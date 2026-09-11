@@ -829,7 +829,6 @@ impl Graph {
                 panic!("matmul_streamed backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})",
                     err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
             });
-
             stream_bwd.synchronize().unwrap_or_else(|err| panic!("matmul_streamed: backward sync failed: {:?}", err));
         });
 
