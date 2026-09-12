@@ -454,6 +454,9 @@ fn main() {
             g.backward(loss_id);
             g.print_vram_state("PAST backward pass");
 
+            // This releases streamed-parameter GPU cache tensors only after
+            // their tape nodes finish backward. The buffers are reusable by
+            // the next micro-batch; CPU-homed parameter gradients remain for AdamW.
             g.clear_activations();
         }
 
