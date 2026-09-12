@@ -685,8 +685,8 @@ impl Graph {
             "matmul_streamed: lhs last dim must equal rhs first dim"
         );
 
-        let (gpu_device, stream) = match &self.device {
-            Device::Gpu(d, s) => (d.clone(), s.clone()),
+        let stream = match &self.device {
+            Device::Gpu(_, s) => s.clone(),
             Device::Cpu => unreachable!("matmul_streamed called on CPU graph"),
         };
 
@@ -697,10 +697,15 @@ impl Graph {
         );
         let stream_bwd = stream.clone();
 
-        let b_f32_fwd = self.tensors[b_id].data.to_f32_vec();
-        let b_temp_fwd = stream.clone_htod(b_f32_fwd.as_slice()).unwrap_or_else(|err| {
-            panic!("matmul_streamed: forward htod failed for size {}: {:?}", b_f32_fwd.len(), err)
-        });
+        // Materialize the CPU-homed parameter as a pooled tensor in the graph,
+        // rather than as a local CUDA allocation. The tape owns this tensor
+        // through backward, so its data and gradient buffers cannot be recycled
+        // before both gradient kernels have consumed them. On the next
+        // micro-batch `alloc_pooled` reuses the buffers from `vram_pool`.
+        let streamed_b_id = self.alloc_pooled(b_shape.clone());
+        self.name_tensor(streamed_b_id, "streamed_param_matmul_cache");
+        let b_f32 = self.tensors[b_id].data.to_f32_vec();
+        self.load_tensor_data(streamed_b_id, &b_f32);
 
         let out_id = self.alloc_pooled(vec![m, n]);
         self.name_tensor(out_id, "tmp_matmul_streamed_out");
@@ -717,7 +722,7 @@ impl Graph {
         let mut builder = stream.launch_builder(&f_fwd);
         match (
             &self.tensors[a_id].data,
-            &self.tensors[b_id].data,
+            &self.tensors[streamed_b_id].data,
             &self.tensors[out_id].data,
         ) {
             (Storage::Gpu(a_s), Storage::Gpu(b_temp_fwd), Storage::Gpu(o_s)) => {
@@ -759,7 +764,7 @@ impl Graph {
             match (
                 &tensors[a_id].grad,
                 &tensors[out_id].grad,
-                &tensors[b_id].data,
+                &tensors[streamed_b_id].data,
             ) {
                 (Storage::Gpu(a_grad), Storage::Gpu(out_grad), Storage::Gpu(b_temp_bwd)) => {
                     b1.arg(out_grad)
@@ -793,7 +798,7 @@ impl Graph {
             match (
                 &tensors[a_id].data,
                 &tensors[out_id].grad,
-                &tensors[b_id].grad,
+                &tensors[streamed_b_id].grad,
             ) {
                 (Storage::Gpu(a_data), Storage::Gpu(out_grad), Storage::Gpu(grad_b_temp)) => {
                     b2.arg(a_data)
@@ -823,11 +828,38 @@ impl Graph {
                 .synchronize()
                 .unwrap_or_else(|err| panic!("matmul_streamed: backward sync failed: {:?}", err));
 
+            // The master gradient remains CPU-homed with the streamed parameter.
+            // Accumulate only after both GPU kernels have completed so gradient
+            // accumulation matches the behavior of a resident parameter.
+            let cached_grad = match &tensors[streamed_b_id].grad {
+                Storage::Gpu(grad) => stream_bwd
+                    .clone_dtoh(grad)
+                    .expect("matmul_streamed: dtoh cached parameter grad failed"),
+                #[cfg(feature = "bf16")]
+                Storage::GpuBf16(grad) => stream_bwd
+                    .clone_dtoh(grad)
+                    .expect("matmul_streamed: dtoh cached BF16 parameter grad failed")
+                    .into_iter()
+                    .map(crate::tensor::bf16u_to_f32)
+                    .collect(),
+                storage => unreachable!("matmul_streamed: cached grad must be GPU storage: {storage:?}"),
+            };
+            match &mut tensors[b_id].grad {
+                Storage::Cpu(param_grad) => {
+                    for (dst, src) in param_grad.iter_mut().zip(cached_grad) {
+                        *dst += src;
+                    }
+                }
+                storage => unreachable!("matmul_streamed: streamed parameter grad must remain on CPU: {storage:?}"),
+            }
+
         });
 
         if !self.no_grad {
             self.tape.nodes.push(TapeNode {
-                inputs: vec![a_id, b_id],
+                // The cache is a tape input so graph eviction and activation
+                // cleanup retain it until this closure has completed.
+                inputs: vec![a_id, streamed_b_id],
                 output: out_id,
                 backward_fn,
             });
