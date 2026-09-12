@@ -295,10 +295,12 @@ impl Graph {
                 let f_fwd = self.functions.get("matmul_trans_b_bf16").expect("matmul_trans_b_bf16 kernel not found").clone();
                 #[cfg(not(feature = "bf16"))]
                 let f_fwd = self.functions.get("matmul_trans_b_f32").expect("matmul_trans_b_f32 kernel not found").clone();
+
                 #[cfg(feature = "bf16")]
-                let f_bwd_a = self.functions.get("matmul_bf16").expect("matmul_bf16 kernel not found").clone();
+                let f_bwd_a = self.functions.get("matmul_accum_bf16").expect("matmul_accum_bf16 kernel not found").clone();
                 #[cfg(not(feature = "bf16"))]
                 let f_bwd_a = self.functions.get("matmul_f32").expect("matmul_f32 kernel not found").clone();
+
                 #[cfg(feature = "bf16")]
                 let f_bwd_b = self.functions.get("matmul_trans_a_bf16").expect("matmul_trans_a_bf16 kernel not found").clone();
                 #[cfg(not(feature = "bf16"))]
@@ -347,9 +349,9 @@ impl Graph {
                 if !self.no_grad {
                     let backward_fn = Box::new(move |tensors: &mut [Tensor]| {
 
-                        stream_clone.synchronize().unwrap_or_else(|err| {
-                            panic!("matmul_trans_b PRE backward sync failed: {:?}", err)
-                        });
+                        // stream_clone.synchronize().unwrap_or_else(|err| {
+                        //     panic!("matmul_trans_b PRE backward sync failed: {:?}", err)
+                        // });
 
                         // 1. dA = dC * B  (Standard Matmul: M x N @ N x K -> M x K)
                         let mut b1 = stream_clone.launch_builder(&f_bwd_a);
@@ -380,9 +382,9 @@ impl Graph {
                         unsafe { b1.launch(cfg_a) }.unwrap_or_else(|err| {
                             panic!("matmul_trans_b backward a kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_a.grid_dim, cfg_a.block_dim)
                         });
-                        stream_clone.synchronize().unwrap_or_else(|err| {
-                            panic!("matmul_trans_b backward a sync failed: {:?}", err)
-                        });
+                        // stream_clone.synchronize().unwrap_or_else(|err| {
+                        //     panic!("matmul_trans_b backward a sync failed: {:?}", err)
+                        // });
 
                         // 2. dB = dC^T * A (Transposed A Matmul: N x M @ M x K -> N x K)
                         let mut b2 = stream_clone.launch_builder(&f_bwd_b);
@@ -398,15 +400,15 @@ impl Graph {
                             &tensors[b_id].grad
                         ) {
                             (Storage::Gpu(out_grad), Storage::Gpu(a_data), Storage::Gpu(b_grad)) => {
-                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&n_u64).arg(&m_u64).arg(&k_u64);
                             },
                             #[cfg(feature = "bf16")]
                             (Storage::Gpu(out_grad), Storage::GpuBf16(a_data), Storage::GpuBf16(b_grad)) => {
-                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&n_u64).arg(&m_u64).arg(&k_u64);
                             },
                             #[cfg(feature = "bf16")]
                             (Storage::GpuBf16(out_grad), Storage::GpuBf16(a_data), Storage::GpuBf16(b_grad)) => {
-                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&m_u64).arg(&n_u64).arg(&k_u64);
+                                b2.arg(out_grad).arg(a_data).arg(b_grad).arg(&n_u64).arg(&m_u64).arg(&k_u64);
                             },
                             (s1, s2, s3) => unreachable!("Wrong storage types [{:?}, {:?}, {:?}]", s1, s2, s3)
                         }
@@ -1117,7 +1119,6 @@ impl Graph {
                     panic!("bmm forward kernel launch failed: {:?} (batch={}, m={}, k={}, n={}, trans_b={}, grid={:?}, block={:?})", err, batch, m, k, n, trans_b, cfg_fwd.grid_dim, cfg_fwd.block_dim)
                 });
                 
-                println!("bmm fwd!");
                 // CRITICAL: Prevent local temp buffer RAII variables from dropping before GPU is finished!
                 stream.synchronize().expect("bmm forward sync failed");
 
@@ -1173,10 +1174,9 @@ impl Graph {
                         panic!("bmm backward a kernel launch failed: {:?} (batch={}, m={}, k={}, n={}, trans_b={}, grid={:?}, block={:?})", err, batch, m, k, n, trans_b, cfg_a.grid_dim, cfg_a.block_dim)
                     });
 
-
-                    stream_clone.synchronize().unwrap_or_else(|err| {
-                        panic!("bmm backward a kernel sync failed: {:?}", err)
-                    });
+                    // stream_clone.synchronize().unwrap_or_else(|err| {
+                    //     panic!("bmm backward a kernel sync failed: {:?}", err)
+                    // });
 
                     let mut b2 = stream_clone.launch_builder(&f_bwd_b);
                     match (

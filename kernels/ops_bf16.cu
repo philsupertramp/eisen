@@ -1947,3 +1947,62 @@ extern "C" __global__ void scale_bf16(__nv_bfloat16* a, const float scale, const
         a[idx] = __float2bfloat16(val * scale);
     }
 }
+
+// Accumulating plain BF16 matmul: C += A @ B (no transpose)
+// grad_a of matmul_trans_b_bf16: (a=grad_out[M,N], b=B_orig[N,K], out=grad_a[M,K], m=M,k=N,n=K)
+// grad_b of matmul_trans_a_bf16: (a=A_orig[K,M],  b=grad_out[M,N], out=grad_b[K,N], m=K,k=M,n=N)
+extern "C" __global__ void matmul_accum_bf16(
+    const __nv_bfloat16* a, const __nv_bfloat16* b, __nv_bfloat16* out,
+    const size_t m, const size_t k, const size_t n
+) {
+    __shared__ __nv_bfloat16 tile_A[TILE_SIZE][TILE_SIZE];
+    __shared__ __nv_bfloat16 tile_B[TILE_SIZE][TILE_SIZE];
+
+    size_t row = (size_t)blockIdx.y * TILE_SIZE + threadIdx.y;
+    size_t col = (size_t)blockIdx.x * TILE_SIZE + threadIdx.x;
+    float sum = 0.0f;
+
+    for (size_t t = 0; t < (k + TILE_SIZE - 1) / TILE_SIZE; ++t) {
+        size_t a_col = t * TILE_SIZE + threadIdx.x;
+        size_t b_row = t * TILE_SIZE + threadIdx.y;
+
+        tile_A[threadIdx.y][threadIdx.x] = (row < m && a_col < k)
+            ? a[row * k + a_col] : __float2bfloat16(0.0f);
+        tile_B[threadIdx.y][threadIdx.x] = (b_row < k && col < n)
+            ? b[b_row * n + col] : __float2bfloat16(0.0f);
+
+        __syncthreads();
+        #pragma unroll
+        for (int i = 0; i < TILE_SIZE; ++i)
+            sum += __bfloat162float(tile_A[threadIdx.y][i]) * __bfloat162float(tile_B[i][threadIdx.x]);
+        __syncthreads();
+    }
+
+    if (row < m && col < n) {
+        float current = __bfloat162float(out[row * n + col]);
+        out[row * n + col] = __float2bfloat16(current + sum);
+    }
+}
+
+// Accumulating twin of matmul_trans_b_bf16: C += A @ B^T
+// grad_a of matmul_trans_a_bf16: (A=B_orig[K,N], B=grad_out[M,N], C=grad_a[K,M], M=K,K=N,N=M)
+extern "C" __global__ void matmul_transb_accum_bf16(
+    const __nv_bfloat16* __restrict__ A,
+    const __nv_bfloat16* __restrict__ B,
+    __nv_bfloat16* __restrict__ C,
+    unsigned long long M, unsigned long long K, unsigned long long N
+) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+
+    if (row < M && col < N) {
+        float sum = 0.0f;
+        for (int i = 0; i < K; ++i) {
+            float a_val = __bfloat162float(A[row * K + i]);
+            float b_val = __bfloat162float(B[col * K + i]);
+            sum += a_val * b_val;
+        }
+        float current = __bfloat162float(C[row * N + col]);
+        C[row * N + col] = __float2bfloat16(current + sum);
+    }
+}

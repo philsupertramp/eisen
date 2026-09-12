@@ -320,6 +320,8 @@ impl Graph {
                     "matmul_backward_a_bf16b_f32",
                     "matmul_trans_b_bf16",
                     "matmul_trans_a_bf16",
+                    "matmul_accum_bf16",
+                    "matmul_transb_accum_bf16",
                     // matmul pure bf16
                     "matmul_bf16",
                     "matmul_backward_a_bf16",
