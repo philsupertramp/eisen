@@ -33,7 +33,7 @@ fn matmul_kernels(
 
 impl Graph {
     pub fn matmul(&mut self, a_id: usize, b_id: usize) -> usize {
-        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        let b_is_cpu = self.tensors[b_id].data.is_cpu();
         #[cfg(feature = "bf16")]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
         #[cfg(not(feature = "bf16"))]
@@ -251,7 +251,7 @@ impl Graph {
     }
 
     pub fn matmul_trans_b(&mut self, a_id: usize, b_id: usize) -> usize {
-        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        let b_is_cpu = self.tensors[b_id].data.is_cpu();
         #[cfg(feature = "bf16")]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
         #[cfg(not(feature = "bf16"))]
@@ -420,7 +420,7 @@ impl Graph {
 
     #[cfg(feature = "bf16")]
     pub fn matmul_bf16(&mut self, a_id: usize, b_id: usize) -> usize {
-        let b_is_cpu = matches!(&self.tensors[b_id].data, Storage::Cpu(_));
+        let b_is_cpu = self.tensors[b_id].data.is_cpu();
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
 
         if a_is_gpu && b_is_cpu {
@@ -884,8 +884,8 @@ impl Graph {
             "matmul_trans_b_streamed: lhs last dim must equal rhs last dim (k)"
         );
 
-        let (gpu_device, stream) = match &self.device {
-            Device::Gpu(d, s) => (d.clone(), s.clone()),
+        let stream = match &self.device {
+            Device::Gpu(_, s) => s.clone(),
             Device::Cpu => unreachable!("matmul_trans_b_streamed called on CPU graph"),
         };
 
@@ -902,6 +902,14 @@ impl Graph {
         #[cfg(not(feature = "bf16"))]
         let f_bwd_b = self.functions.get("matmul_trans_a_f32").expect("matmul_trans_a_f32 kernel not found").clone();
         let stream_bwd = stream.clone();
+
+        // Keep the streamed parameter in graph-owned storage through backward.
+        // This makes its lifetime explicit to the tape and returns both buffers
+        // to the pool only after the parameter gradient has been consumed.
+        let streamed_b_id = self.alloc_pooled(b_shape.clone());
+        self.name_tensor(streamed_b_id, "streamed_param_matmul_trans_b_cache");
+        let b_f32 = self.tensors[b_id].data.to_f32_vec();
+        self.load_tensor_data(streamed_b_id, &b_f32);
 
         let mut out_shape = a_shape.clone();
         *out_shape.last_mut().unwrap() = n;
@@ -920,7 +928,7 @@ impl Graph {
         let mut builder = stream.launch_builder(&f_fwd);
         match (
             &self.tensors[a_id].data,
-            &self.tensors[b_id].data,
+            &self.tensors[streamed_b_id].data,
             &self.tensors[out_id].data
         ) {
             (Storage::Gpu(a_s), Storage::Gpu(b_s), Storage::Gpu(o_s)) => {
@@ -962,7 +970,7 @@ impl Graph {
             let mut b1 = stream_bwd.launch_builder(&f_bwd_a);
             match (
                 &tensors[a_id].grad,
-                &tensors[b_id].data,
+                &tensors[streamed_b_id].data,
                 &tensors[out_id].grad
             ) {
                 (Storage::Gpu(a_grad), Storage::Gpu(b_data), Storage::Gpu(out_grad)) => {
@@ -997,7 +1005,7 @@ impl Graph {
             let mut b2 = stream_bwd.launch_builder(&f_bwd_b);
             match (
                 &tensors[a_id].data,
-                &tensors[b_id].grad,
+                &tensors[streamed_b_id].grad,
                 &tensors[out_id].grad
             ) {
                 (Storage::Gpu(a_data), Storage::Gpu(b_grad), Storage::Gpu(out_grad)) => {
@@ -1023,11 +1031,37 @@ impl Graph {
             unsafe { b2.launch(cfg_b) }.unwrap_or_else(|err| {
                 panic!("matmul_trans_b_streamed backward b kernel launch failed: {:?} (m={}, k={}, n={}, grid={:?}, block={:?})", err, m, k, n, cfg_b.grid_dim, cfg_b.block_dim)
             });
+
+            stream_bwd
+                .synchronize()
+                .unwrap_or_else(|err| panic!("matmul_trans_b_streamed: backward sync failed: {:?}", err));
+
+            let cached_grad = match &tensors[streamed_b_id].grad {
+                Storage::Gpu(grad) => stream_bwd
+                    .clone_dtoh(grad)
+                    .expect("matmul_trans_b_streamed: dtoh cached parameter grad failed"),
+                #[cfg(feature = "bf16")]
+                Storage::GpuBf16(grad) => stream_bwd
+                    .clone_dtoh(grad)
+                    .expect("matmul_trans_b_streamed: dtoh cached BF16 parameter grad failed")
+                    .into_iter()
+                    .map(crate::tensor::bf16u_to_f32)
+                    .collect(),
+                storage => unreachable!("matmul_trans_b_streamed: cached grad must be GPU storage: {storage:?}"),
+            };
+            match &mut tensors[b_id].grad {
+                Storage::Cpu(param_grad) => {
+                    for (dst, src) in param_grad.iter_mut().zip(cached_grad) {
+                        *dst += src;
+                    }
+                }
+                storage => unreachable!("matmul_trans_b_streamed: streamed parameter grad must remain on CPU: {storage:?}"),
+            }
         });
 
         if !self.no_grad {
             self.tape.nodes.push(TapeNode {
-                inputs: vec![a_id, b_id],
+                inputs: vec![a_id, streamed_b_id],
                 output: out_id,
                 backward_fn,
             });
