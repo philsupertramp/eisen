@@ -33,6 +33,18 @@ fn matmul_kernels(
 
 impl Graph {
     pub fn matmul(&mut self, a_id: usize, b_id: usize) -> usize {
+        // The BF16 kernel registered by `matmul_kernels` writes FP32 output,
+        // whereas `alloc_pooled` produces a BF16 activation in mixed mode.
+        // Route mixed-precision work through the dedicated implementation,
+        // which supplies an FP32 compute target and performs the explicit cast
+        // to the pooled BF16 output afterwards. Passing dimensions in a
+        // different order cannot make the generic path safe: its output
+        // pointer has the wrong element width for `matmul_bf16`.
+        #[cfg(feature = "bf16")]
+        if self.uses_bf16_mixed_precision() {
+            return self.matmul_bf16(a_id, b_id);
+        }
+
         let b_is_cpu = self.tensors[b_id].data.is_cpu();
         #[cfg(feature = "bf16")]
         let a_is_gpu = matches!(&self.tensors[a_id].data, Storage::Gpu(_) | Storage::GpuBf16(_));
